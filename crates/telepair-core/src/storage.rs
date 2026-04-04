@@ -1,10 +1,11 @@
 pub mod sqlite;
 
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::error::Result;
 use crate::permission::Role;
-use crate::session::{InputMode, Participant, Session, User};
+use crate::session::{InputMode, InviteToken, Participant, Session, User};
 
 pub use sqlite::SqliteStorage;
 
@@ -36,4 +37,15 @@ pub trait Storage: Send + Sync {
     ) -> Result<Participant>;
     async fn remove_participant(&self, session_id: &str, user_id: Uuid) -> Result<()>;
     async fn list_participants(&self, session_id: &str) -> Result<Vec<Participant>>;
+
+    // Invite Tokens
+    async fn create_invite(
+        &self,
+        session_id: &str,
+        role: Role,
+        max_uses: i32,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<(InviteToken, String)>;
+    async fn validate_invite(&self, token: &str) -> Result<InviteToken>;
+    async fn consume_invite(&self, token: &str) -> Result<InviteToken>;
 }
