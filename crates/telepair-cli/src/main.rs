@@ -43,6 +43,10 @@ struct Cli {
     /// Path to web frontend dist directory
     #[arg(long)]
     web_dir: Option<PathBuf>,
+
+    /// Allowed CORS origins (comma-separated). If unset, allows all origins.
+    #[arg(long, value_delimiter = ',')]
+    allowed_origins: Vec<String>,
 }
 
 #[tokio::main]
@@ -124,7 +128,8 @@ async fn main() -> anyhow::Result<()> {
     if gateway {
         let web_dir = cli.web_dir.as_ref().map(|p| p.to_str().unwrap());
         let state = AppState::new(storage, engine).await;
-        let router = telepair_gateway::build_router_with_web_dir(state, web_dir);
+        let router =
+            telepair_gateway::build_router_with_options(state, web_dir, &cli.allowed_origins);
         let addr = format!("{}:{}", cli.host, cli.port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         tracing::info!("telepair listening on http://{addr}");
