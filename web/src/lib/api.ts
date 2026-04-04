@@ -1,5 +1,5 @@
 // web/src/lib/api.ts
-import type { TargetInfo, Session } from './protocol';
+import type { TargetInfo, Session, InviteInfo, RedeemResult } from './protocol';
 
 const BASE = '/api';
 
@@ -48,6 +48,20 @@ export const api = {
     return request('/sessions', {
       method: 'POST',
       body: JSON.stringify({ target_name, input_mode }),
+    });
+  },
+
+  createInvite(sessionId: string, role: string, maxUses?: number): Promise<InviteInfo> {
+    return request(`/sessions/${sessionId}/invite`, {
+      method: 'POST',
+      body: JSON.stringify({ role, max_uses: maxUses ?? 1 }),
+    });
+  },
+
+  redeemInvite(token: string): Promise<RedeemResult> {
+    return request('/invite/redeem', {
+      method: 'POST',
+      body: JSON.stringify({ token }),
     });
   },
 };

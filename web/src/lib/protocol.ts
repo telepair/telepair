@@ -59,3 +59,15 @@ export function encodeInput(text: string): number[] {
 export function decodeOutput(data: number[]): Uint8Array {
   return new Uint8Array(data);
 }
+
+export interface InviteInfo {
+  token: string;
+  role: Role;
+  max_uses: number;
+  session_id: string;
+}
+
+export interface RedeemResult {
+  session_id: string;
+  role: Role;
+}
