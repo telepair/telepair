@@ -39,6 +39,10 @@ struct Cli {
     /// Path to targets config file
     #[arg(long)]
     targets: Option<PathBuf>,
+
+    /// Path to web frontend dist directory
+    #[arg(long)]
+    web_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -103,11 +107,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if gateway {
+        let web_dir = cli.web_dir.as_ref().map(|p| p.to_str().unwrap());
         let state = AppState::new(storage, engine).await;
-        let router = telepair_gateway::build_router(state);
+        let router = telepair_gateway::build_router_with_web_dir(state, web_dir);
         let addr = format!("{}:{}", cli.host, cli.port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         tracing::info!("telepair listening on http://{addr}");
+        if let Some(dir) = &cli.web_dir {
+            tracing::info!("serving web frontend from {}", dir.display());
+        }
         axum::serve(listener, router).await?;
     } else {
         tracing::info!("no gateway role — running headless");
