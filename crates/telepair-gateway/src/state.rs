@@ -6,12 +6,15 @@ use telepair_control::target_service::TargetService;
 use telepair_core::auth::TokenAuthProvider;
 use telepair_core::storage::{SqliteStorage, Storage};
 
+use crate::session_hub::SessionHub;
+
 #[derive(Clone)]
 pub struct AppState {
     pub auth: Arc<TokenAuthProvider>,
     pub sessions: Arc<SessionService>,
     pub targets: Arc<TargetService>,
     pub storage: Arc<SqliteStorage>,
+    pub hub: Arc<SessionHub>,
 }
 
 impl AppState {
@@ -19,11 +22,13 @@ impl AppState {
         let auth = Arc::new(TokenAuthProvider::new(storage.clone()));
         let sessions = Arc::new(SessionService::new(storage.clone()));
         let targets = Arc::new(TargetService::new(engine));
+        let hub = Arc::new(SessionHub::new());
         Self {
             auth,
             sessions,
             targets,
             storage,
+            hub,
         }
     }
 

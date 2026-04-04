@@ -1,7 +1,9 @@
 #![deny(unsafe_code)]
 
 pub mod http;
+pub mod session_hub;
 pub mod state;
+pub mod ws;
 
 use axum::{
     routing::{get, post},
@@ -17,5 +19,6 @@ pub fn build_router(state: AppState) -> Router {
             "/api/sessions",
             post(http::create_session).get(http::list_sessions),
         )
+        .route("/ws/session/{session_id}", get(ws::ws_handler))
         .with_state(state)
 }
