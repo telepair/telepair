@@ -1,0 +1,22 @@
+[package]
+name = "telepair-gateway"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+telepair-core = { workspace = true }
+telepair-control = { workspace = true }
+telepair-agent = { workspace = true }
+axum = { workspace = true }
+axum-extra = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }

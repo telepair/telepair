@@ -1,0 +1,22 @@
+[package]
+name = "telepair"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "telepair"
+path = "src/main.rs"
+
+[dependencies]
+telepair-core = { workspace = true }
+telepair-agent = { workspace = true }
+telepair-control = { workspace = true }
+telepair-gateway = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+dirs = { workspace = true }
