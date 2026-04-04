@@ -96,6 +96,19 @@ List active sessions.
 ]
 ```
 
+### DELETE /api/sessions/{session_id}
+
+Close a session. Only the session owner can close it. Stops the PTY process and marks the session as closed.
+
+**Response** `204 No Content`
+
+No response body.
+
+**Errors**
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — not the session owner
+- `404 Not Found` — session does not exist
+
 ## Invites
 
 ### POST /api/sessions/{session_id}/invite
