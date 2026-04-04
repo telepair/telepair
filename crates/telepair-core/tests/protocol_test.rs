@@ -48,7 +48,7 @@ fn binary_frame_encode_decode() {
         frame_type: BinaryFrameType::Output,
         payload: b"hello world".to_vec(),
     };
-    let bytes = frame.encode();
+    let bytes = frame.encode().unwrap();
     assert_eq!(bytes[0], 0x01);
     assert_eq!(u16::from_be_bytes([bytes[1], bytes[2]]), 11);
     let decoded = BinaryFrame::decode(&bytes).unwrap();
@@ -60,7 +60,7 @@ fn binary_frame_encode_decode() {
 fn binary_frame_resize() {
     use telepair_core::protocol::BinaryFrame;
     let frame = BinaryFrame::resize(120, 40);
-    let bytes = frame.encode();
+    let bytes = frame.encode().unwrap();
     let decoded = BinaryFrame::decode(&bytes).unwrap();
     let (cols, rows) = decoded.parse_resize().unwrap();
     assert_eq!(cols, 120);

@@ -92,14 +92,13 @@ pub struct BinaryFrame {
 }
 
 impl BinaryFrame {
-    pub fn encode(&self) -> Vec<u8> {
-        let len = u16::try_from(self.payload.len())
-            .expect("BinaryFrame payload exceeds u16::MAX (65535) bytes");
+    pub fn encode(&self) -> Option<Vec<u8>> {
+        let len = u16::try_from(self.payload.len()).ok()?;
         let mut buf = Vec::with_capacity(3 + self.payload.len());
         buf.push(self.frame_type as u8);
         buf.extend_from_slice(&len.to_be_bytes());
         buf.extend_from_slice(&self.payload);
-        buf
+        Some(buf)
     }
 
     pub fn decode(data: &[u8]) -> Option<Self> {

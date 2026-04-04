@@ -2,34 +2,56 @@
 import type { ClientMessage, ServerMessage } from './protocol';
 
 export type MessageHandler = (msg: ServerMessage) => void;
+export type BinaryHandler = (data: Uint8Array) => void;
 export type StatusHandler = (status: 'connecting' | 'connected' | 'disconnected' | 'error') => void;
 
 export class TelepairSocket {
   private ws: WebSocket | null = null;
   private onMessage: MessageHandler;
+  private onBinary: BinaryHandler;
   private onStatus: StatusHandler;
+  private sessionId = '';
+  private token = '';
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 10;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private intentionalClose = false;
 
-  constructor(onMessage: MessageHandler, onStatus: StatusHandler) {
+  constructor(onMessage: MessageHandler, onBinary: BinaryHandler, onStatus: StatusHandler) {
     this.onMessage = onMessage;
+    this.onBinary = onBinary;
     this.onStatus = onStatus;
   }
 
   connect(sessionId: string, token: string) {
-    this.onStatus('connecting');
+    this.sessionId = sessionId;
+    this.token = token;
+    this.intentionalClose = false;
+    this.reconnectAttempts = 0;
+    this.doConnect();
+  }
 
+  private doConnect() {
+    this.onStatus('connecting');
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${protocol}//${location.host}/ws/session/${sessionId}`;
+    const url = `${protocol}//${location.host}/ws/session/${this.sessionId}`;
     this.ws = new WebSocket(url);
+    this.ws.binaryType = 'arraybuffer';
 
     this.ws.onopen = () => {
+      this.reconnectAttempts = 0;
       this.send({
         type: 'SessionJoin',
-        session_id: sessionId,
-        token,
+        session_id: this.sessionId,
+        token: this.token,
       });
     };
 
     this.ws.onmessage = (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        this.onBinary(new Uint8Array(event.data));
+        return;
+      }
       try {
         const msg: ServerMessage = JSON.parse(event.data);
         if (msg.type === 'SessionState') {
@@ -41,13 +63,30 @@ export class TelepairSocket {
       }
     };
 
-    this.ws.onclose = () => {
-      this.onStatus('disconnected');
+    this.ws.onclose = (event) => {
+      if (this.intentionalClose) {
+        this.onStatus('disconnected');
+        return;
+      }
+      if (event.code === 1008 || event.code === 4001) {
+        this.onStatus('error');
+        return;
+      }
+      this.scheduleReconnect();
     };
 
-    this.ws.onerror = () => {
-      this.onStatus('error');
-    };
+    this.ws.onerror = () => {}; // onclose fires after onerror
+  }
+
+  private scheduleReconnect() {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      this.onStatus('disconnected');
+      return;
+    }
+    this.onStatus('connecting');
+    const delay = Math.min(1000 * 2 ** this.reconnectAttempts, 30000);
+    this.reconnectAttempts++;
+    this.reconnectTimer = setTimeout(() => this.doConnect(), delay);
   }
 
   send(msg: ClientMessage) {
@@ -65,6 +104,8 @@ export class TelepairSocket {
   }
 
   disconnect() {
+    this.intentionalClose = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.ws?.close();
     this.ws = null;
   }

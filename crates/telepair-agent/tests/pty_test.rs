@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use telepair_agent::pty::PtyManager;
 use tokio::time::{timeout, Duration};
 
@@ -30,7 +31,8 @@ async fn spawn_shell_and_read_output() {
 
 #[tokio::test]
 async fn spawn_command() {
-    let mut pty = PtyManager::spawn_command("echo", &["PTY_TEST"], 80, 24).unwrap();
+    let mut pty =
+        PtyManager::spawn_command("echo", &["PTY_TEST"], 80, 24, &HashMap::new()).unwrap();
 
     let output = timeout(Duration::from_secs(3), async {
         let mut all = Vec::new();

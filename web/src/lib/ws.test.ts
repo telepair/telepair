@@ -5,9 +5,10 @@ import type { ServerMessage } from './protocol';
 class MockWebSocket {
   static OPEN = 1;
   readyState = MockWebSocket.OPEN;
+  binaryType = '';
   onopen: (() => void) | null = null;
-  onmessage: ((event: { data: string }) => void) | null = null;
-  onclose: (() => void) | null = null;
+  onmessage: ((event: { data: string | ArrayBuffer }) => void) | null = null;
+  onclose: ((event: { code: number; reason: string }) => void) | null = null;
   onerror: (() => void) | null = null;
   sent: string[] = [];
 
@@ -21,7 +22,7 @@ class MockWebSocket {
   }
 
   close() {
-    this.onclose?.();
+    this.onclose?.({ code: 1000, reason: '' });
   }
 }
 
@@ -38,17 +39,27 @@ beforeEach(() => {
 describe('TelepairSocket', () => {
   it('connects with correct URL', () => {
     const onMsg = vi.fn();
+    const onBinary = vi.fn();
     const onStatus = vi.fn();
-    const sock = new TelepairSocket(onMsg, onStatus);
+    const sock = new TelepairSocket(onMsg, onBinary, onStatus);
     sock.connect('sess-1', 'my-token');
 
     expect(onStatus).toHaveBeenCalledWith('connecting');
   });
 
+  it('sets binaryType to arraybuffer', async () => {
+    const sock = new TelepairSocket(vi.fn(), vi.fn(), vi.fn());
+    sock.connect('sess-1', 'my-token');
+
+    const ws = (sock as any).ws as MockWebSocket;
+    expect(ws.binaryType).toBe('arraybuffer');
+  });
+
   it('sends SessionJoin on open', async () => {
     const onMsg = vi.fn();
+    const onBinary = vi.fn();
     const onStatus = vi.fn();
-    const sock = new TelepairSocket(onMsg, onStatus);
+    const sock = new TelepairSocket(onMsg, onBinary, onStatus);
     sock.connect('sess-1', 'my-token');
 
     // Wait for async open
@@ -63,25 +74,58 @@ describe('TelepairSocket', () => {
     expect(joinMsg.token).toBe('my-token');
   });
 
-  it('forwards parsed messages to handler', async () => {
+  it('forwards parsed text messages to message handler', async () => {
     const onMsg = vi.fn();
+    const onBinary = vi.fn();
     const onStatus = vi.fn();
-    const sock = new TelepairSocket(onMsg, onStatus);
+    const sock = new TelepairSocket(onMsg, onBinary, onStatus);
     sock.connect('sess-1', 'tok');
 
     await new Promise((r) => setTimeout(r, 10));
 
     const ws = (sock as any).ws as MockWebSocket;
-    const termOutput: ServerMessage = { type: 'TermOutput', data: [65, 66] };
-    ws.onmessage?.({ data: JSON.stringify(termOutput) });
+    const peerJoined: ServerMessage = {
+      type: 'PeerJoined',
+      user_id: 'u1',
+      name: 'Alice',
+      role: 'operator',
+      color: '#fff',
+    };
+    ws.onmessage?.({ data: JSON.stringify(peerJoined) });
 
-    expect(onMsg).toHaveBeenCalledWith(termOutput);
+    expect(onMsg).toHaveBeenCalledWith(peerJoined);
+    expect(onBinary).not.toHaveBeenCalled();
+  });
+
+  it('forwards binary messages to binary handler', async () => {
+    const onMsg = vi.fn();
+    const onBinary = vi.fn();
+    const onStatus = vi.fn();
+    const sock = new TelepairSocket(onMsg, onBinary, onStatus);
+    sock.connect('sess-1', 'tok');
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    const ws = (sock as any).ws as MockWebSocket;
+    const binaryData = new ArrayBuffer(3);
+    const view = new Uint8Array(binaryData);
+    view[0] = 65;
+    view[1] = 66;
+    view[2] = 67;
+    ws.onmessage?.({ data: binaryData });
+
+    expect(onBinary).toHaveBeenCalledTimes(1);
+    const received = onBinary.mock.calls[0][0];
+    expect(received).toBeInstanceOf(Uint8Array);
+    expect(Array.from(received)).toEqual([65, 66, 67]);
+    expect(onMsg).not.toHaveBeenCalled();
   });
 
   it('sets connected status on SessionState', async () => {
     const onMsg = vi.fn();
+    const onBinary = vi.fn();
     const onStatus = vi.fn();
-    const sock = new TelepairSocket(onMsg, onStatus);
+    const sock = new TelepairSocket(onMsg, onBinary, onStatus);
     sock.connect('sess-1', 'tok');
 
     await new Promise((r) => setTimeout(r, 10));
@@ -99,7 +143,7 @@ describe('TelepairSocket', () => {
   });
 
   it('sendInput sends TermInput message', async () => {
-    const sock = new TelepairSocket(vi.fn(), vi.fn());
+    const sock = new TelepairSocket(vi.fn(), vi.fn(), vi.fn());
     sock.connect('s', 't');
     await new Promise((r) => setTimeout(r, 10));
 
@@ -113,7 +157,7 @@ describe('TelepairSocket', () => {
   });
 
   it('sendResize sends TermResize message', async () => {
-    const sock = new TelepairSocket(vi.fn(), vi.fn());
+    const sock = new TelepairSocket(vi.fn(), vi.fn(), vi.fn());
     sock.connect('s', 't');
     await new Promise((r) => setTimeout(r, 10));
 
@@ -128,12 +172,81 @@ describe('TelepairSocket', () => {
 
   it('disconnect closes and nullifies ws', async () => {
     const onStatus = vi.fn();
-    const sock = new TelepairSocket(vi.fn(), onStatus);
+    const sock = new TelepairSocket(vi.fn(), vi.fn(), onStatus);
     sock.connect('s', 't');
     await new Promise((r) => setTimeout(r, 10));
 
     sock.disconnect();
     expect((sock as any).ws).toBeNull();
     expect(onStatus).toHaveBeenCalledWith('disconnected');
+  });
+
+  it('does not reconnect on intentional close', async () => {
+    const onStatus = vi.fn();
+    const sock = new TelepairSocket(vi.fn(), vi.fn(), onStatus);
+    sock.connect('s', 't');
+    await new Promise((r) => setTimeout(r, 10));
+
+    sock.disconnect();
+    // After intentional close, status should be disconnected, not connecting
+    const statusCalls = onStatus.mock.calls.map((c: any[]) => c[0]);
+    const lastStatus = statusCalls[statusCalls.length - 1];
+    expect(lastStatus).toBe('disconnected');
+  });
+
+  it('does not reconnect on auth failure (code 1008)', async () => {
+    const onStatus = vi.fn();
+    const sock = new TelepairSocket(vi.fn(), vi.fn(), onStatus);
+    sock.connect('s', 't');
+    await new Promise((r) => setTimeout(r, 10));
+
+    const ws = (sock as any).ws as MockWebSocket;
+    ws.onclose?.({ code: 1008, reason: 'Policy Violation' });
+
+    const statusCalls = onStatus.mock.calls.map((c: any[]) => c[0]);
+    expect(statusCalls).toContain('error');
+    // Should not schedule reconnect
+    expect((sock as any).reconnectTimer).toBeNull();
+  });
+
+  it('does not reconnect on auth failure (code 4001)', async () => {
+    const onStatus = vi.fn();
+    const sock = new TelepairSocket(vi.fn(), vi.fn(), onStatus);
+    sock.connect('s', 't');
+    await new Promise((r) => setTimeout(r, 10));
+
+    const ws = (sock as any).ws as MockWebSocket;
+    ws.onclose?.({ code: 4001, reason: 'Unauthorized' });
+
+    const statusCalls = onStatus.mock.calls.map((c: any[]) => c[0]);
+    expect(statusCalls).toContain('error');
+    expect((sock as any).reconnectTimer).toBeNull();
+  });
+
+  it('schedules reconnect on unexpected close', async () => {
+    vi.useFakeTimers();
+    const onStatus = vi.fn();
+    const sock = new TelepairSocket(vi.fn(), vi.fn(), onStatus);
+    sock.connect('s', 't');
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const ws = (sock as any).ws as MockWebSocket;
+    // Simulate unexpected close
+    ws.onclose?.({ code: 1006, reason: '' });
+
+    expect(onStatus).toHaveBeenCalledWith('connecting');
+    expect((sock as any).reconnectAttempts).toBe(1);
+    expect((sock as any).reconnectTimer).not.toBeNull();
+
+    vi.useRealTimers();
+  });
+
+  it('stores sessionId and token for reconnection', () => {
+    const sock = new TelepairSocket(vi.fn(), vi.fn(), vi.fn());
+    sock.connect('my-session', 'my-token');
+
+    expect((sock as any).sessionId).toBe('my-session');
+    expect((sock as any).token).toBe('my-token');
   });
 });
