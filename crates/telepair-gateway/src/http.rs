@@ -218,29 +218,22 @@ pub async fn redeem_invite(
 ) -> Result<impl IntoResponse, StatusCode> {
     let user = extract_user(&state, &headers).await?;
 
-    // Validate first (does not consume)
+    // Consume atomically first — validates expiry, max_uses, and increments used_count.
+    // If this fails, no participant is added.
     let invite = state
         .sessions
         .storage()
-        .validate_invite(&body.token)
+        .consume_invite(&body.token)
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Upsert participant (idempotent — safe if user already has a row)
+    // Only now upsert participant — invite was valid and consumed
     state
         .sessions
         .storage()
         .upsert_participant(&invite.session_id, user.id, invite.role)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Then consume the invite (increment used_count)
-    state
-        .sessions
-        .storage()
-        .consume_invite(&body.token)
-        .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     Ok(Json(serde_json::json!({
         "session_id": invite.session_id,

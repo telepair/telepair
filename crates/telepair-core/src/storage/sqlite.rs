@@ -461,7 +461,18 @@ impl Storage for SqliteStorage {
             .fetch_optional(&self.pool)
             .await?
         {
-            return row_to_invite(&row);
+            let invite = row_to_invite(&row)?;
+            // Check expiry
+            if let Some(expires_at) = invite.expires_at {
+                if expires_at < Utc::now() {
+                    return Err(Error::Auth("invite token has expired".into()));
+                }
+            }
+            // Check usage limit
+            if invite.used_count >= invite.max_uses {
+                return Err(Error::Auth("invite token has been fully used".into()));
+            }
+            return Ok(invite);
         }
 
         // Slow path: legacy invite tokens without token_sha256 — bcrypt scan only those rows
@@ -481,7 +492,18 @@ impl Storage for SqliteStorage {
                 .bind(&token_hash_val)
                 .execute(&self.pool)
                 .await;
-                return row_to_invite(&row);
+                let invite = row_to_invite(&row)?;
+                // Check expiry
+                if let Some(expires_at) = invite.expires_at {
+                    if expires_at < Utc::now() {
+                        return Err(Error::Auth("invite token has expired".into()));
+                    }
+                }
+                // Check usage limit
+                if invite.used_count >= invite.max_uses {
+                    return Err(Error::Auth("invite token has been fully used".into()));
+                }
+                return Ok(invite);
             }
         }
 
@@ -491,17 +513,12 @@ impl Storage for SqliteStorage {
     async fn consume_invite(&self, token: &str) -> Result<InviteToken> {
         let invite = self.validate_invite(token).await?;
 
-        if let Some(expires_at) = invite.expires_at {
-            if expires_at < Utc::now() {
-                return Err(Error::Auth("invite token has expired".into()));
-            }
-        }
-
-        // Atomic increment with WHERE guard to prevent TOCTOU race
+        // Atomic increment with WHERE guard for both max_uses and expiry
         let result = sqlx::query(
-            "UPDATE invite_tokens SET used_count = used_count + 1 WHERE token_hash = ? AND used_count < max_uses",
+            "UPDATE invite_tokens SET used_count = used_count + 1 WHERE token_hash = ? AND used_count < max_uses AND (expires_at IS NULL OR expires_at > ?)",
         )
         .bind(&invite.token_hash)
+        .bind(Utc::now().to_rfc3339())
         .execute(&self.pool)
         .await?;
 
