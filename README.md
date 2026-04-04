@@ -182,6 +182,16 @@ cd web && npm run dev              # terminal 2
 RUST_LOG=debug ./target/release/telepair
 ```
 
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Architecture](docs/architecture.md) | Crate structure, data flow, broadcast channels, security model |
+| [REST API](docs/api.md) | HTTP endpoint reference with request/response examples |
+| [WebSocket Protocol](docs/protocol.md) | JSON message types, binary frame format, permission enforcement |
+| [Deployment](docs/deployment.md) | Systemd, Docker, nginx reverse proxy, security checklist |
+| [Contributing](CONTRIBUTING.md) | Development setup, code style, testing, PR workflow |
+
 ## Tech Stack
 
 | Layer | Technology |
@@ -194,4 +204,4 @@ RUST_LOG=debug ./target/release/telepair
 
 ## License
 
-MIT OR Apache-2.0
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
