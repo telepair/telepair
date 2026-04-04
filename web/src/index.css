@@ -81,3 +81,26 @@ input:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.3);
 }
+
+[data-role] {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+[data-role="owner"] {
+  background: rgba(63, 185, 80, 0.2);
+  color: var(--success);
+}
+
+[data-role="operator"] {
+  background: rgba(88, 166, 255, 0.2);
+  color: var(--accent);
+}
+
+[data-role="viewer"] {
+  background: rgba(139, 148, 158, 0.2);
+  color: var(--text-secondary);
+}

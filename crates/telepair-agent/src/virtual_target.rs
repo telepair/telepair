@@ -40,7 +40,7 @@ impl TargetEngine {
                     .shell
                     .as_deref()
                     .map(substitute_env_vars)
-                    .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
+                    .unwrap_or_else(crate::default_shell);
                 Some((shell, vec![]))
             }
             TargetKind::Virtual => {

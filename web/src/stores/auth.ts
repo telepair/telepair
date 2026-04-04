@@ -2,7 +2,7 @@
 import { createSignal } from 'solid-js';
 import { api, ApiError } from '../lib/api';
 
-const STORAGE_KEY = 'telepair_token';
+export const STORAGE_KEY = 'telepair_token';
 
 const [token, setTokenSignal] = createSignal(localStorage.getItem(STORAGE_KEY) ?? '');
 const [validating, setValidating] = createSignal(false);
@@ -22,14 +22,12 @@ async function validateToken(t: string): Promise<boolean> {
   setValidating(true);
   setError('');
   try {
-    localStorage.setItem(STORAGE_KEY, t);
+    setToken(t);
     await api.listTargets();
-    setTokenSignal(t);
     setValidating(false);
     return true;
   } catch (e) {
-    localStorage.removeItem(STORAGE_KEY);
-    setTokenSignal('');
+    setToken('');
     if (e instanceof ApiError && e.status === 401) {
       setError('Invalid token');
     } else {

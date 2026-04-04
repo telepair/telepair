@@ -1,5 +1,6 @@
 // web/src/lib/api.ts
 import type { TargetInfo, Session, InviteInfo, RedeemResult } from './protocol';
+import { STORAGE_KEY } from '../stores/auth';
 
 const BASE = '/api';
 
@@ -11,7 +12,7 @@ class ApiError extends Error {
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const token = localStorage.getItem('telepair_token');
+  const token = localStorage.getItem(STORAGE_KEY);
   const headers: Record<string, string> = {
     ...options.headers as Record<string, string>,
   };

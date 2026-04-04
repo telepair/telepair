@@ -39,3 +39,16 @@ impl std::fmt::Display for Role {
         f.write_str(self.as_str())
     }
 }
+
+impl std::str::FromStr for Role {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "owner" => Ok(Self::Owner),
+            "operator" => Ok(Self::Operator),
+            "viewer" => Ok(Self::Viewer),
+            _ => Err(format!("unknown role: {s}")),
+        }
+    }
+}

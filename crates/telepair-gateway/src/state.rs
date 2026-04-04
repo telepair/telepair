@@ -13,7 +13,6 @@ pub struct AppState {
     pub auth: Arc<TokenAuthProvider>,
     pub sessions: Arc<SessionService>,
     pub targets: Arc<TargetService>,
-    pub storage: Arc<SqliteStorage>,
     pub hub: Arc<SessionHub>,
 }
 
@@ -27,7 +26,6 @@ impl AppState {
             auth,
             sessions,
             targets,
-            storage,
             hub,
         }
     }
@@ -39,7 +37,7 @@ impl AppState {
     }
 
     pub async fn create_test_user(&self, name: &str) -> String {
-        let (_, token) = self.storage.create_user(name, false).await.unwrap();
+        let (_, token) = self.sessions.storage().create_user(name, false).await.unwrap();
         token
     }
 }

@@ -62,14 +62,14 @@ fn row_to_session(r: &SqliteRow) -> Result<Session> {
             .parse()
             .map_err(|e| Error::InvalidInput(format!("invalid user id: {e}")))?,
         target_name: r.get("target_name"),
-        input_mode: match r.get::<String, _>("input_mode").as_str() {
-            "multiplexed" => InputMode::Multiplexed,
-            _ => InputMode::Serialized,
-        },
-        status: match r.get::<String, _>("status").as_str() {
-            "closed" => SessionStatus::Closed,
-            _ => SessionStatus::Active,
-        },
+        input_mode: r
+            .get::<String, _>("input_mode")
+            .parse()
+            .map_err(|e: String| Error::InvalidInput(e))?,
+        status: r
+            .get::<String, _>("status")
+            .parse()
+            .map_err(|e: String| Error::InvalidInput(e))?,
         created_at: r
             .get::<String, _>("created_at")
             .parse()
@@ -81,36 +81,34 @@ fn row_to_session(r: &SqliteRow) -> Result<Session> {
 }
 
 fn row_to_participant(r: &SqliteRow) -> Result<Participant> {
-    let role_str: String = r.get("role");
     Ok(Participant {
         session_id: r.get("session_id"),
         user_id: r
             .get::<String, _>("user_id")
             .parse()
             .map_err(|e| Error::InvalidInput(format!("invalid user id: {e}")))?,
-        role: match role_str.as_str() {
-            "owner" => Role::Owner,
-            "operator" => Role::Operator,
-            _ => Role::Viewer,
-        },
+        role: r
+            .get::<String, _>("role")
+            .parse()
+            .map_err(|e: String| Error::InvalidInput(e))?,
         joined_at: r
             .get::<String, _>("joined_at")
             .parse()
             .map_err(|e| Error::InvalidInput(format!("invalid timestamp: {e}")))?,
-        left_at: None,
+        left_at: r
+            .get::<Option<String>, _>("left_at")
+            .and_then(|s| s.parse().ok()),
     })
 }
 
 fn row_to_invite(r: &SqliteRow) -> Result<InviteToken> {
-    let role_str: String = r.get("role");
     Ok(InviteToken {
         token_hash: r.get("token_hash"),
         session_id: r.get("session_id"),
-        role: match role_str.as_str() {
-            "owner" => Role::Owner,
-            "operator" => Role::Operator,
-            _ => Role::Viewer,
-        },
+        role: r
+            .get::<String, _>("role")
+            .parse()
+            .map_err(|e: String| Error::InvalidInput(e))?,
         max_uses: r.get("max_uses"),
         used_count: r.get("used_count"),
         expires_at: r
@@ -119,11 +117,18 @@ fn row_to_invite(r: &SqliteRow) -> Result<InviteToken> {
     })
 }
 
+const BCRYPT_COST: u32 = 10;
+
+fn generate_token() -> Result<(String, String)> {
+    let raw = nanoid::nanoid!(32);
+    let hash = bcrypt::hash(&raw, BCRYPT_COST).map_err(|e| Error::Auth(e.to_string()))?;
+    Ok((raw, hash))
+}
+
 impl Storage for SqliteStorage {
     async fn create_user(&self, name: &str, is_admin: bool) -> Result<(User, String)> {
         let id = Uuid::new_v4();
-        let token = nanoid::nanoid!(32);
-        let token_hash = bcrypt::hash(&token, 10).map_err(|e| Error::Auth(e.to_string()))?;
+        let (token, token_hash) = generate_token()?;
         let now = Utc::now();
 
         sqlx::query(
@@ -194,10 +199,6 @@ impl Storage for SqliteStorage {
     ) -> Result<Session> {
         let id = nanoid::nanoid!(10);
         let now = Utc::now();
-        let mode_str = match input_mode {
-            InputMode::Serialized => "serialized",
-            InputMode::Multiplexed => "multiplexed",
-        };
 
         sqlx::query(
             "INSERT INTO sessions (id, owner_id, target_name, input_mode, status, created_at) VALUES (?, ?, ?, ?, 'active', ?)",
@@ -205,7 +206,7 @@ impl Storage for SqliteStorage {
         .bind(&id)
         .bind(owner_id.to_string())
         .bind(target_name)
-        .bind(mode_str)
+        .bind(input_mode.as_str())
         .bind(now.to_rfc3339())
         .execute(&self.pool)
         .await?;
@@ -313,9 +314,7 @@ impl Storage for SqliteStorage {
         max_uses: i32,
         expires_at: Option<chrono::DateTime<Utc>>,
     ) -> Result<(InviteToken, String)> {
-        let raw_token = nanoid::nanoid!(32);
-        let token_hash =
-            bcrypt::hash(&raw_token, 10).map_err(|e| Error::Auth(e.to_string()))?;
+        let (raw_token, token_hash) = generate_token()?;
 
         sqlx::query(
             "INSERT INTO invite_tokens (token_hash, session_id, role, max_uses, used_count, expires_at) VALUES (?, ?, ?, ?, 0, ?)",
