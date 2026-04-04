@@ -115,4 +115,4 @@ File issues at [github.com/telepair/telepair/issues](https://github.com/telepair
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the MIT OR Apache-2.0 license.
+By contributing, you agree that your contributions will be licensed under the MIT license.
