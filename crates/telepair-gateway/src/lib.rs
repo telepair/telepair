@@ -10,9 +10,14 @@ use axum::{
     Router,
 };
 use state::AppState;
+use tower_http::services::{ServeDir, ServeFile};
 
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    build_router_with_web_dir(state, None)
+}
+
+pub fn build_router_with_web_dir(state: AppState, web_dir: Option<&str>) -> Router {
+    let api = Router::new()
         .route("/api/health", get(http::health))
         .route("/api/targets", get(http::list_targets))
         .route(
@@ -20,5 +25,14 @@ pub fn build_router(state: AppState) -> Router {
             post(http::create_session).get(http::list_sessions),
         )
         .route("/ws/session/{session_id}", get(ws::ws_handler))
-        .with_state(state)
+        .with_state(state);
+
+    match web_dir {
+        Some(dir) => {
+            let serve = ServeDir::new(dir)
+                .not_found_service(ServeFile::new(format!("{dir}/index.html")));
+            api.fallback_service(serve)
+        }
+        None => api,
+    }
 }
