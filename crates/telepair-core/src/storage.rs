@@ -36,6 +36,12 @@ pub trait Storage: Send + Sync {
         user_id: Uuid,
         role: Role,
     ) -> Result<Participant>;
+    async fn upsert_participant(
+        &self,
+        session_id: &str,
+        user_id: Uuid,
+        role: Role,
+    ) -> Result<Participant>;
     async fn remove_participant(&self, session_id: &str, user_id: Uuid) -> Result<()>;
     async fn list_participants(&self, session_id: &str) -> Result<Vec<Participant>>;
 
