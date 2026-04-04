@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -7,6 +7,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use telepair_core::session::{InputMode, User};
+use telepair_core::storage::Storage;
 
 use crate::state::AppState;
 
@@ -103,4 +104,93 @@ pub async fn list_sessions(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(sessions))
+}
+
+// --- Invite handlers ---
+
+#[derive(Deserialize)]
+pub struct CreateInviteRequest {
+    pub role: String,
+    #[serde(default = "default_max_uses")]
+    pub max_uses: i32,
+}
+
+fn default_max_uses() -> i32 {
+    1
+}
+
+pub async fn create_invite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(body): Json<CreateInviteRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let user = extract_user(&state, &headers).await?;
+
+    let session = state
+        .sessions
+        .storage()
+        .get_session(&session_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    if session.owner_id != user.id {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let role = match body.role.as_str() {
+        "operator" => telepair_core::permission::Role::Operator,
+        "viewer" => telepair_core::permission::Role::Viewer,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let (invite, raw_token) = state
+        .sessions
+        .storage()
+        .create_invite(&session_id, role, body.max_uses, None)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "token": raw_token,
+            "role": invite.role.as_str(),
+            "max_uses": invite.max_uses,
+            "session_id": session_id,
+        })),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct RedeemInviteRequest {
+    pub token: String,
+}
+
+pub async fn redeem_invite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RedeemInviteRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let user = extract_user(&state, &headers).await?;
+
+    let invite = state
+        .sessions
+        .storage()
+        .consume_invite(&body.token)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let _ = state
+        .sessions
+        .storage()
+        .add_participant(&invite.session_id, user.id, invite.role)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "session_id": invite.session_id,
+        "role": invite.role.as_str(),
+    })))
 }
