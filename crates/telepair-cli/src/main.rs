@@ -97,6 +97,13 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Close any sessions left "active" from a previous unclean shutdown
+    match storage.close_stale_sessions().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("closed {n} stale session(s) from previous run"),
+        Err(e) => tracing::warn!("failed to close stale sessions: {e}"),
+    }
+
     // Auto-create admin user on first run
     let auth = TokenAuthProvider::new(storage.clone());
     if storage.get_user_by_name("admin").await?.is_none() {

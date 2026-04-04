@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use telepair_agent::virtual_target::TargetEngine;
 use telepair_core::target::Target;
 
@@ -14,7 +16,7 @@ impl TargetService {
         self.engine.list_targets()
     }
 
-    pub fn resolve(&self, name: &str) -> Option<(String, Vec<String>)> {
+    pub fn resolve(&self, name: &str) -> Option<(String, Vec<String>, HashMap<String, String>)> {
         self.engine.resolve(name)
     }
 }
