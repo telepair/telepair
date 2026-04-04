@@ -24,6 +24,11 @@ pub fn build_router_with_web_dir(state: AppState, web_dir: Option<&str>) -> Rout
             "/api/sessions",
             post(http::create_session).get(http::list_sessions),
         )
+        .route(
+            "/api/sessions/{session_id}/invite",
+            post(http::create_invite),
+        )
+        .route("/api/invite/redeem", post(http::redeem_invite))
         .route("/ws/session/{session_id}", get(ws::ws_handler))
         .with_state(state);
 
