@@ -198,9 +198,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                 result = output_rx.recv() => {
                     match result {
                         Ok(data) => {
-                            let msg = ServerMessage::TermOutput { data };
-                            let json = serde_json::to_string(&msg).unwrap();
-                            if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                            if ws_tx.send(Message::Binary(data.into())).await.is_err() {
                                 break;
                             }
                         }
