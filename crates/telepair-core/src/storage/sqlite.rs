@@ -367,6 +367,33 @@ impl Storage for SqliteStorage {
         })
     }
 
+    async fn upsert_participant(
+        &self,
+        session_id: &str,
+        user_id: Uuid,
+        role: Role,
+    ) -> Result<Participant> {
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO participants (session_id, user_id, role, joined_at) VALUES (?, ?, ?, ?) \
+             ON CONFLICT (session_id, user_id) DO UPDATE SET role = excluded.role, left_at = NULL",
+        )
+        .bind(session_id)
+        .bind(user_id.to_string())
+        .bind(role.as_str())
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(Participant {
+            session_id: session_id.into(),
+            user_id,
+            role,
+            joined_at: now,
+            left_at: None,
+        })
+    }
+
     async fn remove_participant(&self, session_id: &str, user_id: Uuid) -> Result<()> {
         let now = Utc::now();
         sqlx::query(
