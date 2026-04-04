@@ -309,7 +309,7 @@ impl Storage for SqliteStorage {
     async fn close_session(&self, id: &str) -> Result<()> {
         let now = Utc::now();
         let result =
-            sqlx::query("UPDATE sessions SET status = 'closed', closed_at = ? WHERE id = ?")
+            sqlx::query("UPDATE sessions SET status = 'closed', closed_at = ? WHERE id = ? AND status = 'active'")
                 .bind(now.to_rfc3339())
                 .bind(id)
                 .execute(&self.pool)
