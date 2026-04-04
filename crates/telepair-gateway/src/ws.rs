@@ -145,7 +145,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
             return;
         }
     };
-    let (cmd_tx, mut output_rx, mut collab_rx) =
+    let (cmd_tx, mut output_rx, mut collab_rx, mut shutdown_rx) =
         match hub
             .start_or_join(&session_id, &cmd, &args, &env, 80, 24)
             .await
@@ -234,62 +234,71 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let user_name = user.name.clone();
     let input_mode = session.input_mode;
 
-    while let Some(Ok(msg)) = ws_rx.next().await {
+    loop {
         let current_role = *role_watch_rx.borrow();
-        match msg {
-            Message::Text(text) => {
-                if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
-                    match client_msg {
-                        ClientMessage::TermInput { data } => {
-                            if current_role.can_input() {
-                                // In serialized mode, only the owner can type
-                                if input_mode == InputMode::Serialized
-                                    && current_role != Role::Owner
-                                {
-                                    // Drop input from non-owners in serialized mode
-                                } else {
-                                    let _ = cmd_tx.send(PtyCommand::Input(data)).await;
+        tokio::select! {
+            msg = ws_rx.next() => {
+                let Some(Ok(msg)) = msg else { break };
+                match msg {
+                    Message::Text(text) => {
+                        if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
+                            match client_msg {
+                                ClientMessage::TermInput { data } => {
+                                    if current_role.can_input() {
+                                        // In serialized mode, only the owner can type
+                                        if input_mode == InputMode::Serialized
+                                            && current_role != Role::Owner
+                                        {
+                                            // Drop input from non-owners in serialized mode
+                                        } else {
+                                            let _ = cmd_tx.send(PtyCommand::Input(data)).await;
+                                        }
+                                    }
+                                    // Silently drop if viewer
+                                }
+                                ClientMessage::TermResize { cols, rows } => {
+                                    if current_role.can_resize() {
+                                        let _ = cmd_tx.send(PtyCommand::Resize(cols, rows)).await;
+                                    }
+                                }
+                                ClientMessage::ChatMessage { text } => {
+                                    let chat_msg = ServerMessage::PeerChat {
+                                        user_id,
+                                        name: user_name.clone(),
+                                        text,
+                                        ts: Utc::now().to_rfc3339(),
+                                    };
+                                    hub.broadcast_collab(&session_id, chat_msg).await;
+                                }
+                                ClientMessage::CursorMove { x, y } => {
+                                    let cursor_msg = ServerMessage::PeerCursor { user_id, x, y };
+                                    hub.broadcast_collab(&session_id, cursor_msg).await;
+                                }
+                                ClientMessage::SessionJoin { .. } => {
+                                    // Ignore duplicate join messages
                                 }
                             }
-                            // Silently drop if viewer
                         }
-                        ClientMessage::TermResize { cols, rows } => {
-                            if current_role.can_resize() {
-                                let _ = cmd_tx.send(PtyCommand::Resize(cols, rows)).await;
+                    }
+                    Message::Binary(data) => {
+                        // Binary frame: direct PTY input (only if allowed)
+                        if current_role.can_input() {
+                            // In serialized mode, only the owner can type
+                            if input_mode == InputMode::Serialized && current_role != Role::Owner {
+                                // Drop input from non-owners in serialized mode
+                            } else {
+                                let _ = cmd_tx.send(PtyCommand::Input(data.to_vec())).await;
                             }
                         }
-                        ClientMessage::ChatMessage { text } => {
-                            let chat_msg = ServerMessage::PeerChat {
-                                user_id,
-                                name: user_name.clone(),
-                                text,
-                                ts: Utc::now().to_rfc3339(),
-                            };
-                            hub.broadcast_collab(&session_id, chat_msg).await;
-                        }
-                        ClientMessage::CursorMove { x, y } => {
-                            let cursor_msg = ServerMessage::PeerCursor { user_id, x, y };
-                            hub.broadcast_collab(&session_id, cursor_msg).await;
-                        }
-                        ClientMessage::SessionJoin { .. } => {
-                            // Ignore duplicate join messages
-                        }
                     }
+                    Message::Close(_) => break,
+                    _ => {}
                 }
             }
-            Message::Binary(data) => {
-                // Binary frame: direct PTY input (only if allowed)
-                if current_role.can_input() {
-                    // In serialized mode, only the owner can type
-                    if input_mode == InputMode::Serialized && current_role != Role::Owner {
-                        // Drop input from non-owners in serialized mode
-                    } else {
-                        let _ = cmd_tx.send(PtyCommand::Input(data.to_vec())).await;
-                    }
-                }
+            _ = shutdown_rx.recv() => {
+                tracing::info!(user = %user_name, session = %session_id, "session force-stopped");
+                break;
             }
-            Message::Close(_) => break,
-            _ => {}
         }
     }
 
