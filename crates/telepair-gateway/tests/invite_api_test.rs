@@ -163,6 +163,36 @@ async fn redeem_expired_invite_rejected() {
 }
 
 #[tokio::test]
+async fn list_sessions_only_shows_own_sessions() {
+    let (state, app, owner_token) = setup().await;
+
+    // Owner creates a session
+    let _session_id = create_session(&app, &owner_token).await;
+
+    // Create a second user who has no sessions
+    let other_token = state.create_test_user("other").await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/sessions")
+                .header("Authorization", format!("Bearer {other_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let sessions: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        sessions.is_empty(),
+        "other user should not see owner's sessions"
+    );
+}
+
+#[tokio::test]
 async fn redeem_exhausted_invite_rejected() {
     let (state, app, owner_token) = setup().await;
     let session_id = create_session(&app, &owner_token).await;

@@ -115,13 +115,33 @@ pub async fn list_sessions(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let _user = extract_user(&state, &headers).await?;
-    let sessions = state
+    let user = extract_user(&state, &headers).await?;
+    let all_sessions = state
         .sessions
         .list_active_sessions()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(sessions))
+
+    // Filter to sessions the user owns or participates in
+    let mut visible = Vec::new();
+    for session in all_sessions {
+        if session.owner_id == user.id {
+            visible.push(session);
+            continue;
+        }
+        if let Ok(participants) = state
+            .sessions
+            .storage()
+            .list_participants(&session.id)
+            .await
+        {
+            if participants.iter().any(|p| p.user_id == user.id) {
+                visible.push(session);
+            }
+        }
+    }
+
+    Ok(Json(visible))
 }
 
 // --- Invite handlers ---
