@@ -2,8 +2,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc, RwLock};
+use uuid::Uuid;
 
 use telepair_agent::pty::PtyManager;
+use telepair_core::permission::Role;
+use telepair_core::protocol::ServerMessage;
+
+/// Color palette for participant cursors / identifiers.
+const COLORS: &[&str] = &[
+    "#58a6ff", "#3fb950", "#d29922", "#f85149",
+    "#bc8cff", "#39c5cf", "#ffa198", "#56d364",
+];
+
+fn assign_color(index: usize) -> String {
+    COLORS[index % COLORS.len()].to_string()
+}
 
 /// Commands sent to the PTY I/O loop.
 pub enum PtyCommand {
@@ -11,12 +24,27 @@ pub enum PtyCommand {
     Resize(u16, u16),
 }
 
-/// A running terminal session with PTY and broadcast channel.
+/// A participant currently connected to a session.
+#[derive(Debug, Clone)]
+pub struct ConnectedParticipant {
+    pub user_id: Uuid,
+    pub name: String,
+    pub role: Role,
+    pub color: String,
+}
+
+/// A running terminal session with PTY, broadcast channels, and participant tracking.
 struct LiveSession {
     /// Send terminal input (or resize) to PTY via command channel
     cmd_tx: mpsc::Sender<PtyCommand>,
     /// Subscribe to PTY output
     output_tx: broadcast::Sender<Vec<u8>>,
+    /// Broadcast collaboration messages (PeerJoined, PeerLeft, PermUpdate, etc.)
+    collab_tx: broadcast::Sender<ServerMessage>,
+    /// Currently connected participants
+    participants: HashMap<Uuid, ConnectedParticipant>,
+    /// Monotonic counter for color assignment
+    color_counter: usize,
 }
 
 pub struct SessionHub {
@@ -36,7 +64,7 @@ impl SessionHub {
         }
     }
 
-    /// Spawn a PTY for a session. Returns channels for I/O.
+    /// Spawn a PTY for a session. Returns channels for I/O and collaboration.
     pub async fn start_session(
         &self,
         session_id: &str,
@@ -48,6 +76,7 @@ impl SessionHub {
         (
             mpsc::Sender<PtyCommand>,
             broadcast::Receiver<Vec<u8>>,
+            broadcast::Receiver<ServerMessage>,
         ),
         String,
     > {
@@ -57,12 +86,13 @@ impl SessionHub {
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<PtyCommand>(256);
         let (output_tx, output_rx) = broadcast::channel::<Vec<u8>>(256);
+        let (collab_tx, collab_rx) = broadcast::channel::<ServerMessage>(64);
 
         let output_tx_clone = output_tx.clone();
         let session_id_owned = session_id.to_string();
         let sessions = self.sessions.clone();
 
-        // PTY I/O loop — single task owns the PtyManager
+        // PTY I/O loop -- single task owns the PtyManager
         tokio::spawn(async move {
             loop {
                 // Use select to wait for either PTY output or a command.
@@ -97,7 +127,7 @@ impl SessionHub {
                         let _ = pty.resize(cols, rows);
                     }
                     Action::Command(None) => {
-                        // All senders dropped — no more clients
+                        // All senders dropped -- no more clients
                         tracing::info!(session = %session_id_owned, "all clients disconnected");
                         break;
                     }
@@ -111,26 +141,123 @@ impl SessionHub {
         let live = LiveSession {
             cmd_tx: cmd_tx.clone(),
             output_tx: output_tx.clone(),
+            collab_tx: collab_tx.clone(),
+            participants: HashMap::new(),
+            color_counter: 0,
         };
         self.sessions
             .write()
             .await
             .insert(session_id.to_string(), live);
 
-        Ok((cmd_tx, output_rx))
+        Ok((cmd_tx, output_rx, collab_rx))
     }
 
-    /// Join an existing live session (get command sender + output receiver).
+    /// Join an existing live session (get command sender + output receiver + collab receiver).
     pub async fn join_session(
         &self,
         session_id: &str,
-    ) -> Option<(mpsc::Sender<PtyCommand>, broadcast::Receiver<Vec<u8>>)> {
+    ) -> Option<(
+        mpsc::Sender<PtyCommand>,
+        broadcast::Receiver<Vec<u8>>,
+        broadcast::Receiver<ServerMessage>,
+    )> {
         let sessions = self.sessions.read().await;
         let live = sessions.get(session_id)?;
-        Some((live.cmd_tx.clone(), live.output_tx.subscribe()))
+        Some((
+            live.cmd_tx.clone(),
+            live.output_tx.subscribe(),
+            live.collab_tx.subscribe(),
+        ))
     }
 
     pub async fn is_live(&self, session_id: &str) -> bool {
         self.sessions.read().await.contains_key(session_id)
+    }
+
+    /// Add a participant to a session. Auto-broadcasts `PeerJoined` to all subscribers.
+    /// Returns the assigned color.
+    pub async fn add_participant(
+        &self,
+        session_id: &str,
+        user_id: Uuid,
+        name: String,
+        role: Role,
+    ) -> Option<String> {
+        let mut sessions = self.sessions.write().await;
+        let live = sessions.get_mut(session_id)?;
+
+        let color = assign_color(live.color_counter);
+        live.color_counter += 1;
+
+        let participant = ConnectedParticipant {
+            user_id,
+            name: name.clone(),
+            role,
+            color: color.clone(),
+        };
+        live.participants.insert(user_id, participant);
+
+        // Broadcast PeerJoined to all collab subscribers
+        let _ = live.collab_tx.send(ServerMessage::PeerJoined {
+            user_id,
+            name,
+            role,
+            color: color.clone(),
+        });
+
+        Some(color)
+    }
+
+    /// Remove a participant from a session. Auto-broadcasts `PeerLeft` to all subscribers.
+    pub async fn remove_participant(&self, session_id: &str, user_id: Uuid) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(live) = sessions.get_mut(session_id) {
+            if live.participants.remove(&user_id).is_some() {
+                let _ = live.collab_tx.send(ServerMessage::PeerLeft { user_id });
+            }
+        }
+    }
+
+    /// Get a snapshot of all participants in a session.
+    pub async fn get_participants(&self, session_id: &str) -> Vec<ConnectedParticipant> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(session_id)
+            .map(|live| live.participants.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Broadcast an arbitrary collaboration message to all subscribers in a session.
+    pub async fn broadcast_collab(&self, session_id: &str, msg: ServerMessage) {
+        let sessions = self.sessions.read().await;
+        if let Some(live) = sessions.get(session_id) {
+            let _ = live.collab_tx.send(msg);
+        }
+    }
+
+    /// Update a participant's role and broadcast `PermUpdate` to all subscribers.
+    pub async fn update_participant_role(
+        &self,
+        session_id: &str,
+        user_id: Uuid,
+        new_role: Role,
+    ) -> bool {
+        let mut sessions = self.sessions.write().await;
+        let Some(live) = sessions.get_mut(session_id) else {
+            return false;
+        };
+        let Some(participant) = live.participants.get_mut(&user_id) else {
+            return false;
+        };
+
+        participant.role = new_role;
+
+        let _ = live.collab_tx.send(ServerMessage::PermUpdate {
+            user_id,
+            new_role,
+        });
+
+        true
     }
 }

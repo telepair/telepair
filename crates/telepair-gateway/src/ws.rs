@@ -65,7 +65,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
 
     // Start or join the live PTY session
     let hub = &state.hub;
-    let (cmd_tx, mut output_rx) = if hub.is_live(&session_id).await {
+    let (cmd_tx, mut output_rx, _collab_rx) = if hub.is_live(&session_id).await {
         match hub.join_session(&session_id).await {
             Some(channels) => channels,
             None => return,
