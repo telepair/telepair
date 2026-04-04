@@ -79,6 +79,24 @@ pub async fn create_session(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    // Check required_role if set on the target
+    if let Some(target) = state
+        .targets
+        .list_targets()
+        .iter()
+        .find(|t| t.name == body.target_name)
+    {
+        if let Some(required) = &target.required_role {
+            // Admin users are always allowed
+            if !user.is_admin {
+                // Non-admin users are only allowed if required_role is Viewer
+                if *required != telepair_core::permission::Role::Viewer {
+                    return Err(StatusCode::FORBIDDEN);
+                }
+            }
+        }
+    }
+
     let mode = match body.input_mode.as_deref() {
         Some("multiplexed") => InputMode::Multiplexed,
         _ => InputMode::Serialized,
@@ -168,6 +186,31 @@ pub struct RedeemInviteRequest {
     pub token: String,
 }
 
+pub async fn close_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let user = extract_user(&state, &headers).await?;
+    let session = state
+        .sessions
+        .storage()
+        .get_session(&session_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if session.owner_id != user.id {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    state
+        .sessions
+        .close_session(&session_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state.hub.stop_session(&session_id).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn redeem_invite(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -175,19 +218,29 @@ pub async fn redeem_invite(
 ) -> Result<impl IntoResponse, StatusCode> {
     let user = extract_user(&state, &headers).await?;
 
+    // Validate first (does not consume)
     let invite = state
+        .sessions
+        .storage()
+        .validate_invite(&body.token)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // Upsert participant (idempotent — safe if user already has a row)
+    state
+        .sessions
+        .storage()
+        .upsert_participant(&invite.session_id, user.id, invite.role)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Then consume the invite (increment used_count)
+    state
         .sessions
         .storage()
         .consume_invite(&body.token)
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    let _ = state
-        .sessions
-        .storage()
-        .add_participant(&invite.session_id, user.id, invite.role)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(serde_json::json!({
         "session_id": invite.session_id,

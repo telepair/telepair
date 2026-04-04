@@ -3,7 +3,7 @@ import { createSignal, onCleanup, Show, createMemo } from 'solid-js';
 import { useParams, useNavigate } from '@solidjs/router';
 import { auth } from '../stores/auth';
 import { TelepairSocket } from '../lib/ws';
-import { encodeInput, decodeOutput } from '../lib/protocol';
+import { encodeInput } from '../lib/protocol';
 import type { ServerMessage, Role, ParticipantInfo } from '../lib/protocol';
 import type { TerminalHandle } from '../components/Terminal';
 import type { ChatMessage } from '../components/ChatPanel';
@@ -25,20 +25,32 @@ export default function SessionPage() {
   const [chatMessages, setChatMessages] = createSignal<ChatMessage[]>([]);
   const [showInvite, setShowInvite] = createSignal(false);
   const [sidebarOpen, setSidebarOpen] = createSignal(true);
+  const [currentUserId, setCurrentUserId] = createSignal('');
 
   let termHandle: TerminalHandle | undefined;
+  let pendingOutput: Uint8Array[] = [];
   let socket: TelepairSocket | undefined;
 
   const isOwner = createMemo(() => role() === 'owner');
+
+  const handleBinary = (data: Uint8Array) => {
+    if (termHandle) {
+      termHandle.write(data);
+    } else {
+      pendingOutput.push(data);
+    }
+  };
 
   const handleMessage = (msg: ServerMessage) => {
     switch (msg.type) {
       case 'SessionState':
         setRole(msg.your_role);
         setParticipants(msg.participants);
-        break;
-      case 'TermOutput':
-        termHandle?.write(decodeOutput(msg.data));
+        // Find our user_id from participants by matching our assigned role
+        {
+          const me = msg.participants.find((p: ParticipantInfo) => p.role === msg.your_role);
+          if (me) setCurrentUserId(me.user_id);
+        }
         break;
       case 'PeerJoined':
         setParticipants((prev) => [
@@ -55,12 +67,17 @@ export default function SessionPage() {
           { user_id: msg.user_id, name: msg.name, text: msg.text, ts: msg.ts },
         ]);
         break;
+      case 'PeerCursor':
+        break;
       case 'PermUpdate':
         setParticipants((prev) =>
           prev.map((p) =>
             p.user_id === msg.user_id ? { ...p, role: msg.new_role } : p
           )
         );
+        if (msg.user_id === currentUserId()) {
+          setRole(msg.new_role);
+        }
         break;
       case 'Error':
         setErrorMsg(`${msg.code}: ${msg.message}`);
@@ -87,7 +104,7 @@ export default function SessionPage() {
   };
 
   // Connect WebSocket
-  socket = new TelepairSocket(handleMessage, handleStatus);
+  socket = new TelepairSocket(handleMessage, handleBinary, handleStatus);
   socket.connect(params.id, auth.token());
 
   onCleanup(() => {
@@ -120,7 +137,11 @@ export default function SessionPage() {
           <Terminal
             onData={handleData}
             onResize={handleResize}
-            ref={(h) => { termHandle = h; }}
+            ref={(h) => {
+              termHandle = h;
+              for (const data of pendingOutput) h.write(data);
+              pendingOutput = [];
+            }}
           />
         </div>
 

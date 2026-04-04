@@ -13,15 +13,15 @@ use telepair_gateway::state::AppState;
 #[command(name = "telepair", version, about = "Web terminal collaboration tool")]
 struct Cli {
     /// Enable the agent role (PTY management, virtual targets)
-    #[arg(long)]
+    #[arg(long, hide = true)]
     agent: bool,
 
     /// Enable the control role (auth, sessions, storage)
-    #[arg(long)]
+    #[arg(long, hide = true)]
     control: bool,
 
     /// Enable the gateway role (HTTP/WS endpoints)
-    #[arg(long)]
+    #[arg(long, hide = true)]
     gateway: bool,
 
     /// Server bind address
@@ -97,13 +97,28 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Close any sessions left "active" from a previous unclean shutdown
+    match storage.close_stale_sessions().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("closed {n} stale session(s) from previous run"),
+        Err(e) => tracing::warn!("failed to close stale sessions: {e}"),
+    }
+
     // Auto-create admin user on first run
     let auth = TokenAuthProvider::new(storage.clone());
     if storage.get_user_by_name("admin").await?.is_none() {
         let (_, token) = auth.setup_initial_admin("admin").await?;
+        let token_file = data_dir.join("admin_token");
+        std::fs::write(&token_file, &token)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))?;
+        }
         tracing::info!("=== First run: admin user created ===");
-        tracing::info!("Admin token: {token}");
-        tracing::info!("Save this token — it won't be shown again!");
+        tracing::info!("Admin token saved to: {}", token_file.display());
+        eprintln!("Admin token: {token}");
+        eprintln!("Save this token — it won't be shown again!");
     }
 
     if gateway {
@@ -116,7 +131,12 @@ async fn main() -> anyhow::Result<()> {
         if let Some(dir) = &cli.web_dir {
             tracing::info!("serving web frontend from {}", dir.display());
         }
-        axum::serve(listener, router).await?;
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                tokio::signal::ctrl_c().await.ok();
+                tracing::info!("shutting down gracefully...");
+            })
+            .await?;
     } else {
         tracing::info!("no gateway role — running headless");
         // In a future cluster mode, agent/control-only instances would

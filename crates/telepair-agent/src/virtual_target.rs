@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use telepair_core::target::{substitute_env_vars, Target, TargetConfig, TargetKind};
 
 pub struct TargetEngine {
@@ -31,8 +33,8 @@ impl TargetEngine {
         &self.targets
     }
 
-    /// Resolve a target name to (command, args) with env substitution applied.
-    pub fn resolve(&self, name: &str) -> Option<(String, Vec<String>)> {
+    /// Resolve a target name to (command, args, env) with env substitution applied.
+    pub fn resolve(&self, name: &str) -> Option<(String, Vec<String>, HashMap<String, String>)> {
         let target = self.targets.iter().find(|t| t.name == name)?;
         match target.kind {
             TargetKind::Local => {
@@ -41,13 +43,18 @@ impl TargetEngine {
                     .as_deref()
                     .map(substitute_env_vars)
                     .unwrap_or_else(crate::default_shell);
-                Some((shell, vec![]))
+                Some((shell, vec![], HashMap::new()))
             }
             TargetKind::Virtual => {
                 let cmd = substitute_env_vars(target.command.as_deref()?);
                 let args: Vec<String> =
                     target.args.iter().map(|a| substitute_env_vars(a)).collect();
-                Some((cmd, args))
+                let env: HashMap<String, String> = target
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), substitute_env_vars(v)))
+                    .collect();
+                Some((cmd, args, env))
             }
         }
     }

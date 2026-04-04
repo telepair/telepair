@@ -21,7 +21,7 @@ impl AppState {
         let auth = Arc::new(TokenAuthProvider::new(storage.clone()));
         let sessions = Arc::new(SessionService::new(storage.clone()));
         let targets = Arc::new(TargetService::new(engine));
-        let hub = Arc::new(SessionHub::new());
+        let hub = Arc::new(SessionHub::new(storage.clone()));
         Self {
             auth,
             sessions,

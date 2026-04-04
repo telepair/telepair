@@ -7,6 +7,7 @@ use uuid::Uuid;
 use telepair_agent::pty::PtyManager;
 use telepair_core::permission::Role;
 use telepair_core::protocol::ServerMessage;
+use telepair_core::storage::{SqliteStorage, Storage};
 
 /// Color palette for participant cursors / identifiers.
 const COLORS: &[&str] = &[
@@ -49,27 +50,25 @@ struct LiveSession {
 
 pub struct SessionHub {
     sessions: Arc<RwLock<HashMap<String, LiveSession>>>,
-}
-
-impl Default for SessionHub {
-    fn default() -> Self {
-        Self::new()
-    }
+    storage: Arc<SqliteStorage>,
 }
 
 impl SessionHub {
-    pub fn new() -> Self {
+    pub fn new(storage: Arc<SqliteStorage>) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            storage,
         }
     }
 
-    /// Spawn a PTY for a session. Returns channels for I/O and collaboration.
-    pub async fn start_session(
+    /// Atomic start-or-join: check if the session is live and join it, or spawn
+    /// a new PTY — all under a single write lock to prevent TOCTOU races.
+    pub async fn start_or_join(
         &self,
         session_id: &str,
         command: &str,
         args: &[String],
+        env: &HashMap<String, String>,
         cols: u16,
         rows: u16,
     ) -> Result<
@@ -80,9 +79,21 @@ impl SessionHub {
         ),
         String,
     > {
+        let mut sessions = self.sessions.write().await;
+
+        // Fast path: session already running — just subscribe
+        if let Some(live) = sessions.get(session_id) {
+            return Ok((
+                live.cmd_tx.clone(),
+                live.output_tx.subscribe(),
+                live.collab_tx.subscribe(),
+            ));
+        }
+
+        // Slow path: spawn a new PTY
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let mut pty =
-            PtyManager::spawn_command(command, &args_ref, cols, rows).map_err(|e| e.to_string())?;
+        let mut pty = PtyManager::spawn_command(command, &args_ref, cols, rows, env)
+            .map_err(|e| e.to_string())?;
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<PtyCommand>(256);
         let (output_tx, output_rx) = broadcast::channel::<Vec<u8>>(256);
@@ -90,7 +101,8 @@ impl SessionHub {
 
         let output_tx_clone = output_tx.clone();
         let session_id_owned = session_id.to_string();
-        let sessions = self.sessions.clone();
+        let sessions_arc = self.sessions.clone();
+        let storage_clone = self.storage.clone();
 
         // PTY I/O loop -- single task owns the PtyManager
         tokio::spawn(async move {
@@ -134,8 +146,11 @@ impl SessionHub {
                 }
             }
 
-            // Cleanup
-            sessions.write().await.remove(&session_id_owned);
+            // Cleanup: remove from in-memory map and close in DB
+            sessions_arc.write().await.remove(&session_id_owned);
+            if let Err(e) = storage_clone.close_session(&session_id_owned).await {
+                tracing::warn!(session = %session_id_owned, "failed to close session in DB: {e}");
+            }
         });
 
         let live = LiveSession {
@@ -145,34 +160,15 @@ impl SessionHub {
             participants: HashMap::new(),
             color_counter: 0,
         };
-        self.sessions
-            .write()
-            .await
-            .insert(session_id.to_string(), live);
+        sessions.insert(session_id.to_string(), live);
 
         Ok((cmd_tx, output_rx, collab_rx))
     }
 
-    /// Join an existing live session (get command sender + output receiver + collab receiver).
-    pub async fn join_session(
-        &self,
-        session_id: &str,
-    ) -> Option<(
-        mpsc::Sender<PtyCommand>,
-        broadcast::Receiver<Vec<u8>>,
-        broadcast::Receiver<ServerMessage>,
-    )> {
-        let sessions = self.sessions.read().await;
-        let live = sessions.get(session_id)?;
-        Some((
-            live.cmd_tx.clone(),
-            live.output_tx.subscribe(),
-            live.collab_tx.subscribe(),
-        ))
-    }
-
-    pub async fn is_live(&self, session_id: &str) -> bool {
-        self.sessions.read().await.contains_key(session_id)
+    /// Force-stop a live session by removing it from the map.
+    /// The PTY I/O task will detect the dropped senders and exit.
+    pub async fn stop_session(&self, session_id: &str) {
+        self.sessions.write().await.remove(session_id);
     }
 
     /// Add a participant to a session. Auto-broadcasts `PeerJoined` to all subscribers.
