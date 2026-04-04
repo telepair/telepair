@@ -79,6 +79,24 @@ pub async fn create_session(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    // Check required_role if set on the target
+    if let Some(target) = state
+        .targets
+        .list_targets()
+        .iter()
+        .find(|t| t.name == body.target_name)
+    {
+        if let Some(required) = &target.required_role {
+            // Admin users are always allowed
+            if !user.is_admin {
+                // Non-admin users are only allowed if required_role is Viewer
+                if *required != telepair_core::permission::Role::Viewer {
+                    return Err(StatusCode::FORBIDDEN);
+                }
+            }
+        }
+    }
+
     let mode = match body.input_mode.as_deref() {
         Some("multiplexed") => InputMode::Multiplexed,
         _ => InputMode::Serialized,
