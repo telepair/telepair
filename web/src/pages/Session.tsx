@@ -51,7 +51,7 @@ export default function SessionPage() {
         break;
       case 'PeerChat':
         setChatMessages((prev) => [
-          ...prev,
+          ...prev.slice(-(500 - 1)),
           { user_id: msg.user_id, name: msg.name, text: msg.text, ts: msg.ts },
         ]);
         break;
@@ -127,10 +127,7 @@ export default function SessionPage() {
         <Show when={sidebarOpen()}>
           <aside class="sidebar">
             <div class="sidebar-section">
-              <ParticipantList
-                participants={participants()}
-                myRole={role()}
-              />
+              <ParticipantList participants={participants()} />
             </div>
             <div class="sidebar-section chat-section">
               <ChatPanel messages={chatMessages()} onSend={handleSendChat} />
@@ -154,13 +151,7 @@ export default function SessionPage() {
         }
         .back-btn { font-size: 13px; padding: 4px 10px; }
         .session-label code { font-family: var(--font-mono); color: var(--accent); }
-        .role-badge {
-          padding: 2px 8px; border-radius: 12px; font-size: 11px;
-          font-weight: 600; text-transform: uppercase;
-        }
-        .role-badge[data-role="owner"] { background: rgba(63,185,80,0.2); color: var(--success); }
-        .role-badge[data-role="operator"] { background: rgba(88,166,255,0.2); color: var(--accent); }
-        .role-badge[data-role="viewer"] { background: rgba(139,148,158,0.2); color: var(--text-secondary); }
+        .role-badge { padding: 2px 8px; border-radius: 12px; font-size: 11px; }
         .status-dot { width: 8px; height: 8px; border-radius: 50%; }
         .status-dot[data-status="connecting"] { background: var(--warning); }
         .status-dot[data-status="connected"] { background: var(--success); }

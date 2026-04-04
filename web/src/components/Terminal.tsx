@@ -75,9 +75,11 @@ export default function Terminal(props: TerminalProps) {
     // Forward resize
     term.onResize(({ cols, rows }) => props.onResize(cols, rows));
 
-    // Auto-fit on container resize
+    // Auto-fit on container resize (debounced to avoid flooding server with resize messages)
+    let resizeTimer: ReturnType<typeof setTimeout>;
     resizeObserver = new ResizeObserver(() => {
-      fitAddon?.fit();
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => fitAddon?.fit(), 100);
     });
     resizeObserver.observe(containerRef);
 

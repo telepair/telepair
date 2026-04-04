@@ -10,11 +10,44 @@ pub enum InputMode {
     Multiplexed,
 }
 
+impl InputMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Serialized => "serialized",
+            Self::Multiplexed => "multiplexed",
+        }
+    }
+}
+
+impl std::str::FromStr for InputMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "serialized" => Ok(Self::Serialized),
+            "multiplexed" => Ok(Self::Multiplexed),
+            _ => Err(format!("unknown input mode: {s}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionStatus {
     Active,
     Closed,
+}
+
+impl std::str::FromStr for SessionStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "active" => Ok(Self::Active),
+            "closed" => Ok(Self::Closed),
+            _ => Err(format!("unknown session status: {s}")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

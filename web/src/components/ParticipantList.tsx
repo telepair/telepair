@@ -1,9 +1,8 @@
 import { For } from 'solid-js';
-import type { ParticipantInfo, Role } from '../lib/protocol';
+import type { ParticipantInfo } from '../lib/protocol';
 
 interface ParticipantListProps {
   participants: ParticipantInfo[];
-  myRole: Role;
 }
 
 export default function ParticipantList(props: ParticipantListProps) {
@@ -28,10 +27,7 @@ export default function ParticipantList(props: ParticipantListProps) {
         .participant-row:hover { background: var(--bg-tertiary); }
         .participant-color { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
         .participant-name { flex: 1; }
-        .participant-role { font-size: 10px; padding: 1px 6px; border-radius: 8px; text-transform: uppercase; font-weight: 600; }
-        .participant-role[data-role="owner"] { background: rgba(63,185,80,0.2); color: var(--success); }
-        .participant-role[data-role="operator"] { background: rgba(88,166,255,0.2); color: var(--accent); }
-        .participant-role[data-role="viewer"] { background: rgba(139,148,158,0.2); color: var(--text-secondary); }
+        .participant-role { font-size: 10px; }
       `}</style>
     </div>
   );

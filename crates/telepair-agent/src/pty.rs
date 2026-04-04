@@ -12,7 +12,7 @@ pub struct PtyManager {
 
 impl PtyManager {
     pub fn spawn_shell(cols: u16, rows: u16) -> std::io::Result<Self> {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let shell = crate::default_shell();
         Self::spawn_command(&shell, &[], cols, rows)
     }
 
@@ -86,9 +86,7 @@ impl PtyManager {
     }
 
     pub async fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
-        self.writer.write_all(data)?;
-        self.writer.flush()?;
-        Ok(())
+        self.writer.write_all(data)
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> std::io::Result<()> {
