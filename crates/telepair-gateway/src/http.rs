@@ -186,6 +186,31 @@ pub struct RedeemInviteRequest {
     pub token: String,
 }
 
+pub async fn close_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let user = extract_user(&state, &headers).await?;
+    let session = state
+        .sessions
+        .storage()
+        .get_session(&session_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if session.owner_id != user.id {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    state
+        .sessions
+        .close_session(&session_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state.hub.stop_session(&session_id).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn redeem_invite(
     State(state): State<AppState>,
     headers: HeaderMap,
