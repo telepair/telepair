@@ -5,6 +5,7 @@ pub mod error;
 pub mod permission;
 pub mod protocol;
 pub mod session;
+pub mod storage;
 pub mod target;
 
 pub use error::{Error, Result};
