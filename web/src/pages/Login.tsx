@@ -11,7 +11,13 @@ export default function Login() {
     e.preventDefault();
     const ok = await auth.validateToken(input());
     if (ok) {
-      navigate('/', { replace: true });
+      const pendingInvite = sessionStorage.getItem('pending_invite');
+      if (pendingInvite) {
+        sessionStorage.removeItem('pending_invite');
+        navigate(`/join/${pendingInvite}`, { replace: true });
+      } else {
+        navigate('/', { replace: true });
+      }
     }
   };
 
