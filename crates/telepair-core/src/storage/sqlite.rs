@@ -362,14 +362,17 @@ impl Storage for SqliteStorage {
             }
         }
 
-        if invite.used_count >= invite.max_uses {
+        // Atomic increment with WHERE guard to prevent TOCTOU race
+        let result = sqlx::query(
+            "UPDATE invite_tokens SET used_count = used_count + 1 WHERE token_hash = ? AND used_count < max_uses",
+        )
+        .bind(&invite.token_hash)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
             return Err(Error::Auth("invite token has been fully used".into()));
         }
-
-        sqlx::query("UPDATE invite_tokens SET used_count = used_count + 1 WHERE token_hash = ?")
-            .bind(&invite.token_hash)
-            .execute(&self.pool)
-            .await?;
 
         Ok(InviteToken {
             used_count: invite.used_count + 1,
