@@ -1,4 +1,4 @@
-import { createSignal, For, onMount } from 'solid-js';
+import { createSignal, For, onMount, onCleanup } from 'solid-js';
 
 export interface ChatMessage {
   user_id: string;
@@ -26,6 +26,7 @@ export default function ChatPanel(props: ChatPanelProps) {
     if (container) {
       observer.observe(container, { childList: true });
     }
+    onCleanup(() => observer.disconnect());
   });
 
   const handleSend = () => {
