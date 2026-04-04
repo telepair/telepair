@@ -3,6 +3,7 @@ import { Router, Route, Navigate } from '@solidjs/router';
 import { Show } from 'solid-js';
 import { auth } from './stores/auth';
 import Login from './pages/Login';
+import Dashboard from './pages/Dashboard';
 
 function AuthGuard(props: { children: any }) {
   return (
@@ -12,13 +13,12 @@ function AuthGuard(props: { children: any }) {
   );
 }
 
-function DashboardPlaceholder() {
+function SessionPlaceholder() {
   return (
     <AuthGuard>
       <div style={{ padding: '40px', 'text-align': 'center' }}>
-        <h2>Dashboard</h2>
-        <p style={{ color: 'var(--text-secondary)' }}>Coming in Task 5</p>
-        <button onClick={() => auth.logout()} style={{ 'margin-top': '16px' }}>Logout</button>
+        <h2>Session</h2>
+        <p style={{ color: 'var(--text-secondary)' }}>Coming in Task 8</p>
       </div>
     </AuthGuard>
   );
@@ -28,7 +28,8 @@ export default function App() {
   return (
     <Router>
       <Route path="/login" component={Login} />
-      <Route path="/" component={DashboardPlaceholder} />
+      <Route path="/" component={() => <AuthGuard><Dashboard /></AuthGuard>} />
+      <Route path="/session/:id" component={SessionPlaceholder} />
     </Router>
   );
 }
