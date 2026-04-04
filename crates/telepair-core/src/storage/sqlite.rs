@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::error::{Error, Result};
 use crate::permission::Role;
-use crate::session::{InputMode, Participant, Session, SessionStatus, User};
+use crate::session::{InputMode, InviteToken, Participant, Session, SessionStatus, User};
 use crate::storage::Storage;
 
 pub struct SqliteStorage {
@@ -98,6 +98,24 @@ fn row_to_participant(r: &SqliteRow) -> Result<Participant> {
             .parse()
             .map_err(|e| Error::InvalidInput(format!("invalid timestamp: {e}")))?,
         left_at: None,
+    })
+}
+
+fn row_to_invite(r: &SqliteRow) -> Result<InviteToken> {
+    let role_str: String = r.get("role");
+    Ok(InviteToken {
+        token_hash: r.get("token_hash"),
+        session_id: r.get("session_id"),
+        role: match role_str.as_str() {
+            "owner" => Role::Owner,
+            "operator" => Role::Operator,
+            _ => Role::Viewer,
+        },
+        max_uses: r.get("max_uses"),
+        used_count: r.get("used_count"),
+        expires_at: r
+            .get::<Option<String>, _>("expires_at")
+            .and_then(|s| s.parse().ok()),
     })
 }
 
@@ -286,5 +304,76 @@ impl Storage for SqliteStorage {
         rows.into_iter()
             .map(|r| row_to_participant(&r))
             .collect::<Result<Vec<_>>>()
+    }
+
+    async fn create_invite(
+        &self,
+        session_id: &str,
+        role: Role,
+        max_uses: i32,
+        expires_at: Option<chrono::DateTime<Utc>>,
+    ) -> Result<(InviteToken, String)> {
+        let raw_token = nanoid::nanoid!(32);
+        let token_hash =
+            bcrypt::hash(&raw_token, 10).map_err(|e| Error::Auth(e.to_string()))?;
+
+        sqlx::query(
+            "INSERT INTO invite_tokens (token_hash, session_id, role, max_uses, used_count, expires_at) VALUES (?, ?, ?, ?, 0, ?)",
+        )
+        .bind(&token_hash)
+        .bind(session_id)
+        .bind(role.as_str())
+        .bind(max_uses)
+        .bind(expires_at.map(|t| t.to_rfc3339()))
+        .execute(&self.pool)
+        .await?;
+
+        let invite = InviteToken {
+            token_hash,
+            session_id: session_id.into(),
+            role,
+            max_uses,
+            used_count: 0,
+            expires_at,
+        };
+        Ok((invite, raw_token))
+    }
+
+    async fn validate_invite(&self, token: &str) -> Result<InviteToken> {
+        let rows = sqlx::query("SELECT * FROM invite_tokens")
+            .fetch_all(&self.pool)
+            .await?;
+
+        for row in rows {
+            let hash: String = row.get("token_hash");
+            if bcrypt::verify(token, &hash).unwrap_or(false) {
+                return row_to_invite(&row);
+            }
+        }
+        Err(Error::Auth("invalid invite token".into()))
+    }
+
+    async fn consume_invite(&self, token: &str) -> Result<InviteToken> {
+        let invite = self.validate_invite(token).await?;
+
+        if let Some(expires_at) = invite.expires_at {
+            if expires_at < Utc::now() {
+                return Err(Error::Auth("invite token has expired".into()));
+            }
+        }
+
+        if invite.used_count >= invite.max_uses {
+            return Err(Error::Auth("invite token has been fully used".into()));
+        }
+
+        sqlx::query("UPDATE invite_tokens SET used_count = used_count + 1 WHERE token_hash = ?")
+            .bind(&invite.token_hash)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(InviteToken {
+            used_count: invite.used_count + 1,
+            ..invite
+        })
     }
 }
