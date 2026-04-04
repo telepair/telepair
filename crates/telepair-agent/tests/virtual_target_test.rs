@@ -26,18 +26,20 @@ fn load_targets_from_yaml() {
 #[test]
 fn resolve_virtual_target() {
     let engine = TargetEngine::from_yaml(TEST_CONFIG).unwrap();
-    let (cmd, args) = engine.resolve("test-echo").unwrap();
+    let (cmd, args, env) = engine.resolve("test-echo").unwrap();
     assert_eq!(cmd, "echo");
     assert_eq!(args, vec!["hello", "world"]);
+    assert!(env.is_empty());
 }
 
 #[test]
 fn resolve_local_shell() {
     let engine = TargetEngine::from_yaml(TEST_CONFIG).unwrap();
-    let (cmd, args) = engine.resolve("local-shell").unwrap();
+    let (cmd, args, env) = engine.resolve("local-shell").unwrap();
     // Should resolve to $SHELL or /bin/sh
     assert!(!cmd.is_empty());
     assert!(args.is_empty());
+    assert!(env.is_empty());
 }
 
 #[test]

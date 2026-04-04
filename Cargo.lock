@@ -2163,10 +2163,12 @@ version = "0.1.0"
 dependencies = [
  "bcrypt",
  "chrono",
+ "hex",
  "nanoid",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "sqlx",
  "thiserror 2.0.18",
  "tokio",

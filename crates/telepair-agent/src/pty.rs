@@ -1,5 +1,6 @@
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
-use std::io::{Read, Write};
+use std::collections::HashMap;
+use std::io::Read;
 use tokio::sync::mpsc;
 use tokio::task;
 
@@ -7,13 +8,13 @@ pub struct PtyManager {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     output_rx: mpsc::Receiver<Vec<u8>>,
-    writer: Box<dyn Write + Send>,
+    input_tx: mpsc::Sender<Vec<u8>>,
 }
 
 impl PtyManager {
     pub fn spawn_shell(cols: u16, rows: u16) -> std::io::Result<Self> {
         let shell = crate::default_shell();
-        Self::spawn_command(&shell, &[], cols, rows)
+        Self::spawn_command(&shell, &[], cols, rows, &HashMap::new())
     }
 
     pub fn spawn_command(
@@ -21,6 +22,7 @@ impl PtyManager {
         args: &[&str],
         cols: u16,
         rows: u16,
+        env: &HashMap<String, String>,
     ) -> std::io::Result<Self> {
         let pty_system = NativePtySystem::default();
         let pair = pty_system
@@ -36,6 +38,9 @@ impl PtyManager {
         for arg in args {
             cmd.arg(*arg);
         }
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
 
         let child = pair
             .slave
@@ -45,7 +50,7 @@ impl PtyManager {
         // Drop the slave side — we only use master
         drop(pair.slave);
 
-        let writer = pair
+        let mut writer = pair
             .master
             .take_writer()
             .map_err(std::io::Error::other)?;
@@ -73,11 +78,22 @@ impl PtyManager {
             }
         });
 
+        // Spawn blocking writer thread
+        let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(256);
+        task::spawn_blocking(move || {
+            use std::io::Write;
+            while let Some(data) = input_rx.blocking_recv() {
+                if writer.write_all(&data).is_err() {
+                    break;
+                }
+            }
+        });
+
         Ok(Self {
             master: pair.master,
             child,
             output_rx,
-            writer,
+            input_tx,
         })
     }
 
@@ -86,7 +102,10 @@ impl PtyManager {
     }
 
     pub async fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
-        self.writer.write_all(data)
+        self.input_tx
+            .send(data.to_vec())
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY writer closed"))
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> std::io::Result<()> {

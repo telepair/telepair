@@ -72,6 +72,16 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         }
     };
 
+    if session.status == telepair_core::session::SessionStatus::Closed {
+        send_error(
+            &mut ws_tx,
+            "SESSION_CLOSED",
+            "this session has been closed".into(),
+        )
+        .await;
+        return;
+    }
+
     // 3. Role lookup from DB participants
     let db_participants = state
         .sessions
@@ -105,24 +115,31 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
             }
         });
 
-    // 4. Start or join the live PTY session
+    // 4. Start or join the live PTY session (atomic — no TOCTOU race)
     let hub = &state.hub;
-    let (cmd_tx, mut output_rx, mut collab_rx) = if hub.is_live(&session_id).await {
-        match hub.join_session(&session_id).await {
-            Some(channels) => channels,
-            None => return,
-        }
-    } else {
-        // Resolve target and spawn PTY
-        let (cmd, args) = match state.targets.resolve(&session.target_name) {
-            Some(resolved) => resolved,
-            None => return,
-        };
-        match hub.start_session(&session_id, &cmd, &args, 80, 24).await {
-            Ok(channels) => channels,
-            Err(_) => return,
+    let (cmd, args, env) = match state.targets.resolve(&session.target_name) {
+        Some(resolved) => resolved,
+        None => {
+            send_error(
+                &mut ws_tx,
+                "TARGET_NOT_FOUND",
+                format!("target {} not found", session.target_name),
+            )
+            .await;
+            return;
         }
     };
+    let (cmd_tx, mut output_rx, mut collab_rx) =
+        match hub
+            .start_or_join(&session_id, &cmd, &args, &env, 80, 24)
+            .await
+        {
+            Ok(channels) => channels,
+            Err(e) => {
+                send_error(&mut ws_tx, "PTY_ERROR", e).await;
+                return;
+            }
+        };
 
     // 5. Register participant in the hub
     let _color = hub
