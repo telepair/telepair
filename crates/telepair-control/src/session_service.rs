@@ -37,4 +37,8 @@ impl SessionService {
     pub async fn list_active_sessions(&self) -> Result<Vec<Session>> {
         self.storage.list_active_sessions().await
     }
+
+    pub async fn list_sessions_for_user(&self, user_id: Uuid) -> Result<Vec<Session>> {
+        self.storage.list_sessions_for_user(user_id).await
+    }
 }

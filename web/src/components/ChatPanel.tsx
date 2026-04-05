@@ -1,4 +1,4 @@
-import { createSignal, For, onMount, onCleanup } from 'solid-js';
+import { createSignal, createEffect, For } from 'solid-js';
 
 export interface ChatMessage {
   user_id: string;
@@ -16,17 +16,9 @@ export default function ChatPanel(props: ChatPanelProps) {
   const [input, setInput] = createSignal('');
   let messagesEnd: HTMLDivElement | undefined;
 
-  const scrollToBottom = () => {
+  createEffect(() => {
+    props.messages.length; // track reactive dependency
     messagesEnd?.scrollIntoView({ behavior: 'smooth' });
-  };
-
-  onMount(() => {
-    const observer = new MutationObserver(scrollToBottom);
-    const container = messagesEnd?.parentElement;
-    if (container) {
-      observer.observe(container, { childList: true });
-    }
-    onCleanup(() => observer.disconnect());
   });
 
   const handleSend = () => {

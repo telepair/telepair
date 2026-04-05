@@ -73,36 +73,41 @@ impl SqliteStorage {
             .await?;
         }
 
+        // Index on sessions.status for faster list_active_sessions
+        sqlx::raw_sql(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);",
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 }
 
+fn parse_uuid(s: String) -> Result<Uuid> {
+    s.parse()
+        .map_err(|e| Error::InvalidInput(format!("invalid uuid: {e}")))
+}
+
+fn parse_datetime(s: String) -> Result<chrono::DateTime<Utc>> {
+    s.parse()
+        .map_err(|e| Error::InvalidInput(format!("invalid timestamp: {e}")))
+}
+
 fn row_to_user(r: &SqliteRow) -> Result<User> {
     Ok(User {
-        id: r
-            .get::<String, _>("id")
-            .parse()
-            .map_err(|e| Error::InvalidInput(format!("invalid user id: {e}")))?,
+        id: parse_uuid(r.get("id"))?,
         name: r.get("name"),
         is_admin: r.get("is_admin"),
-        created_at: r
-            .get::<String, _>("created_at")
-            .parse()
-            .map_err(|e| Error::InvalidInput(format!("invalid timestamp: {e}")))?,
-        updated_at: r
-            .get::<String, _>("updated_at")
-            .parse()
-            .map_err(|e| Error::InvalidInput(format!("invalid timestamp: {e}")))?,
+        created_at: parse_datetime(r.get("created_at"))?,
+        updated_at: parse_datetime(r.get("updated_at"))?,
     })
 }
 
 fn row_to_session(r: &SqliteRow) -> Result<Session> {
     Ok(Session {
         id: r.get("id"),
-        owner_id: r
-            .get::<String, _>("owner_id")
-            .parse()
-            .map_err(|e| Error::InvalidInput(format!("invalid user id: {e}")))?,
+        owner_id: parse_uuid(r.get("owner_id"))?,
         target_name: r.get("target_name"),
         input_mode: r
             .get::<String, _>("input_mode")
@@ -112,10 +117,7 @@ fn row_to_session(r: &SqliteRow) -> Result<Session> {
             .get::<String, _>("status")
             .parse()
             .map_err(|e: String| Error::InvalidInput(e))?,
-        created_at: r
-            .get::<String, _>("created_at")
-            .parse()
-            .map_err(|e| Error::InvalidInput(format!("invalid timestamp: {e}")))?,
+        created_at: parse_datetime(r.get("created_at"))?,
         closed_at: r
             .get::<Option<String>, _>("closed_at")
             .and_then(|s| s.parse().ok()),
@@ -125,18 +127,12 @@ fn row_to_session(r: &SqliteRow) -> Result<Session> {
 fn row_to_participant(r: &SqliteRow) -> Result<Participant> {
     Ok(Participant {
         session_id: r.get("session_id"),
-        user_id: r
-            .get::<String, _>("user_id")
-            .parse()
-            .map_err(|e| Error::InvalidInput(format!("invalid user id: {e}")))?,
+        user_id: parse_uuid(r.get("user_id"))?,
         role: r
             .get::<String, _>("role")
             .parse()
             .map_err(|e: String| Error::InvalidInput(e))?,
-        joined_at: r
-            .get::<String, _>("joined_at")
-            .parse()
-            .map_err(|e| Error::InvalidInput(format!("invalid timestamp: {e}")))?,
+        joined_at: parse_datetime(r.get("joined_at"))?,
         left_at: r
             .get::<Option<String>, _>("left_at")
             .and_then(|s| s.parse().ok()),
@@ -173,6 +169,58 @@ fn generate_token() -> Result<(String, String, String)> {
     let bcrypt_hash = bcrypt::hash(&raw, BCRYPT_COST).map_err(|e| Error::Auth(e.to_string()))?;
     let sha256_hex = token_sha256(&raw);
     Ok((raw, bcrypt_hash, sha256_hex))
+}
+
+fn check_invite_validity(invite: &InviteToken) -> Result<()> {
+    if let Some(expires_at) = invite.expires_at {
+        if expires_at < Utc::now() {
+            return Err(Error::Auth("invite token has expired".into()));
+        }
+    }
+    if invite.used_count >= invite.max_uses {
+        return Err(Error::Auth("invite token has been fully used".into()));
+    }
+    Ok(())
+}
+
+impl SqliteStorage {
+    /// Look up an invite by raw token (SHA-256 fast path + bcrypt legacy fallback).
+    /// Does NOT check expiry or usage limits.
+    async fn find_invite_by_token(&self, token: &str) -> Result<InviteToken> {
+        let sha256_hex = token_sha256(token);
+
+        // Fast path: O(1) indexed lookup by SHA-256
+        if let Some(row) = sqlx::query("SELECT * FROM invite_tokens WHERE token_sha256 = ?")
+            .bind(&sha256_hex)
+            .fetch_optional(&self.pool)
+            .await?
+        {
+            return row_to_invite(&row);
+        }
+
+        // Slow path: legacy invite tokens without token_sha256 — bcrypt scan
+        let rows = sqlx::query("SELECT * FROM invite_tokens WHERE token_sha256 IS NULL")
+            .fetch_all(&self.pool)
+            .await?;
+
+        for row in rows {
+            let hash: String = row.get("token_hash");
+            if bcrypt::verify(token, &hash).unwrap_or(false) {
+                // Backfill token_sha256 for future O(1) lookups
+                let token_hash_val: String = row.get("token_hash");
+                let _ = sqlx::query(
+                    "UPDATE invite_tokens SET token_sha256 = ? WHERE token_hash = ?",
+                )
+                .bind(&sha256_hex)
+                .bind(&token_hash_val)
+                .execute(&self.pool)
+                .await;
+                return row_to_invite(&row);
+            }
+        }
+
+        Err(Error::Auth("invalid invite token".into()))
+    }
 }
 
 impl Storage for SqliteStorage {
@@ -328,6 +376,23 @@ impl Storage for SqliteStorage {
             .collect::<Result<Vec<_>>>()
     }
 
+    async fn list_sessions_for_user(&self, user_id: Uuid) -> Result<Vec<Session>> {
+        let uid = user_id.to_string();
+        let rows = sqlx::query(
+            "SELECT DISTINCT s.* FROM sessions s \
+             LEFT JOIN participants p ON p.session_id = s.id AND p.user_id = ? AND p.left_at IS NULL \
+             WHERE s.status = 'active' AND (s.owner_id = ? OR p.user_id IS NOT NULL)",
+        )
+        .bind(&uid)
+        .bind(&uid)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| row_to_session(&r))
+            .collect::<Result<Vec<_>>>()
+    }
+
     async fn close_stale_sessions(&self) -> Result<u64> {
         let now = Utc::now();
         let result = sqlx::query(
@@ -456,69 +521,19 @@ impl Storage for SqliteStorage {
     }
 
     async fn validate_invite(&self, token: &str) -> Result<InviteToken> {
-        let sha256_hex = token_sha256(token);
-
-        // Fast path: O(1) indexed lookup by SHA-256
-        if let Some(row) = sqlx::query("SELECT * FROM invite_tokens WHERE token_sha256 = ?")
-            .bind(&sha256_hex)
-            .fetch_optional(&self.pool)
-            .await?
-        {
-            let invite = row_to_invite(&row)?;
-            // Check expiry
-            if let Some(expires_at) = invite.expires_at {
-                if expires_at < Utc::now() {
-                    return Err(Error::Auth("invite token has expired".into()));
-                }
-            }
-            // Check usage limit
-            if invite.used_count >= invite.max_uses {
-                return Err(Error::Auth("invite token has been fully used".into()));
-            }
-            return Ok(invite);
-        }
-
-        // Slow path: legacy invite tokens without token_sha256 — bcrypt scan only those rows
-        let rows = sqlx::query("SELECT * FROM invite_tokens WHERE token_sha256 IS NULL")
-            .fetch_all(&self.pool)
-            .await?;
-
-        for row in rows {
-            let hash: String = row.get("token_hash");
-            if bcrypt::verify(token, &hash).unwrap_or(false) {
-                // Backfill token_sha256 for future O(1) lookups
-                let token_hash_val: String = row.get("token_hash");
-                let _ = sqlx::query(
-                    "UPDATE invite_tokens SET token_sha256 = ? WHERE token_hash = ?",
-                )
-                .bind(&sha256_hex)
-                .bind(&token_hash_val)
-                .execute(&self.pool)
-                .await;
-                let invite = row_to_invite(&row)?;
-                // Check expiry
-                if let Some(expires_at) = invite.expires_at {
-                    if expires_at < Utc::now() {
-                        return Err(Error::Auth("invite token has expired".into()));
-                    }
-                }
-                // Check usage limit
-                if invite.used_count >= invite.max_uses {
-                    return Err(Error::Auth("invite token has been fully used".into()));
-                }
-                return Ok(invite);
-            }
-        }
-
-        Err(Error::Auth("invalid invite token".into()))
+        let invite = self.find_invite_by_token(token).await?;
+        check_invite_validity(&invite)?;
+        Ok(invite)
     }
 
     async fn consume_invite(&self, token: &str) -> Result<InviteToken> {
-        let invite = self.validate_invite(token).await?;
+        let invite = self.find_invite_by_token(token).await?;
 
-        // Atomic increment with WHERE guard for both max_uses and expiry
+        // Atomic increment with WHERE guard — no separate validity pre-check needed
         let result = sqlx::query(
-            "UPDATE invite_tokens SET used_count = used_count + 1 WHERE token_hash = ? AND used_count < max_uses AND (expires_at IS NULL OR expires_at > ?)",
+            "UPDATE invite_tokens SET used_count = used_count + 1 \
+             WHERE token_hash = ? AND used_count < max_uses \
+             AND (expires_at IS NULL OR expires_at > ?)",
         )
         .bind(&invite.token_hash)
         .bind(Utc::now().to_rfc3339())
@@ -526,6 +541,9 @@ impl Storage for SqliteStorage {
         .await?;
 
         if result.rows_affected() == 0 {
+            // Determine why: expired or fully used
+            check_invite_validity(&invite)?;
+            // Race condition: another request consumed the last use between our lookup and UPDATE
             return Err(Error::Auth("invite token has been fully used".into()));
         }
 

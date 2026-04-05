@@ -63,8 +63,9 @@ impl SessionHub {
         }
     }
 
-    /// Atomic start-or-join: check if the session is live and join it, or spawn
-    /// a new PTY — all under a single write lock to prevent TOCTOU races.
+    /// Start or join a live session. Checks under read lock first, spawns
+    /// PTY without holding any lock, then inserts under write lock with a
+    /// TOCTOU re-check.
     pub async fn start_or_join(
         &self,
         session_id: &str,
@@ -82,19 +83,20 @@ impl SessionHub {
         ),
         String,
     > {
-        let mut sessions = self.sessions.write().await;
-
-        // Fast path: session already running — just subscribe
-        if let Some(live) = sessions.get(session_id) {
-            return Ok((
-                live.cmd_tx.clone(),
-                live.output_tx.subscribe(),
-                live.collab_tx.subscribe(),
-                live.shutdown_tx.subscribe(),
-            ));
+        // Fast path: session already running — subscribe under read lock
+        {
+            let sessions = self.sessions.read().await;
+            if let Some(live) = sessions.get(session_id) {
+                return Ok((
+                    live.cmd_tx.clone(),
+                    live.output_tx.subscribe(),
+                    live.collab_tx.subscribe(),
+                    live.shutdown_tx.subscribe(),
+                ));
+            }
         }
 
-        // Slow path: spawn a new PTY
+        // Spawn PTY without holding any lock (fork/exec can be slow)
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let mut pty = PtyManager::spawn_command(command, &args_ref, cols, rows, env)
             .map_err(|e| e.to_string())?;
@@ -104,6 +106,20 @@ impl SessionHub {
         let (collab_tx, collab_rx) = broadcast::channel::<ServerMessage>(64);
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
+        // Re-acquire write lock and check for TOCTOU race
+        let mut sessions = self.sessions.write().await;
+        if let Some(live) = sessions.get(session_id) {
+            // Another task spawned the session while we were spawning — use theirs,
+            // our PTY will be dropped and the child process cleaned up
+            drop(pty);
+            return Ok((
+                live.cmd_tx.clone(),
+                live.output_tx.subscribe(),
+                live.collab_tx.subscribe(),
+                live.shutdown_tx.subscribe(),
+            ));
+        }
+
         let output_tx_clone = output_tx.clone();
         let session_id_owned = session_id.to_string();
         let sessions_arc = self.sessions.clone();
@@ -112,10 +128,6 @@ impl SessionHub {
         // PTY I/O loop -- single task owns the PtyManager
         tokio::spawn(async move {
             loop {
-                // Use select to wait for either PTY output or a command.
-                // To avoid simultaneous &mut pty borrows, we capture the
-                // result into local variables and handle pty mutations after
-                // the select (when all futures have been dropped).
                 enum Action {
                     Output(Option<Vec<u8>>),
                     Command(Option<PtyCommand>),
@@ -131,7 +143,6 @@ impl SessionHub {
                         let _ = output_tx_clone.send(bytes);
                     }
                     Action::Output(None) => {
-                        // PTY closed
                         tracing::info!(session = %session_id_owned, "PTY process exited");
                         break;
                     }
@@ -144,7 +155,6 @@ impl SessionHub {
                         let _ = pty.resize(cols, rows);
                     }
                     Action::Command(None) => {
-                        // All senders dropped -- no more clients
                         tracing::info!(session = %session_id_owned, "all clients disconnected");
                         break;
                     }

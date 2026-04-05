@@ -6,7 +6,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use telepair_core::session::{InputMode, User};
+use telepair_core::permission::Role;
+use telepair_core::session::{InputMode, Session, User};
 use telepair_core::storage::Storage;
 
 use crate::state::AppState;
@@ -25,6 +26,24 @@ pub async fn extract_user(state: &AppState, headers: &HeaderMap) -> Result<User,
         .validate(token)
         .await
         .map_err(|_| StatusCode::UNAUTHORIZED)
+}
+
+async fn require_owned_session(
+    state: &AppState,
+    session_id: &str,
+    user: &User,
+) -> Result<Session, StatusCode> {
+    let session = state
+        .sessions
+        .storage()
+        .get_session(session_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if session.owner_id != user.id {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(session)
 }
 
 // --- Handlers ---
@@ -74,26 +93,18 @@ pub async fn create_session(
 ) -> Result<impl IntoResponse, StatusCode> {
     let user = extract_user(&state, &headers).await?;
 
-    // Verify target exists
-    if state.targets.resolve(&body.target_name).is_none() {
-        return Err(StatusCode::NOT_FOUND);
-    }
-
-    // Check required_role if set on the target
-    if let Some(target) = state
+    // Verify target exists and check required_role
+    let target = state
         .targets
         .list_targets()
         .iter()
         .find(|t| t.name == body.target_name)
-    {
-        if let Some(required) = &target.required_role {
-            // Admin users are always allowed
-            if !user.is_admin {
-                // Non-admin users are only allowed if required_role is Viewer
-                if *required != telepair_core::permission::Role::Viewer {
-                    return Err(StatusCode::FORBIDDEN);
-                }
-            }
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    if let Some(required) = &target.required_role {
+        if !user.is_admin && *required != Role::Viewer {
+            return Err(StatusCode::FORBIDDEN);
         }
     }
 
@@ -116,30 +127,11 @@ pub async fn list_sessions(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
     let user = extract_user(&state, &headers).await?;
-    let all_sessions = state
+    let visible = state
         .sessions
-        .list_active_sessions()
+        .list_sessions_for_user(user.id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Filter to sessions the user owns or participates in
-    let mut visible = Vec::new();
-    for session in all_sessions {
-        if session.owner_id == user.id {
-            visible.push(session);
-            continue;
-        }
-        if let Ok(participants) = state
-            .sessions
-            .storage()
-            .list_participants(&session.id)
-            .await
-        {
-            if participants.iter().any(|p| p.user_id == user.id) {
-                visible.push(session);
-            }
-        }
-    }
 
     Ok(Json(visible))
 }
@@ -148,7 +140,7 @@ pub async fn list_sessions(
 
 #[derive(Deserialize)]
 pub struct CreateInviteRequest {
-    pub role: String,
+    pub role: Role,
     #[serde(default = "default_max_uses")]
     pub max_uses: i32,
 }
@@ -164,24 +156,14 @@ pub async fn create_invite(
     Json(body): Json<CreateInviteRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let user = extract_user(&state, &headers).await?;
+    require_owned_session(&state, &session_id, &user).await?;
 
-    let session = state
-        .sessions
-        .storage()
-        .get_session(&session_id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    if session.owner_id != user.id {
-        return Err(StatusCode::FORBIDDEN);
+    // Only operator and viewer roles can be invited
+    if body.role == Role::Owner {
+        return Err(StatusCode::BAD_REQUEST);
     }
 
-    let role = match body.role.as_str() {
-        "operator" => telepair_core::permission::Role::Operator,
-        "viewer" => telepair_core::permission::Role::Viewer,
-        _ => return Err(StatusCode::BAD_REQUEST),
-    };
+    let role = body.role;
 
     let (invite, raw_token) = state
         .sessions
@@ -212,16 +194,7 @@ pub async fn close_session(
     Path(session_id): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let user = extract_user(&state, &headers).await?;
-    let session = state
-        .sessions
-        .storage()
-        .get_session(&session_id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-    if session.owner_id != user.id {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    require_owned_session(&state, &session_id, &user).await?;
     state
         .sessions
         .close_session(&session_id)

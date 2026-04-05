@@ -261,6 +261,10 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let user_name = user.name.clone();
     let input_mode = session.input_mode;
 
+    let can_forward_input = |role: Role| -> bool {
+        role.can_input() && !(input_mode == InputMode::Serialized && role != Role::Owner)
+    };
+
     loop {
         let current_role = *role_watch_rx.borrow();
         tokio::select! {
@@ -271,17 +275,9 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                         if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
                             match client_msg {
                                 ClientMessage::TermInput { data } => {
-                                    if current_role.can_input() {
-                                        // In serialized mode, only the owner can type
-                                        if input_mode == InputMode::Serialized
-                                            && current_role != Role::Owner
-                                        {
-                                            // Drop input from non-owners in serialized mode
-                                        } else {
-                                            let _ = cmd_tx.send(PtyCommand::Input(data)).await;
-                                        }
+                                    if can_forward_input(current_role) {
+                                        let _ = cmd_tx.send(PtyCommand::Input(data)).await;
                                     }
-                                    // Silently drop if viewer
                                 }
                                 ClientMessage::TermResize { cols, rows } => {
                                     if current_role.can_resize() {
@@ -308,14 +304,8 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                         }
                     }
                     Message::Binary(data) => {
-                        // Binary frame: direct PTY input (only if allowed)
-                        if current_role.can_input() {
-                            // In serialized mode, only the owner can type
-                            if input_mode == InputMode::Serialized && current_role != Role::Owner {
-                                // Drop input from non-owners in serialized mode
-                            } else {
-                                let _ = cmd_tx.send(PtyCommand::Input(data.to_vec())).await;
-                            }
+                        if can_forward_input(current_role) {
+                            let _ = cmd_tx.send(PtyCommand::Input(data.to_vec())).await;
                         }
                     }
                     Message::Close(_) => break,
