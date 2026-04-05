@@ -32,7 +32,7 @@ export interface TargetInfo {
 // --- Client → Server ---
 
 export type ClientMessage =
-  | { type: 'SessionJoin'; session_id: string; token: string }
+  | { type: 'SessionJoin'; session_id: string; token: string; cols: number; rows: number }
   | { type: 'TermInput'; data: number[] }
   | { type: 'TermResize'; cols: number; rows: number }
   | { type: 'CursorMove'; x: number; y: number }

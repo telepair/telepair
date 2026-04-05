@@ -50,7 +50,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // 1. Auth: wait for SessionJoin message with 5-second timeout
-    let user = match tokio::time::timeout(
+    let (user, initial_cols, initial_rows) = match tokio::time::timeout(
         std::time::Duration::from_secs(5),
         ws_rx.next(),
     )
@@ -58,15 +58,18 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     {
         Ok(Some(Ok(Message::Text(text)))) => {
             match serde_json::from_str::<ClientMessage>(&text) {
-                Ok(ClientMessage::SessionJoin { token, .. }) => {
-                    match state.auth.validate(&token).await {
-                        Ok(user) => user,
-                        Err(_) => {
-                            send_error(&mut ws_tx, "AUTH_FAILED", "invalid token".into()).await;
-                            return;
-                        }
+                Ok(ClientMessage::SessionJoin {
+                    token,
+                    cols,
+                    rows,
+                    ..
+                }) => match state.auth.validate(&token).await {
+                    Ok(user) => (user, cols, rows),
+                    Err(_) => {
+                        send_error(&mut ws_tx, "AUTH_FAILED", "invalid token".into()).await;
+                        return;
                     }
-                }
+                },
                 _ => return,
             }
         }
@@ -154,7 +157,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     };
     let (cmd_tx, mut output_rx, mut collab_rx, mut shutdown_rx) =
         match hub
-            .start_or_join(&session_id, &cmd, &args, &env, 80, 24)
+            .start_or_join(&session_id, &cmd, &args, &env, initial_cols, initial_rows)
             .await
         {
             Ok(channels) => channels,
@@ -204,6 +207,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let (role_watch_tx, role_watch_rx) = tokio::sync::watch::channel(my_role);
 
     let my_user_id = user.id;
+    let session_id_for_output = session_id.clone();
     let output_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -214,7 +218,11 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                                 break;
                             }
                         }
-                        Err(_) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(session = %session_id_for_output, "output receiver lagged, dropped {n} messages");
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
                 result = collab_rx.recv() => {
@@ -234,7 +242,11 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                                 break;
                             }
                         }
-                        Err(_) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(session = %session_id_for_output, "collab receiver lagged, dropped {n} messages");
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
                 _ = &mut stop_rx => {
