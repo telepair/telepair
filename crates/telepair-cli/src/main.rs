@@ -126,7 +126,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if gateway {
-        let web_dir = cli.web_dir.as_ref().map(|p| p.to_str().unwrap());
+        let web_dir = cli
+            .web_dir
+            .as_ref()
+            .map(|p| {
+                p.to_str()
+                    .ok_or_else(|| anyhow::anyhow!("--web-dir path is not valid UTF-8"))
+            })
+            .transpose()?;
         let state = AppState::new(storage, engine).await;
         let router =
             telepair_gateway::build_router_with_options(state, web_dir, &cli.allowed_origins);

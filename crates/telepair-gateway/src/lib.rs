@@ -17,10 +17,6 @@ pub fn build_router(state: AppState) -> Router {
     build_router_with_options(state, None, &[])
 }
 
-pub fn build_router_with_web_dir(state: AppState, web_dir: Option<&str>) -> Router {
-    build_router_with_options(state, web_dir, &[])
-}
-
 pub fn build_router_with_options(
     state: AppState,
     web_dir: Option<&str>,

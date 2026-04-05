@@ -52,12 +52,18 @@ export type ServerMessage =
 
 // --- Helpers ---
 
+const textEncoder = new TextEncoder();
+
 export function encodeInput(text: string): number[] {
-  return Array.from(new TextEncoder().encode(text));
+  return Array.from(textEncoder.encode(text));
 }
 
 export function decodeOutput(data: number[]): Uint8Array {
   return new Uint8Array(data);
+}
+
+export function canInput(role: Role): boolean {
+  return role === 'owner' || role === 'operator';
 }
 
 export interface InviteInfo {

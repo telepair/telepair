@@ -3,7 +3,7 @@ import { createSignal, onCleanup, Show, createMemo } from 'solid-js';
 import { useParams, useNavigate } from '@solidjs/router';
 import { auth } from '../stores/auth';
 import { TelepairSocket } from '../lib/ws';
-import { encodeInput } from '../lib/protocol';
+import { encodeInput, canInput } from '../lib/protocol';
 import type { ServerMessage, Role, ParticipantInfo } from '../lib/protocol';
 import type { TerminalHandle } from '../components/Terminal';
 import type { ChatMessage } from '../components/ChatPanel';
@@ -86,12 +86,12 @@ export default function SessionPage() {
   };
 
   const handleData = (data: string) => {
-    if (role() === 'viewer') return;
+    if (!canInput(role())) return;
     socket?.sendInput(encodeInput(data));
   };
 
   const handleResize = (cols: number, rows: number) => {
-    if (role() === 'viewer') return;
+    if (!canInput(role())) return;
     socket?.sendResize(cols, rows);
   };
 
