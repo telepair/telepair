@@ -165,8 +165,12 @@ telepair stores its data in `~/.telepair/`:
 # Run backend tests (68 tests)
 cargo test --workspace
 
-# Run frontend tests (45 tests)
+# Run frontend unit tests (45 tests)
 cd web && npm test
+
+# Run browser E2E tests (12 tests, requires running server + Chromium)
+cd web && npx playwright install chromium    # first time only
+cd web && npm run e2e                        # server auto-starts or reuses :7700
 
 # Type-check frontend
 cd web && npm run type-check
@@ -175,6 +179,8 @@ cd web && npm run type-check
 cargo run                          # terminal 1
 cd web && npm run dev              # terminal 2
 ```
+
+E2E tests use Playwright and require a built frontend (`npm run build`) and either a running telepair server on port 7700 or they auto-start one via `cargo run`. The admin token is read from `~/.telepair/admin_token`.
 
 ### Environment
 
