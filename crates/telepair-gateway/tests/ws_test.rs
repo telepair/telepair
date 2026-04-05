@@ -275,9 +275,11 @@ async fn ws_successful_join_receives_session_state() {
             session: sess,
             participants,
             your_role,
+            your_user_id,
         }) => {
             assert_eq!(sess.id, session.id);
             assert_eq!(your_role, Role::Owner);
+            assert_eq!(your_user_id, user.id);
             assert!(
                 !participants.is_empty(),
                 "expected at least one participant"
@@ -291,4 +293,60 @@ async fn ws_successful_join_receives_session_state() {
 
     // Clean up: close connection so the PTY shuts down
     let _ = ws.close(None).await;
+}
+
+// --------------------------------------------------------------------------
+// Test 6: WS disconnects after session is force-stopped via the hub
+// --------------------------------------------------------------------------
+#[tokio::test]
+async fn ws_disconnects_after_session_stopped() {
+    let (addr, state) = start_server().await;
+
+    let token = state.create_test_user("owner").await;
+    let user = state.auth.validate(&token).await.unwrap();
+    let session = state
+        .sessions
+        .storage()
+        .create_session(user.id, "local-shell", InputMode::Serialized)
+        .await
+        .unwrap();
+    state
+        .sessions
+        .storage()
+        .upsert_participant(&session.id, user.id, Role::Owner)
+        .await
+        .unwrap();
+
+    let (mut ws, _) = connect_async(ws_url(&addr, &session.id))
+        .await
+        .expect("failed to connect");
+
+    ws.send(session_join_msg(&session.id, &token))
+        .await
+        .unwrap();
+
+    // Receive SessionState
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), recv_json(&mut ws))
+        .await
+        .expect("timed out waiting for SessionState");
+    assert!(matches!(msg, Some(ServerMessage::SessionState { .. })));
+
+    // Stop the session via the hub
+    state.hub.stop_session(&session.id).await;
+
+    // WS should close within a reasonable time
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while let Some(Ok(msg)) = ws.next().await {
+            if matches!(msg, Message::Close(_)) {
+                return true;
+            }
+        }
+        true // stream ended
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "WS connection should close after session stop"
+    );
 }

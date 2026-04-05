@@ -115,13 +115,33 @@ pub async fn list_sessions(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let _user = extract_user(&state, &headers).await?;
-    let sessions = state
+    let user = extract_user(&state, &headers).await?;
+    let all_sessions = state
         .sessions
         .list_active_sessions()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(sessions))
+
+    // Filter to sessions the user owns or participates in
+    let mut visible = Vec::new();
+    for session in all_sessions {
+        if session.owner_id == user.id {
+            visible.push(session);
+            continue;
+        }
+        if let Ok(participants) = state
+            .sessions
+            .storage()
+            .list_participants(&session.id)
+            .await
+        {
+            if participants.iter().any(|p| p.user_id == user.id) {
+                visible.push(session);
+            }
+        }
+    }
+
+    Ok(Json(visible))
 }
 
 // --- Invite handlers ---
@@ -218,29 +238,22 @@ pub async fn redeem_invite(
 ) -> Result<impl IntoResponse, StatusCode> {
     let user = extract_user(&state, &headers).await?;
 
-    // Validate first (does not consume)
+    // Consume atomically first — validates expiry, max_uses, and increments used_count.
+    // If this fails, no participant is added.
     let invite = state
         .sessions
         .storage()
-        .validate_invite(&body.token)
+        .consume_invite(&body.token)
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Upsert participant (idempotent — safe if user already has a row)
+    // Only now upsert participant — invite was valid and consumed
     state
         .sessions
         .storage()
         .upsert_participant(&invite.session_id, user.id, invite.role)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Then consume the invite (increment used_count)
-    state
-        .sessions
-        .storage()
-        .consume_invite(&body.token)
-        .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     Ok(Json(serde_json::json!({
         "session_id": invite.session_id,

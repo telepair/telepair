@@ -46,11 +46,7 @@ export default function SessionPage() {
       case 'SessionState':
         setRole(msg.your_role);
         setParticipants(msg.participants);
-        // Find our user_id from participants by matching our assigned role
-        {
-          const me = msg.participants.find((p: ParticipantInfo) => p.role === msg.your_role);
-          if (me) setCurrentUserId(me.user_id);
-        }
+        setCurrentUserId(msg.your_user_id);
         break;
       case 'PeerJoined':
         setParticipants((prev) => [

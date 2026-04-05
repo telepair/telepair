@@ -42,6 +42,8 @@ struct LiveSession {
     output_tx: broadcast::Sender<Vec<u8>>,
     /// Broadcast collaboration messages (PeerJoined, PeerLeft, PermUpdate, etc.)
     collab_tx: broadcast::Sender<ServerMessage>,
+    /// Signal to all connected WS handlers that this session is being force-stopped
+    shutdown_tx: broadcast::Sender<()>,
     /// Currently connected participants
     participants: HashMap<Uuid, ConnectedParticipant>,
     /// Monotonic counter for color assignment
@@ -76,6 +78,7 @@ impl SessionHub {
             mpsc::Sender<PtyCommand>,
             broadcast::Receiver<Vec<u8>>,
             broadcast::Receiver<ServerMessage>,
+            broadcast::Receiver<()>,
         ),
         String,
     > {
@@ -87,6 +90,7 @@ impl SessionHub {
                 live.cmd_tx.clone(),
                 live.output_tx.subscribe(),
                 live.collab_tx.subscribe(),
+                live.shutdown_tx.subscribe(),
             ));
         }
 
@@ -98,6 +102,7 @@ impl SessionHub {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<PtyCommand>(256);
         let (output_tx, output_rx) = broadcast::channel::<Vec<u8>>(256);
         let (collab_tx, collab_rx) = broadcast::channel::<ServerMessage>(64);
+        let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
         let output_tx_clone = output_tx.clone();
         let session_id_owned = session_id.to_string();
@@ -157,18 +162,23 @@ impl SessionHub {
             cmd_tx: cmd_tx.clone(),
             output_tx: output_tx.clone(),
             collab_tx: collab_tx.clone(),
+            shutdown_tx,
             participants: HashMap::new(),
             color_counter: 0,
         };
         sessions.insert(session_id.to_string(), live);
 
-        Ok((cmd_tx, output_rx, collab_rx))
+        Ok((cmd_tx, output_rx, collab_rx, shutdown_rx))
     }
 
-    /// Force-stop a live session by removing it from the map.
-    /// The PTY I/O task will detect the dropped senders and exit.
+    /// Force-stop a live session by signalling all connected WS handlers,
+    /// then removing it from the map.
     pub async fn stop_session(&self, session_id: &str) {
-        self.sessions.write().await.remove(session_id);
+        let mut sessions = self.sessions.write().await;
+        if let Some(live) = sessions.get(session_id) {
+            let _ = live.shutdown_tx.send(());
+        }
+        sessions.remove(session_id);
     }
 
     /// Add a participant to a session. Auto-broadcasts `PeerJoined` to all subscribers.

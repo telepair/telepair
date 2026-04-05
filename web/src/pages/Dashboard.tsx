@@ -1,22 +1,25 @@
 // web/src/pages/Dashboard.tsx
-import { onMount, Show, For } from 'solid-js';
+import { createSignal, onMount, Show, For } from 'solid-js';
 import { useNavigate } from '@solidjs/router';
 import { auth } from '../stores/auth';
 import { sessionStore } from '../stores/session';
 
 export default function Dashboard() {
   const navigate = useNavigate();
+  const [launchError, setLaunchError] = createSignal('');
 
   onMount(() => {
     sessionStore.refresh();
   });
 
   const handleLaunch = async (targetName: string) => {
+    setLaunchError('');
     try {
       const session = await sessionStore.createSession(targetName);
       navigate(`/session/${session.id}`);
     } catch (e) {
-      console.error('Failed to create session:', e);
+      const msg = e instanceof Error ? e.message : 'Failed to create session';
+      setLaunchError(msg);
     }
   };
 
@@ -26,6 +29,10 @@ export default function Dashboard() {
         <h1>telepair</h1>
         <button onClick={() => auth.logout()}>Logout</button>
       </header>
+
+      <Show when={launchError()}>
+        <div class="error-banner">{launchError()}</div>
+      </Show>
 
       <main class="content">
         <section>
@@ -71,6 +78,11 @@ export default function Dashboard() {
 
       <style>{`
         .dashboard { min-height: 100vh; }
+        .error-banner {
+          padding: 8px 16px; background: rgba(248,81,73,0.15);
+          color: var(--error); font-size: 13px;
+          border-bottom: 1px solid rgba(248,81,73,0.3);
+        }
         .topbar {
           display: flex;
           align-items: center;

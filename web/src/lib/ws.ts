@@ -12,6 +12,8 @@ export class TelepairSocket {
   private onStatus: StatusHandler;
   private sessionId = '';
   private token = '';
+  private cols = 80;
+  private rows = 24;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -23,9 +25,11 @@ export class TelepairSocket {
     this.onStatus = onStatus;
   }
 
-  connect(sessionId: string, token: string) {
+  connect(sessionId: string, token: string, cols = 80, rows = 24) {
     this.sessionId = sessionId;
     this.token = token;
+    this.cols = cols;
+    this.rows = rows;
     this.intentionalClose = false;
     this.reconnectAttempts = 0;
     this.doConnect();
@@ -44,6 +48,8 @@ export class TelepairSocket {
         type: 'SessionJoin',
         session_id: this.sessionId,
         token: this.token,
+        cols: this.cols,
+        rows: this.rows,
       });
     };
 

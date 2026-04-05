@@ -72,6 +72,8 @@ describe('TelepairSocket', () => {
     expect(joinMsg.type).toBe('SessionJoin');
     expect(joinMsg.session_id).toBe('sess-1');
     expect(joinMsg.token).toBe('my-token');
+    expect(joinMsg.cols).toBe(80);
+    expect(joinMsg.rows).toBe(24);
   });
 
   it('forwards parsed text messages to message handler', async () => {

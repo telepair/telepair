@@ -38,6 +38,17 @@ impl PtyManager {
         for arg in args {
             cmd.arg(*arg);
         }
+        // Clear inherited environment to prevent leaking server secrets to PTY sessions
+        cmd.env_clear();
+        // Restore minimum safe environment variables
+        let safe_vars = ["HOME", "PATH", "USER", "SHELL", "LANG", "LC_ALL"];
+        for var in &safe_vars {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+        cmd.env("TERM", "xterm-256color");
+        // Apply explicit env overrides from target config
         for (key, value) in env {
             cmd.env(key, value);
         }

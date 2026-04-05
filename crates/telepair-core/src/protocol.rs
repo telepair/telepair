@@ -8,11 +8,28 @@ use crate::session::Session;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
-    SessionJoin { session_id: String, token: String },
-    TermInput { data: Vec<u8> },
-    TermResize { cols: u16, rows: u16 },
-    CursorMove { x: u16, y: u16 },
-    ChatMessage { text: String },
+    SessionJoin {
+        session_id: String,
+        token: String,
+        #[serde(default = "default_cols")]
+        cols: u16,
+        #[serde(default = "default_rows")]
+        rows: u16,
+    },
+    TermInput {
+        data: Vec<u8>,
+    },
+    TermResize {
+        cols: u16,
+        rows: u16,
+    },
+    CursorMove {
+        x: u16,
+        y: u16,
+    },
+    ChatMessage {
+        text: String,
+    },
 }
 
 // --- Server -> Client ---
@@ -23,6 +40,7 @@ pub enum ServerMessage {
         session: Session,
         participants: Vec<ParticipantInfo>,
         your_role: Role,
+        your_user_id: Uuid,
     },
     TermOutput {
         data: Vec<u8>,
@@ -134,4 +152,12 @@ impl BinaryFrame {
         let rows = u16::from_be_bytes([self.payload[2], self.payload[3]]);
         Some((cols, rows))
     }
+}
+
+fn default_cols() -> u16 {
+    80
+}
+
+fn default_rows() -> u16 {
+    24
 }

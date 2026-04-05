@@ -24,9 +24,9 @@ async function validateToken(t: string): Promise<boolean> {
   try {
     // Temporarily set for API call (api.ts reads from localStorage)
     localStorage.setItem(STORAGE_KEY, t);
-    setTokenSignal(t);
     await api.listTargets();
-    // Validation succeeded — token is already persisted
+    // Validation succeeded — now persist to signal
+    setTokenSignal(t);
     setValidating(false);
     return true;
   } catch (e) {

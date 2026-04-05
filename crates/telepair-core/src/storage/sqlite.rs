@@ -44,8 +44,7 @@ impl SqliteStorage {
             "SELECT COUNT(*) > 0 FROM pragma_table_info('users') WHERE name = 'token_sha256'",
         )
         .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
+        .await?;
 
         if !has_users_col {
             sqlx::raw_sql(
@@ -62,8 +61,7 @@ impl SqliteStorage {
             "SELECT COUNT(*) > 0 FROM pragma_table_info('invite_tokens') WHERE name = 'token_sha256'",
         )
         .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
+        .await?;
 
         if !has_invite_col {
             sqlx::raw_sql(
@@ -309,7 +307,7 @@ impl Storage for SqliteStorage {
     async fn close_session(&self, id: &str) -> Result<()> {
         let now = Utc::now();
         let result =
-            sqlx::query("UPDATE sessions SET status = 'closed', closed_at = ? WHERE id = ?")
+            sqlx::query("UPDATE sessions SET status = 'closed', closed_at = ? WHERE id = ? AND status = 'active'")
                 .bind(now.to_rfc3339())
                 .bind(id)
                 .execute(&self.pool)
@@ -427,6 +425,11 @@ impl Storage for SqliteStorage {
         max_uses: i32,
         expires_at: Option<chrono::DateTime<Utc>>,
     ) -> Result<(InviteToken, String)> {
+        if max_uses < 1 {
+            return Err(Error::InvalidInput(
+                "max_uses must be at least 1".into(),
+            ));
+        }
         let (raw_token, token_hash, sha256_hex) = generate_token()?;
 
         sqlx::query(
@@ -461,7 +464,18 @@ impl Storage for SqliteStorage {
             .fetch_optional(&self.pool)
             .await?
         {
-            return row_to_invite(&row);
+            let invite = row_to_invite(&row)?;
+            // Check expiry
+            if let Some(expires_at) = invite.expires_at {
+                if expires_at < Utc::now() {
+                    return Err(Error::Auth("invite token has expired".into()));
+                }
+            }
+            // Check usage limit
+            if invite.used_count >= invite.max_uses {
+                return Err(Error::Auth("invite token has been fully used".into()));
+            }
+            return Ok(invite);
         }
 
         // Slow path: legacy invite tokens without token_sha256 — bcrypt scan only those rows
@@ -481,7 +495,18 @@ impl Storage for SqliteStorage {
                 .bind(&token_hash_val)
                 .execute(&self.pool)
                 .await;
-                return row_to_invite(&row);
+                let invite = row_to_invite(&row)?;
+                // Check expiry
+                if let Some(expires_at) = invite.expires_at {
+                    if expires_at < Utc::now() {
+                        return Err(Error::Auth("invite token has expired".into()));
+                    }
+                }
+                // Check usage limit
+                if invite.used_count >= invite.max_uses {
+                    return Err(Error::Auth("invite token has been fully used".into()));
+                }
+                return Ok(invite);
             }
         }
 
@@ -491,17 +516,12 @@ impl Storage for SqliteStorage {
     async fn consume_invite(&self, token: &str) -> Result<InviteToken> {
         let invite = self.validate_invite(token).await?;
 
-        if let Some(expires_at) = invite.expires_at {
-            if expires_at < Utc::now() {
-                return Err(Error::Auth("invite token has expired".into()));
-            }
-        }
-
-        // Atomic increment with WHERE guard to prevent TOCTOU race
+        // Atomic increment with WHERE guard for both max_uses and expiry
         let result = sqlx::query(
-            "UPDATE invite_tokens SET used_count = used_count + 1 WHERE token_hash = ? AND used_count < max_uses",
+            "UPDATE invite_tokens SET used_count = used_count + 1 WHERE token_hash = ? AND used_count < max_uses AND (expires_at IS NULL OR expires_at > ?)",
         )
         .bind(&invite.token_hash)
+        .bind(Utc::now().to_rfc3339())
         .execute(&self.pool)
         .await?;
 
