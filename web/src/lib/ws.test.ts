@@ -138,6 +138,7 @@ describe('TelepairSocket', () => {
       session: { id: 's', owner_id: 'u', target_name: 't', input_mode: 'serialized', status: 'active', created_at: '', closed_at: null },
       participants: [],
       your_role: 'owner',
+      your_user_id: 'u',
     };
     ws.onmessage?.({ data: JSON.stringify(state) });
 
