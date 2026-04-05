@@ -1,6 +1,6 @@
 use axum::{
     extract::{
-        ws::{Message, WebSocket},
+        ws::{CloseFrame, Message, WebSocket},
         Path, State, WebSocketUpgrade,
     },
     response::IntoResponse,
@@ -32,10 +32,17 @@ async fn send_error(
 ) {
     let err = ServerMessage::Error {
         code: code.into(),
-        message,
+        message: message.clone(),
     };
+    if let Ok(json) = serde_json::to_string(&err) {
+        let _ = ws_tx.send(Message::Text(json.into())).await;
+    }
+    // Send proper close frame so frontend can distinguish permanent errors
     let _ = ws_tx
-        .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
+        .send(Message::Close(Some(CloseFrame {
+            code: 4001,
+            reason: message.into(),
+        })))
         .await;
 }
 
@@ -179,11 +186,15 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         participants: participant_infos,
         your_role: my_role,
     };
-    let _ = ws_tx
-        .send(Message::Text(
-            serde_json::to_string(&state_msg).unwrap().into(),
-        ))
-        .await;
+    match serde_json::to_string(&state_msg) {
+        Ok(json) => {
+            let _ = ws_tx.send(Message::Text(json.into())).await;
+        }
+        Err(e) => {
+            tracing::error!("failed to serialize SessionState: {e}");
+            return;
+        }
+    }
 
     // 7. Output forwarder: PTY output + collab messages -> WebSocket
     //    Use a oneshot channel to signal stop.
@@ -214,7 +225,10 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                                     let _ = role_watch_tx.send(*new_role);
                                 }
                             }
-                            let json = serde_json::to_string(&collab_msg).unwrap();
+                            let Ok(json) = serde_json::to_string(&collab_msg) else {
+                                tracing::error!("failed to serialize collab message");
+                                continue;
+                            };
                             if ws_tx.send(Message::Text(json.into())).await.is_err() {
                                 break;
                             }
@@ -304,7 +318,13 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
 
     // 9. Cleanup
     let _ = stop_tx.send(());
-    output_handle.abort();
+    // Give the output handler time to flush pending sends before force-aborting
+    if tokio::time::timeout(std::time::Duration::from_secs(2), output_handle)
+        .await
+        .is_err()
+    {
+        tracing::warn!(session = %session_id, "output handler did not stop within 2s");
+    }
     hub.remove_participant(&session_id, user_id).await;
     tracing::info!(user = %user_name, session = %session_id, "WebSocket disconnected");
 }
