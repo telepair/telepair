@@ -61,6 +61,9 @@ export default function Terminal(props: TerminalProps) {
     term.loadAddon(fitAddon);
     term.open(containerRef);
 
+    // Expose xterm instance for E2E test buffer access
+    (containerRef as any).__xterm = term;
+
     // Try WebGL renderer for performance
     try {
       term.loadAddon(new WebglAddon());
