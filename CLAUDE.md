@@ -24,10 +24,15 @@ cargo test --workspace                       # 68 Rust tests across all crates
 cargo test -p telepair-core                  # single crate
 cargo test -p telepair-core storage          # single test by name substring
 
-cd web && npm test                           # 45 Vitest tests
+cd web && npm test                           # 45 Vitest unit tests
 cd web && npm run test:watch                 # watch mode
 cd web && npm run type-check                 # TypeScript type checking
+
+cd web && npm run e2e                        # 12 Playwright browser E2E tests
+cd web && npm run e2e:ui                     # Playwright UI mode (interactive)
 ```
+
+E2E tests require a built frontend (`npm run build`) and Chromium (`npx playwright install chromium`). The server auto-starts via `cargo run` or reuses an existing one on port 7700. Admin token is read from `~/.telepair/admin_token`.
 
 ## Linting
 

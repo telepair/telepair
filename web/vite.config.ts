@@ -5,6 +5,7 @@ export default defineConfig({
   plugins: [solid()],
   test: {
     environment: 'jsdom',
+    exclude: ['e2e/**', 'node_modules/**'],
   },
   server: {
     port: 5173,
