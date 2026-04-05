@@ -1,0 +1,10 @@
+target/
+node_modules/
+web/dist/
+.git/
+.github/
+docs/
+*.md
+!README.md
+.env
+.DS_Store
