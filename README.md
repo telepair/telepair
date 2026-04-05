@@ -162,7 +162,7 @@ telepair stores its data in `~/.telepair/`:
 ## Development
 
 ```bash
-# Run backend tests (62 tests)
+# Run backend tests (68 tests)
 cargo test --workspace
 
 # Run frontend tests (45 tests)
