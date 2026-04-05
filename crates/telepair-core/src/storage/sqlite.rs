@@ -44,8 +44,7 @@ impl SqliteStorage {
             "SELECT COUNT(*) > 0 FROM pragma_table_info('users') WHERE name = 'token_sha256'",
         )
         .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
+        .await?;
 
         if !has_users_col {
             sqlx::raw_sql(
@@ -62,8 +61,7 @@ impl SqliteStorage {
             "SELECT COUNT(*) > 0 FROM pragma_table_info('invite_tokens') WHERE name = 'token_sha256'",
         )
         .fetch_one(&self.pool)
-        .await
-        .unwrap_or(false);
+        .await?;
 
         if !has_invite_col {
             sqlx::raw_sql(
@@ -427,6 +425,11 @@ impl Storage for SqliteStorage {
         max_uses: i32,
         expires_at: Option<chrono::DateTime<Utc>>,
     ) -> Result<(InviteToken, String)> {
+        if max_uses < 1 {
+            return Err(Error::InvalidInput(
+                "max_uses must be at least 1".into(),
+            ));
+        }
         let (raw_token, token_hash, sha256_hex) = generate_token()?;
 
         sqlx::query(
