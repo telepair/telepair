@@ -212,35 +212,27 @@ For high-throughput terminal I/O, binary frames provide lower overhead than JSON
 
 ### Frame Format
 
-```
-[type: 1 byte][length: 2 bytes big-endian][payload: N bytes]
-```
+Binary WebSocket frames carry **raw bytes** with no framing header:
 
-| Type | Byte | Direction | Payload |
-|------|------|-----------|---------|
-| Output | `0x01` | Server → Client | Raw PTY bytes |
-| Input | `0x02` | Client → Server | Raw keystrokes |
-| Resize | `0x03` | Client → Server | `[cols: 2B BE][rows: 2B BE]` |
+| Direction | Content | Description |
+|-----------|---------|-------------|
+| Server → Client | Raw PTY output bytes | Sent as binary WS frame, write directly to xterm.js |
+| Client → Server | Raw keystroke bytes | Sent as binary WS frame, forwarded to PTY stdin |
 
-Maximum payload size: 65535 bytes (2^16 - 1).
+There is no type byte or length prefix — each binary frame is a single opaque payload. Terminal resize is handled via the JSON `TermResize` message (text frame), not binary.
 
 ### Examples
 
-Terminal input `ls\n`:
+Terminal input `ls\n` (3 bytes):
 ```
-02 00 03 6C 73 0A
-│  │     └── payload: "ls\n"
-│  └── length: 3
-└── type: Input
+6C 73 0A
+└── raw UTF-8 bytes: "ls\n"
 ```
 
-Resize to 120x40:
+PTY output `$ ` (2 bytes):
 ```
-03 00 04 00 78 00 28
-│  │     │     └── rows: 40
-│  │     └── cols: 120
-│  └── length: 4
-└── type: Resize
+24 20
+└── raw PTY bytes: "$ "
 ```
 
 ## Permission Enforcement
@@ -254,4 +246,4 @@ The server enforces permissions on every action:
 | ChatMessage | Yes | Yes | Yes |
 | CursorMove | Yes | Yes | Yes |
 
-Rejected actions receive an `Error` message. The connection is not closed.
+Rejected actions are **silently dropped** — the server does not send an `Error` message or close the connection. The client receives no feedback when a permission check fails. In serialized input mode, only the session owner can send terminal input; other operators' input is also silently dropped.

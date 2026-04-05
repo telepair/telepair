@@ -127,6 +127,7 @@ targets:
     display: "Staging SSH"
     command: ssh
     args: ["deploy@staging.example.com"]
+    required_role: operator
     tags: [server, staging]
 
   - name: monitor
@@ -135,7 +136,7 @@ targets:
     tags: [monitoring]
 ```
 
-Environment variables in `${VAR}` syntax are expanded at launch time. A default local shell target is always available.
+Environment variables in `${VAR}` syntax are expanded at launch time. Use `required_role` to restrict which users can create sessions for a target (non-admin users without the required role receive `403 Forbidden`). A default local shell target is always available.
 
 ### Data Directory
 
@@ -161,10 +162,10 @@ telepair stores its data in `~/.telepair/`:
 ## Development
 
 ```bash
-# Run backend tests (49 tests)
+# Run backend tests (52 tests)
 cargo test --workspace
 
-# Run frontend tests (22 tests)
+# Run frontend tests (29 tests)
 cd web && npm test
 
 # Type-check frontend

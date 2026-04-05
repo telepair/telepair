@@ -170,6 +170,7 @@ telepair stores all persistent data in `~/.telepair/`:
 | File | Purpose |
 |------|---------|
 | `telepair.db` | SQLite database (users, sessions, participants, invites) |
+| `admin_token` | Admin bearer token (created on first run, mode 0600) |
 | `targets.yaml` | Virtual target definitions (optional) |
 
 Back up `telepair.db` to preserve user accounts and session history.
@@ -177,7 +178,7 @@ Back up `telepair.db` to preserve user accounts and session history.
 ## Security Considerations
 
 - **Always use TLS** in production (via reverse proxy)
-- **Save the admin token** from first run — it cannot be recovered
+- **Save the admin token** from first run — it is also written to `~/.telepair/admin_token` (mode 0600) for recovery
 - **Restrict network access** — telepair binds to `0.0.0.0` by default; use `--host 127.0.0.1` if only accessed via reverse proxy
 - **Invite tokens** are single-use by default; increase `max_uses` only when needed
 - **PTY access** is equivalent to shell access — carefully manage who gets operator/owner roles
