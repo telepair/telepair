@@ -75,6 +75,7 @@ Create a new session. The authenticated user becomes the session owner.
 
 **Errors**
 - `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — target requires a role the user does not have (see `required_role` in target config)
 - `404 Not Found` — target does not exist
 
 ### GET /api/sessions

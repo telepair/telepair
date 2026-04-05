@@ -26,7 +26,6 @@ The foundation crate. Contains no business logic — only shared abstractions.
 | `storage.rs` | Async `Storage` trait — CRUD for users, sessions, participants, invite tokens |
 | `storage/sqlite.rs` | `SqliteStorage` implementation using sqlx |
 | `auth.rs` | `TokenAuthProvider` — bcrypt-based token validation |
-| `config.rs` | `AppConfig` YAML deserialization |
 | `target.rs` | `Target` and `TargetKind` definitions |
 | `error.rs` | `Error` enum (Auth, NotFound, Storage, Internal) |
 
@@ -92,8 +91,8 @@ Browser                     telepair (single process)
 ### Terminal I/O
 
 1. User types in xterm.js
-2. Frontend encodes keystrokes as `TermInput { data: Vec<u8> }` (JSON) or binary frame (type 0x02)
-3. WS handler checks `role.can_input()` — rejects if viewer
+2. Frontend encodes keystrokes as `TermInput { data: Vec<u8> }` (JSON text frame) or raw binary frame (no framing header)
+3. WS handler checks `role.can_input()` — silently drops if viewer
 4. Sends bytes to PTY via `SessionHub` command channel
 5. PTY output is broadcast via `output_tx` to all connected participants
 6. WS handler forwards as `TermOutput { data: Vec<u8> }` to each client
@@ -143,4 +142,4 @@ All IDs are UUIDs stored as TEXT. Timestamps are ISO 8601 TEXT. The `Storage` tr
 - **Authentication**: Bearer token in `Authorization` header. Tokens are bcrypt-hashed in storage, never stored in plaintext.
 - **Authorization**: Role-based per session. WS handler checks role on every input/resize action.
 - **Invite tokens**: Single-use by default. Hashed with bcrypt. Atomic consumption prevents concurrent redemption race conditions.
-- **No CORS**: Frontend is served from the same origin. API proxy in dev mode.
+- **CORS**: Configurable via `--allowed-origins`. When unset, the server allows **all origins** (permissive default for development). In production behind a reverse proxy, set `--allowed-origins` to restrict access to trusted domains.

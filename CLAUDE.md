@@ -20,11 +20,11 @@ cd web && npm run dev                        # dev server on :5173, proxies /api
 ## Testing
 
 ```bash
-cargo test --workspace                       # 49 Rust tests across all crates
+cargo test --workspace                       # 52 Rust tests across all crates
 cargo test -p telepair-core                  # single crate
 cargo test -p telepair-core storage          # single test by name substring
 
-cd web && npm test                           # 22 Vitest tests
+cd web && npm test                           # 29 Vitest tests
 cd web && npm run test:watch                 # watch mode
 cd web && npm run type-check                 # TypeScript type checking
 ```
@@ -62,7 +62,7 @@ telepair-cli          Entry point. Parses --agent/--control/--gateway flags.
 2. POST `/api/sessions` creates a session + DB record
 3. WebSocket connects at `/ws/session/{id}`, first message must be `SessionJoin`
 4. `SessionHub` spawns a `LiveSession` with PTY, broadcast channels (output + collab), and participant map
-5. Terminal I/O uses binary WebSocket frames (type byte prefix: 0x01=output, 0x02=input, 0x03=resize)
+5. Terminal I/O uses binary WebSocket frames (raw bytes, no framing header; resize uses JSON text frames)
 6. Collaboration messages (join/leave/chat/cursor) use JSON WebSocket frames with `#[serde(tag = "type")]` discriminant
 
 ### Storage
