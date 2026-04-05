@@ -23,6 +23,7 @@ pub enum ServerMessage {
         session: Session,
         participants: Vec<ParticipantInfo>,
         your_role: Role,
+        your_user_id: Uuid,
     },
     TermOutput {
         data: Vec<u8>,

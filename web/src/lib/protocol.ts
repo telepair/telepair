@@ -41,7 +41,7 @@ export type ClientMessage =
 // --- Server → Client ---
 
 export type ServerMessage =
-  | { type: 'SessionState'; session: Session; participants: ParticipantInfo[]; your_role: Role }
+  | { type: 'SessionState'; session: Session; participants: ParticipantInfo[]; your_role: Role; your_user_id: string }
   | { type: 'TermOutput'; data: number[] }
   | { type: 'PeerJoined'; user_id: string; name: string; role: Role; color: string }
   | { type: 'PeerLeft'; user_id: string }

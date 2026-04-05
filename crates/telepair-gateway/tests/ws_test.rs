@@ -275,9 +275,11 @@ async fn ws_successful_join_receives_session_state() {
             session: sess,
             participants,
             your_role,
+            your_user_id,
         }) => {
             assert_eq!(sess.id, session.id);
             assert_eq!(your_role, Role::Owner);
+            assert_eq!(your_user_id, user.id);
             assert!(
                 !participants.is_empty(),
                 "expected at least one participant"
