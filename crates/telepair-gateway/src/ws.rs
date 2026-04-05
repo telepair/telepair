@@ -185,6 +185,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         session: session.clone(),
         participants: participant_infos,
         your_role: my_role,
+        your_user_id: user.id,
     };
     match serde_json::to_string(&state_msg) {
         Ok(json) => {
