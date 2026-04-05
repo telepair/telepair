@@ -1,6 +1,8 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use telepair_core::permission::Role;
+use telepair_core::storage::Storage;
 use telepair_gateway::build_router;
 use telepair_gateway::state::AppState;
 use tower::ServiceExt;
@@ -113,4 +115,153 @@ async fn invite_requires_auth() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn redeem_expired_invite_rejected() {
+    let (state, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    // Create an invite that already expired (expires_at in the past)
+    let expired = chrono::Utc::now() - chrono::Duration::hours(1);
+    let (_invite, raw_token) = state
+        .sessions
+        .storage()
+        .create_invite(&session_id, Role::Operator, 5, Some(expired))
+        .await
+        .unwrap();
+
+    // Try to redeem with a different user — should be rejected
+    let joiner_token = state.create_test_user("joiner_expired").await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/invite/redeem")
+                .header("Authorization", format!("Bearer {joiner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"token": raw_token}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Verify no participant was added
+    let participants = state
+        .sessions
+        .storage()
+        .list_participants(&session_id)
+        .await
+        .unwrap();
+    assert!(
+        participants.iter().all(|p| p.role != Role::Operator),
+        "expired invite should not add a participant"
+    );
+}
+
+#[tokio::test]
+async fn list_sessions_only_shows_own_sessions() {
+    let (state, app, owner_token) = setup().await;
+
+    // Owner creates a session
+    let _session_id = create_session(&app, &owner_token).await;
+
+    // Create a second user who has no sessions
+    let other_token = state.create_test_user("other").await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/sessions")
+                .header("Authorization", format!("Bearer {other_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let sessions: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        sessions.is_empty(),
+        "other user should not see owner's sessions"
+    );
+}
+
+#[tokio::test]
+async fn redeem_exhausted_invite_rejected() {
+    let (state, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    // Create an invite with max_uses = 1
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/sessions/{session_id}/invite"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"operator","max_uses":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let invite_body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let raw_token = invite_body["token"].as_str().unwrap().to_owned();
+
+    // First user redeems successfully
+    let joiner1_token = state.create_test_user("joiner1").await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/invite/redeem")
+                .header("Authorization", format!("Bearer {joiner1_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"token": raw_token}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Second user should be rejected
+    let joiner2_token = state.create_test_user("joiner2").await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/invite/redeem")
+                .header("Authorization", format!("Bearer {joiner2_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"token": raw_token}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Verify joiner2 was NOT added as a participant
+    let participants = state
+        .sessions
+        .storage()
+        .list_participants(&session_id)
+        .await
+        .unwrap();
+    let operator_count = participants
+        .iter()
+        .filter(|p| p.role == Role::Operator)
+        .count();
+    assert_eq!(
+        operator_count, 1,
+        "only the first redeemer should be a participant"
+    );
 }

@@ -1,6 +1,6 @@
 use axum::{
     extract::{
-        ws::{Message, WebSocket},
+        ws::{CloseFrame, Message, WebSocket},
         Path, State, WebSocketUpgrade,
     },
     response::IntoResponse,
@@ -32,10 +32,17 @@ async fn send_error(
 ) {
     let err = ServerMessage::Error {
         code: code.into(),
-        message,
+        message: message.clone(),
     };
+    if let Ok(json) = serde_json::to_string(&err) {
+        let _ = ws_tx.send(Message::Text(json.into())).await;
+    }
+    // Send proper close frame so frontend can distinguish permanent errors
     let _ = ws_tx
-        .send(Message::Text(serde_json::to_string(&err).unwrap().into()))
+        .send(Message::Close(Some(CloseFrame {
+            code: 4001,
+            reason: message.into(),
+        })))
         .await;
 }
 
@@ -43,7 +50,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // 1. Auth: wait for SessionJoin message with 5-second timeout
-    let user = match tokio::time::timeout(
+    let (user, initial_cols, initial_rows) = match tokio::time::timeout(
         std::time::Duration::from_secs(5),
         ws_rx.next(),
     )
@@ -51,15 +58,18 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     {
         Ok(Some(Ok(Message::Text(text)))) => {
             match serde_json::from_str::<ClientMessage>(&text) {
-                Ok(ClientMessage::SessionJoin { token, .. }) => {
-                    match state.auth.validate(&token).await {
-                        Ok(user) => user,
-                        Err(_) => {
-                            send_error(&mut ws_tx, "AUTH_FAILED", "invalid token".into()).await;
-                            return;
-                        }
+                Ok(ClientMessage::SessionJoin {
+                    token,
+                    cols,
+                    rows,
+                    ..
+                }) => match state.auth.validate(&token).await {
+                    Ok(user) => (user, cols, rows),
+                    Err(_) => {
+                        send_error(&mut ws_tx, "AUTH_FAILED", "invalid token".into()).await;
+                        return;
                     }
-                }
+                },
                 _ => return,
             }
         }
@@ -145,9 +155,9 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
             return;
         }
     };
-    let (cmd_tx, mut output_rx, mut collab_rx) =
+    let (cmd_tx, mut output_rx, mut collab_rx, mut shutdown_rx) =
         match hub
-            .start_or_join(&session_id, &cmd, &args, &env, 80, 24)
+            .start_or_join(&session_id, &cmd, &args, &env, initial_cols, initial_rows)
             .await
         {
             Ok(channels) => channels,
@@ -178,12 +188,17 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         session: session.clone(),
         participants: participant_infos,
         your_role: my_role,
+        your_user_id: user.id,
     };
-    let _ = ws_tx
-        .send(Message::Text(
-            serde_json::to_string(&state_msg).unwrap().into(),
-        ))
-        .await;
+    match serde_json::to_string(&state_msg) {
+        Ok(json) => {
+            let _ = ws_tx.send(Message::Text(json.into())).await;
+        }
+        Err(e) => {
+            tracing::error!("failed to serialize SessionState: {e}");
+            return;
+        }
+    }
 
     // 7. Output forwarder: PTY output + collab messages -> WebSocket
     //    Use a oneshot channel to signal stop.
@@ -192,6 +207,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let (role_watch_tx, role_watch_rx) = tokio::sync::watch::channel(my_role);
 
     let my_user_id = user.id;
+    let session_id_for_output = session_id.clone();
     let output_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -202,7 +218,11 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                                 break;
                             }
                         }
-                        Err(_) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(session = %session_id_for_output, "output receiver lagged, dropped {n} messages");
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
                 result = collab_rx.recv() => {
@@ -214,12 +234,19 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                                     let _ = role_watch_tx.send(*new_role);
                                 }
                             }
-                            let json = serde_json::to_string(&collab_msg).unwrap();
+                            let Ok(json) = serde_json::to_string(&collab_msg) else {
+                                tracing::error!("failed to serialize collab message");
+                                continue;
+                            };
                             if ws_tx.send(Message::Text(json.into())).await.is_err() {
                                 break;
                             }
                         }
-                        Err(_) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(session = %session_id_for_output, "collab receiver lagged, dropped {n} messages");
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
                 _ = &mut stop_rx => {
@@ -234,68 +261,87 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let user_name = user.name.clone();
     let input_mode = session.input_mode;
 
-    while let Some(Ok(msg)) = ws_rx.next().await {
+    loop {
         let current_role = *role_watch_rx.borrow();
-        match msg {
-            Message::Text(text) => {
-                if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
-                    match client_msg {
-                        ClientMessage::TermInput { data } => {
-                            if current_role.can_input() {
-                                // In serialized mode, only the owner can type
-                                if input_mode == InputMode::Serialized
-                                    && current_role != Role::Owner
-                                {
-                                    // Drop input from non-owners in serialized mode
-                                } else {
-                                    let _ = cmd_tx.send(PtyCommand::Input(data)).await;
+        tokio::select! {
+            msg = ws_rx.next() => {
+                let Some(Ok(msg)) = msg else { break };
+                match msg {
+                    Message::Text(text) => {
+                        if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
+                            match client_msg {
+                                ClientMessage::TermInput { data } => {
+                                    if current_role.can_input() {
+                                        // In serialized mode, only the owner can type
+                                        if input_mode == InputMode::Serialized
+                                            && current_role != Role::Owner
+                                        {
+                                            // Drop input from non-owners in serialized mode
+                                        } else {
+                                            let _ = cmd_tx.send(PtyCommand::Input(data)).await;
+                                        }
+                                    }
+                                    // Silently drop if viewer
+                                }
+                                ClientMessage::TermResize { cols, rows } => {
+                                    if current_role.can_resize() {
+                                        let _ = cmd_tx.send(PtyCommand::Resize(cols, rows)).await;
+                                    }
+                                }
+                                ClientMessage::ChatMessage { text } => {
+                                    let chat_msg = ServerMessage::PeerChat {
+                                        user_id,
+                                        name: user_name.clone(),
+                                        text,
+                                        ts: Utc::now().to_rfc3339(),
+                                    };
+                                    hub.broadcast_collab(&session_id, chat_msg).await;
+                                }
+                                ClientMessage::CursorMove { x, y } => {
+                                    let cursor_msg = ServerMessage::PeerCursor { user_id, x, y };
+                                    hub.broadcast_collab(&session_id, cursor_msg).await;
+                                }
+                                ClientMessage::SessionJoin { .. } => {
+                                    // Ignore duplicate join messages
                                 }
                             }
-                            // Silently drop if viewer
                         }
-                        ClientMessage::TermResize { cols, rows } => {
-                            if current_role.can_resize() {
-                                let _ = cmd_tx.send(PtyCommand::Resize(cols, rows)).await;
+                    }
+                    Message::Binary(data) => {
+                        // Binary frame: direct PTY input (only if allowed)
+                        if current_role.can_input() {
+                            // In serialized mode, only the owner can type
+                            if input_mode == InputMode::Serialized && current_role != Role::Owner {
+                                // Drop input from non-owners in serialized mode
+                            } else {
+                                let _ = cmd_tx.send(PtyCommand::Input(data.to_vec())).await;
                             }
                         }
-                        ClientMessage::ChatMessage { text } => {
-                            let chat_msg = ServerMessage::PeerChat {
-                                user_id,
-                                name: user_name.clone(),
-                                text,
-                                ts: Utc::now().to_rfc3339(),
-                            };
-                            hub.broadcast_collab(&session_id, chat_msg).await;
-                        }
-                        ClientMessage::CursorMove { x, y } => {
-                            let cursor_msg = ServerMessage::PeerCursor { user_id, x, y };
-                            hub.broadcast_collab(&session_id, cursor_msg).await;
-                        }
-                        ClientMessage::SessionJoin { .. } => {
-                            // Ignore duplicate join messages
-                        }
                     }
+                    Message::Close(_) => break,
+                    _ => {}
                 }
             }
-            Message::Binary(data) => {
-                // Binary frame: direct PTY input (only if allowed)
-                if current_role.can_input() {
-                    // In serialized mode, only the owner can type
-                    if input_mode == InputMode::Serialized && current_role != Role::Owner {
-                        // Drop input from non-owners in serialized mode
-                    } else {
-                        let _ = cmd_tx.send(PtyCommand::Input(data.to_vec())).await;
-                    }
-                }
+            _ = shutdown_rx.recv() => {
+                tracing::info!(user = %user_name, session = %session_id, "session force-stopped");
+                break;
             }
-            Message::Close(_) => break,
-            _ => {}
         }
     }
 
     // 9. Cleanup
     let _ = stop_tx.send(());
-    output_handle.abort();
+    // Give the output handler time to flush pending sends before force-aborting
+    if tokio::time::timeout(std::time::Duration::from_secs(2), output_handle)
+        .await
+        .is_err()
+    {
+        tracing::warn!(session = %session_id, "output handler did not stop within 2s");
+    }
     hub.remove_participant(&session_id, user_id).await;
+    // Update DB left_at so participant history is accurate
+    if let Err(e) = state.sessions.storage().remove_participant(&session_id, user_id).await {
+        tracing::warn!(session = %session_id, user = %user_name, "failed to update DB left_at: {e}");
+    }
     tracing::info!(user = %user_name, session = %session_id, "WebSocket disconnected");
 }

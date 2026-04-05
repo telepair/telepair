@@ -15,6 +15,8 @@ fn client_session_join_json() {
     let msg = ClientMessage::SessionJoin {
         session_id: "abc123".into(),
         token: "tok_secret".into(),
+        cols: 120,
+        rows: 40,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains("SessionJoin"));
