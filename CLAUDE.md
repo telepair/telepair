@@ -20,7 +20,7 @@ cd web && npm run dev                        # dev server on :5173, proxies /api
 ## Testing
 
 ```bash
-cargo test --workspace                       # 62 Rust tests across all crates
+cargo test --workspace                       # 68 Rust tests across all crates
 cargo test -p telepair-core                  # single crate
 cargo test -p telepair-core storage          # single test by name substring
 
