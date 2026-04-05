@@ -20,11 +20,11 @@ cd web && npm run dev                        # dev server on :5173, proxies /api
 ## Testing
 
 ```bash
-cargo test --workspace                       # 52 Rust tests across all crates
+cargo test --workspace                       # 62 Rust tests across all crates
 cargo test -p telepair-core                  # single crate
 cargo test -p telepair-core storage          # single test by name substring
 
-cd web && npm test                           # 29 Vitest tests
+cd web && npm test                           # 45 Vitest tests
 cd web && npm run test:watch                 # watch mode
 cd web && npm run type-check                 # TypeScript type checking
 ```
