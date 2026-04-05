@@ -22,6 +22,7 @@ export default function Terminal(props: TerminalProps) {
   let term: XTerm | undefined;
   let fitAddon: FitAddon | undefined;
   let resizeObserver: ResizeObserver | undefined;
+  let resizeTimer: ReturnType<typeof setTimeout> | undefined;
 
   onMount(() => {
     if (!containerRef) return;
@@ -76,7 +77,6 @@ export default function Terminal(props: TerminalProps) {
     term.onResize(({ cols, rows }) => props.onResize(cols, rows));
 
     // Auto-fit on container resize (debounced to avoid flooding server with resize messages)
-    let resizeTimer: ReturnType<typeof setTimeout>;
     resizeObserver = new ResizeObserver(() => {
       clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => fitAddon?.fit(), 100);
@@ -100,6 +100,7 @@ export default function Terminal(props: TerminalProps) {
   });
 
   onCleanup(() => {
+    clearTimeout(resizeTimer);
     resizeObserver?.disconnect();
     term?.dispose();
   });
