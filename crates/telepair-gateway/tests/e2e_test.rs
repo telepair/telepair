@@ -693,6 +693,147 @@ async fn e2e_reaper_kills_idle_session() {
     }
 }
 
+/// Regression for the invitee-reconnect bug: a non-owner participant
+/// whose WebSocket drops (e.g. a wifi hiccup) must be able to reconnect
+/// and be re-admitted, as long as the session itself is still alive.
+///
+/// Before the fix, `ws.rs::handle_socket` eagerly called
+/// `storage.remove_participant` on socket close, stamping `left_at`
+/// immediately. The session_hub's 2-minute reaper grace kept the
+/// in-memory `LiveSession` alive (so client-side auto-retry kicked
+/// in), but the DB participant row was already marked gone, so the
+/// next handshake hit the `NOT_PARTICIPANT` branch and close-4001'd.
+/// Invitees could only ever join once per socket lifetime.
+///
+/// The fix moves `left_at` writes into `close_session` / the reaper,
+/// which runs only when the session actually dies. Socket close now
+/// only touches in-memory refcounts.
+///
+/// The owner path was already immune because `ws.rs` short-circuits
+/// on `is_owner` before checking participant rows, which is why the
+/// existing `e2e_reaper_skips_reconnected_session` test didn't catch
+/// this — it used an owner token. This test specifically exercises
+/// an invitee.
+#[tokio::test]
+async fn e2e_invitee_reconnects_after_transient_disconnect() {
+    let (addr, state) = start_server().await;
+
+    let (session_id, owner_token, _) = create_owned_session(&state, "alice").await;
+    let (invitee_token, invitee_id) =
+        add_participant(&state, &session_id, "bob", Role::Operator).await;
+
+    // Keep an owner connection open throughout so the session stays
+    // live and we don't accidentally test reaper behaviour instead.
+    let mut _ws_owner = join_session(&addr, &session_id, &owner_token).await;
+
+    // First join by the invitee (this is the first "tab" in the
+    // browser, mirroring the normal invite redeem → session flow).
+    let mut ws_invitee_1 = join_session(&addr, &session_id, &invitee_token).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Simulate a transient disconnect — exactly what the frontend
+    // auto-retry logic sees when a user's wifi blips.
+    let _ = ws_invitee_1.close(None).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // DB state check: the invitee's row must still be active. If the
+    // old eager-remove logic ever sneaks back in, this fires.
+    let participants_before_rejoin = state
+        .sessions
+        .storage()
+        .list_participants(&session_id)
+        .await
+        .unwrap();
+    assert!(
+        participants_before_rejoin
+            .iter()
+            .any(|p| p.user_id == invitee_id),
+        "invitee participant row must stay active across a socket close (list_participants filters on left_at IS NULL)"
+    );
+
+    // Reconnect — this is the moment the bug used to surface. With
+    // the fix, we complete the handshake and get SessionState. We
+    // can't use join_session() here because it swallows the
+    // SessionState frame and we need to inspect `your_role`.
+    let (mut ws_invitee_2, _) = connect_async(ws_url(&addr, &session_id)).await.unwrap();
+    ws_invitee_2
+        .send(session_join_msg(&session_id, &invitee_token))
+        .await
+        .unwrap();
+
+    // And we must be able to act with our original role, not get
+    // downgraded to Viewer by the fallback in ws.rs:156.
+    let state_msg = expect_json(&mut ws_invitee_2, 5, |m| {
+        matches!(m, ServerMessage::SessionState { .. })
+    })
+    .await;
+    if let ServerMessage::SessionState { your_role, .. } = state_msg {
+        assert_eq!(
+            your_role,
+            Role::Operator,
+            "invitee should keep their Operator role on reconnect"
+        );
+    }
+
+    let _ = ws_invitee_2.close(None).await;
+}
+
+/// Companion test: once the session is actually closed (by the owner
+/// or the reaper), all participants' `left_at` columns must be
+/// settled. This is the other half of the fix — we moved the cleanup
+/// write from the WS handler into `close_session`, and we need to
+/// prove that path actually runs.
+#[tokio::test]
+async fn e2e_close_session_settles_all_participants() {
+    let (_addr, state) = start_server().await;
+
+    let (session_id, _owner_token, owner_id) = create_owned_session(&state, "alice").await;
+    let (_bob_token, bob_id) = add_participant(&state, &session_id, "bob", Role::Operator).await;
+    let (_carol_token, carol_id) =
+        add_participant(&state, &session_id, "carol", Role::Viewer).await;
+
+    // Sanity: all three are active before close.
+    let before = state
+        .sessions
+        .storage()
+        .list_participants(&session_id)
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 3);
+
+    // Close the session via the same storage path DELETE /api/sessions
+    // and the reaper both use.
+    state
+        .sessions
+        .storage()
+        .close_session(&session_id)
+        .await
+        .unwrap();
+
+    // After close, list_participants (which filters on left_at IS NULL)
+    // should return zero rows for this session. left_at was written
+    // atomically with the sessions status update.
+    let after = state
+        .sessions
+        .storage()
+        .list_participants(&session_id)
+        .await
+        .unwrap();
+    assert!(
+        after.is_empty(),
+        "close_session should settle left_at for every active participant; still active: {:?}",
+        after
+            .iter()
+            .map(|p| (p.user_id, p.role))
+            .collect::<Vec<_>>()
+    );
+
+    // Silence unused warnings on the user ids — keeping them in the
+    // test signature makes the intent clear even though we don't
+    // inspect them individually.
+    let _ = (owner_id, bob_id, carol_id);
+}
+
 /// Inverse of the reaper test: a reconnect inside the grace window must
 /// cancel the pending reap. This verifies that `add_participant` correctly
 /// clears `idle_since` and that the write-lock re-check in the reaper

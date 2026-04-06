@@ -351,19 +351,14 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     {
         tracing::warn!(session = %session_id, "output handler did not stop within 2s");
     }
-    // Only update DB `left_at` when this was the user's final connection;
-    // otherwise other tabs stay authoritative and the participant row must
-    // remain active. `hub.remove_participant` handles the refcount.
-    let was_last = hub.remove_participant(&session_id, user_id).await;
-    if was_last {
-        if let Err(e) = state
-            .sessions
-            .storage()
-            .remove_participant(&session_id, user_id)
-            .await
-        {
-            tracing::warn!(session = %session_id, user = %user_name, "failed to update DB left_at: {e}");
-        }
-    }
+    // Drop the in-memory connection record so the reaper's idle clock
+    // can start counting, but **do not** touch the DB `left_at` here.
+    // Writing `left_at` on socket close used to race with the reaper's
+    // 2-minute grace window: clients that dropped and reconnected a
+    // second later were rejected as NOT_PARTICIPANT even though the
+    // hub was still holding their session open. `close_session` /
+    // `close_stale_sessions` now own the participant-cleanup write,
+    // which keeps the DB consistent with the session lifecycle.
+    hub.remove_participant(&session_id, user_id).await;
     tracing::info!(user = %user_name, session = %session_id, "WebSocket disconnected");
 }
