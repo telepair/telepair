@@ -30,10 +30,12 @@ export interface TargetInfo {
 }
 
 // --- Client → Server ---
+//
+// Terminal input is NOT a JSON message — it is sent as a raw binary WebSocket
+// frame (see TelepairSocket.sendInput). All other messages below are JSON.
 
 export type ClientMessage =
   | { type: 'SessionJoin'; session_id: string; token: string; cols: number; rows: number }
-  | { type: 'TermInput'; data: number[] }
   | { type: 'TermResize'; cols: number; rows: number }
   | { type: 'CursorMove'; x: number; y: number }
   | { type: 'ChatMessage'; text: string };
@@ -53,8 +55,8 @@ export type ServerMessage =
 
 const textEncoder = new TextEncoder();
 
-export function encodeInput(text: string): number[] {
-  return Array.from(textEncoder.encode(text));
+export function encodeInput(text: string): Uint8Array {
+  return textEncoder.encode(text);
 }
 
 export function canInput(role: Role): boolean {

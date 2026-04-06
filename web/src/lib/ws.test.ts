@@ -10,14 +10,14 @@ class MockWebSocket {
   onmessage: ((event: { data: string | ArrayBuffer }) => void) | null = null;
   onclose: ((event: { code: number; reason: string }) => void) | null = null;
   onerror: (() => void) | null = null;
-  sent: string[] = [];
+  sent: Array<string | Uint8Array> = [];
 
   constructor(public url: string) {
     // Simulate async open
     setTimeout(() => this.onopen?.(), 0);
   }
 
-  send(data: string) {
+  send(data: string | Uint8Array) {
     this.sent.push(data);
   }
 
@@ -68,7 +68,7 @@ describe('TelepairSocket', () => {
     // Access internal ws to check sent messages
     const ws = (sock as any).ws as MockWebSocket;
     expect(ws.sent.length).toBe(1);
-    const joinMsg = JSON.parse(ws.sent[0]);
+    const joinMsg = JSON.parse(ws.sent[0] as string);
     expect(joinMsg.type).toBe('SessionJoin');
     expect(joinMsg.session_id).toBe('sess-1');
     expect(joinMsg.token).toBe('my-token');
@@ -145,18 +145,18 @@ describe('TelepairSocket', () => {
     expect(onStatus).toHaveBeenCalledWith('connected');
   });
 
-  it('sendInput sends TermInput message', async () => {
+  it('sendInput sends a raw binary frame', async () => {
     const sock = new TelepairSocket(vi.fn(), vi.fn(), vi.fn());
     sock.connect('s', 't');
     await new Promise((r) => setTimeout(r, 10));
 
-    sock.sendInput([65, 66]);
+    sock.sendInput(new Uint8Array([65, 66]));
 
     const ws = (sock as any).ws as MockWebSocket;
-    // sent[0] is SessionJoin, sent[1] is TermInput
-    const msg = JSON.parse(ws.sent[1]);
-    expect(msg.type).toBe('TermInput');
-    expect(msg.data).toEqual([65, 66]);
+    // sent[0] is the SessionJoin JSON, sent[1] is the binary keystroke frame
+    const payload = ws.sent[1];
+    expect(payload).toBeInstanceOf(Uint8Array);
+    expect(Array.from(payload as Uint8Array)).toEqual([65, 66]);
   });
 
   it('sendResize sends TermResize message', async () => {
@@ -167,7 +167,7 @@ describe('TelepairSocket', () => {
     sock.sendResize(120, 40);
 
     const ws = (sock as any).ws as MockWebSocket;
-    const msg = JSON.parse(ws.sent[1]);
+    const msg = JSON.parse(ws.sent[1] as string);
     expect(msg.type).toBe('TermResize');
     expect(msg.cols).toBe(120);
     expect(msg.rows).toBe(40);

@@ -1,9 +1,12 @@
 use telepair_core::protocol::{ClientMessage, ServerMessage};
 
 #[test]
-fn client_term_input_roundtrip() {
-    let msg = ClientMessage::TermInput {
-        data: vec![0x1b, 0x5b, 0x41],
+fn client_term_resize_roundtrip() {
+    // Terminal input itself travels as a raw binary WS frame and has no JSON
+    // variant. Resize is the closest structured input-path message.
+    let msg = ClientMessage::TermResize {
+        cols: 120,
+        rows: 40,
     };
     let json = serde_json::to_string(&msg).unwrap();
     let parsed: ClientMessage = serde_json::from_str(&json).unwrap();

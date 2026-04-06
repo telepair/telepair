@@ -154,8 +154,10 @@ export class TelepairSocket {
     }
   }
 
-  sendInput(data: number[]) {
-    this.send({ type: 'TermInput', data });
+  sendInput(data: Uint8Array) {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(data);
+    }
   }
 
   sendResize(cols: number, rows: number) {

@@ -34,50 +34,71 @@ impl SqliteStorage {
             .execute(&self.pool)
             .await?;
 
-        // Run base schema (CREATE TABLE IF NOT EXISTS)
+        // Schema is the single source of truth — all DDL lives in SQL files.
+        // Fresh DBs created before this file included token_sha256 must be
+        // recreated (pre-1.0, no backwards-compat shims).
         sqlx::raw_sql(include_str!("../../../../migrations/001_initial.sql"))
             .execute(&self.pool)
             .await?;
 
-        // Migration: add token_sha256 column to users (idempotent)
-        let has_users_col: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM pragma_table_info('users') WHERE name = 'token_sha256'",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        // `CREATE TABLE IF NOT EXISTS` is a silent no-op when an old table
+        // with the same name already exists. Verify the expected columns are
+        // present so we fail fast instead of serving traffic against a stale
+        // schema and returning "invalid token" at runtime.
+        self.verify_schema().await?;
 
-        if !has_users_col {
-            sqlx::raw_sql(
-                "ALTER TABLE users ADD COLUMN token_sha256 TEXT;\
-                 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_token_sha256 \
-                     ON users(token_sha256) WHERE token_sha256 IS NOT NULL;",
-            )
-            .execute(&self.pool)
-            .await?;
+        Ok(())
+    }
+
+    /// Verify the database has the columns this code depends on.
+    ///
+    /// We intentionally do NOT require the SQLite-level `NOT NULL` flag
+    /// because the previous release shipped `token_sha256 TEXT` (nullable)
+    /// while always writing a value at insert time. Rejecting that shape
+    /// would force operators to wipe `~/.telepair/telepair.db` during an
+    /// in-place upgrade. Instead we verify:
+    ///
+    ///   1. The column exists (catches ancient schemas pre-`token_sha256`).
+    ///   2. No existing row has a NULL value (catches real data corruption
+    ///      and any legacy row that slipped through).
+    async fn verify_schema(&self) -> Result<()> {
+        for table in ["users", "invite_tokens"] {
+            self.assert_column_present(table, "token_sha256").await?;
+            self.assert_no_null_rows(table, "token_sha256").await?;
         }
+        Ok(())
+    }
 
-        // Migration: add token_sha256 column to invite_tokens (idempotent)
-        let has_invite_col: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM pragma_table_info('invite_tokens') WHERE name = 'token_sha256'",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+    async fn assert_column_present(&self, table: &str, column: &str) -> Result<()> {
+        // `PRAGMA table_info(<table>)` returns one row per column:
+        //   cid | name | type | notnull | dflt_value | pk
+        let query = format!("PRAGMA table_info({table})");
+        let rows = sqlx::query(&query).fetch_all(&self.pool).await?;
 
-        if !has_invite_col {
-            sqlx::raw_sql(
-                "ALTER TABLE invite_tokens ADD COLUMN token_sha256 TEXT;\
-                 CREATE UNIQUE INDEX IF NOT EXISTS idx_invite_tokens_token_sha256 \
-                     ON invite_tokens(token_sha256) WHERE token_sha256 IS NOT NULL;",
-            )
-            .execute(&self.pool)
-            .await?;
+        if !rows.iter().any(|r| r.get::<String, _>("name") == column) {
+            return Err(Error::SchemaOutdated(format!(
+                "table `{table}` is missing required column `{column}`. \
+                 The database was created by an older telepair release. \
+                 Remove ~/.telepair/telepair.db and restart to recreate it."
+            )));
         }
+        Ok(())
+    }
 
-        // Index on sessions.status for faster list_active_sessions
-        sqlx::raw_sql("CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);")
-            .execute(&self.pool)
-            .await?;
-
+    async fn assert_no_null_rows(&self, table: &str, column: &str) -> Result<()> {
+        let query = format!("SELECT 1 FROM {table} WHERE {column} IS NULL LIMIT 1");
+        if sqlx::query(&query)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some()
+        {
+            return Err(Error::SchemaOutdated(format!(
+                "table `{table}` has row(s) with NULL `{column}`. \
+                 The database was populated by an older telepair release \
+                 before the column was backfilled. Remove ~/.telepair/telepair.db \
+                 and restart to recreate it."
+            )));
+        }
         Ok(())
     }
 }
@@ -182,56 +203,33 @@ fn check_invite_validity(invite: &InviteToken) -> Result<()> {
 }
 
 impl SqliteStorage {
-    /// Resolve a raw token via SHA-256 indexed lookup, falling back to a bcrypt
-    /// scan for legacy rows. On bcrypt match, backfills `token_sha256` so
-    /// subsequent lookups hit the fast path.
+    /// Resolve a raw token via SHA-256 indexed lookup.
     ///
-    /// `table` and `id_col` are interpolated into SQL — they MUST be hardcoded
-    /// constants, never user input.
+    /// `table` is interpolated into SQL — it MUST be a hardcoded constant,
+    /// never user input.
     async fn lookup_by_token<T>(
         &self,
         table: &str,
-        id_col: &str,
         raw_token: &str,
         map_row: impl Fn(&SqliteRow) -> Result<T>,
         not_found_error: &'static str,
     ) -> Result<T> {
         let sha256_hex = token_sha256(raw_token);
-
-        let sha_query = format!("SELECT * FROM {table} WHERE token_sha256 = ?");
-        if let Some(row) = sqlx::query(&sha_query)
+        let query = format!("SELECT * FROM {table} WHERE token_sha256 = ?");
+        match sqlx::query(&query)
             .bind(&sha256_hex)
             .fetch_optional(&self.pool)
             .await?
         {
-            return map_row(&row);
+            Some(row) => map_row(&row),
+            None => Err(Error::Auth(not_found_error.into())),
         }
-
-        let scan_query = format!("SELECT * FROM {table} WHERE token_sha256 IS NULL");
-        let rows = sqlx::query(&scan_query).fetch_all(&self.pool).await?;
-
-        for row in rows {
-            let hash: String = row.get("token_hash");
-            if bcrypt::verify(raw_token, &hash).unwrap_or(false) {
-                let id: String = row.get(id_col);
-                let backfill = format!("UPDATE {table} SET token_sha256 = ? WHERE {id_col} = ?");
-                let _ = sqlx::query(&backfill)
-                    .bind(&sha256_hex)
-                    .bind(&id)
-                    .execute(&self.pool)
-                    .await;
-                return map_row(&row);
-            }
-        }
-
-        Err(Error::Auth(not_found_error.into()))
     }
 
     /// Look up an invite by raw token. Does NOT check expiry or usage limits.
     async fn find_invite_by_token(&self, token: &str) -> Result<InviteToken> {
         self.lookup_by_token(
             "invite_tokens",
-            "token_hash",
             token,
             row_to_invite,
             "invalid invite token",
@@ -292,7 +290,7 @@ impl Storage for SqliteStorage {
     }
 
     async fn validate_token(&self, token: &str) -> Result<User> {
-        self.lookup_by_token("users", "id", token, row_to_user, "invalid token")
+        self.lookup_by_token("users", token, row_to_user, "invalid token")
             .await
     }
 
@@ -388,32 +386,6 @@ impl Storage for SqliteStorage {
         Ok(result.rows_affected())
     }
 
-    async fn add_participant(
-        &self,
-        session_id: &str,
-        user_id: Uuid,
-        role: Role,
-    ) -> Result<Participant> {
-        let now = Utc::now();
-        sqlx::query(
-            "INSERT INTO participants (session_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)",
-        )
-        .bind(session_id)
-        .bind(user_id.to_string())
-        .bind(role.as_str())
-        .bind(now.to_rfc3339())
-        .execute(&self.pool)
-        .await?;
-
-        Ok(Participant {
-            session_id: session_id.into(),
-            user_id,
-            role,
-            joined_at: now,
-            left_at: None,
-        })
-    }
-
     async fn upsert_participant(
         &self,
         session_id: &str,
@@ -497,12 +469,6 @@ impl Storage for SqliteStorage {
             expires_at,
         };
         Ok((invite, raw_token))
-    }
-
-    async fn validate_invite(&self, token: &str) -> Result<InviteToken> {
-        let invite = self.find_invite_by_token(token).await?;
-        check_invite_validity(&invite)?;
-        Ok(invite)
     }
 
     async fn consume_invite(&self, token: &str) -> Result<InviteToken> {

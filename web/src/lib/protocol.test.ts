@@ -3,30 +3,27 @@ import { encodeInput } from './protocol';
 import type { ClientMessage, ServerMessage } from './protocol';
 
 describe('encodeInput', () => {
-  it('encodes ASCII string to number array', () => {
+  // TextEncoder under jsdom returns a Node-realm Uint8Array, so `instanceof`
+  // fails against jsdom's global Uint8Array. We assert shape via byteLength
+  // + Array.from, which works across realms.
+  it('encodes ASCII string to a typed byte array', () => {
     const result = encodeInput('hello');
-    expect(result).toEqual([104, 101, 108, 108, 111]);
+    expect(Array.from(result)).toEqual([104, 101, 108, 108, 111]);
   });
 
-  it('encodes empty string to empty array', () => {
-    expect(encodeInput('')).toEqual([]);
+  it('encodes empty string to zero bytes', () => {
+    const result = encodeInput('');
+    expect(result.byteLength).toBe(0);
   });
 
   it('encodes multi-byte UTF-8 characters', () => {
     const result = encodeInput('日');
     // '日' is U+65E5, encoded as 3 bytes in UTF-8: 0xE6, 0x97, 0xA5
-    expect(result).toEqual([0xe6, 0x97, 0xa5]);
+    expect(Array.from(result)).toEqual([0xe6, 0x97, 0xa5]);
   });
 });
 
 describe('ClientMessage type narrowing', () => {
-  it('discriminates on type field', () => {
-    const msg: ClientMessage = { type: 'TermInput', data: [65] };
-    if (msg.type === 'TermInput') {
-      expect(msg.data).toEqual([65]);
-    }
-  });
-
   it('TermResize carries cols and rows', () => {
     const msg: ClientMessage = { type: 'TermResize', cols: 80, rows: 24 };
     if (msg.type === 'TermResize') {

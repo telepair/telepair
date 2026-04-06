@@ -14,7 +14,7 @@ async fn setup() -> (SqliteStorage, String) {
 }
 
 #[tokio::test]
-async fn create_and_validate_invite_token() {
+async fn create_and_consume_invite_token() {
     let (store, session_id) = setup().await;
 
     let (invite, raw_token) = store
@@ -29,10 +29,12 @@ async fn create_and_validate_invite_token() {
     assert!(invite.expires_at.is_none());
     assert!(!raw_token.is_empty());
 
-    let validated = store.validate_invite(&raw_token).await.unwrap();
-    assert_eq!(validated.session_id, session_id);
-    assert_eq!(validated.role, Role::Operator);
-    assert_eq!(validated.max_uses, 5);
+    // Consume once — verifies lookup by raw token works and increments counter
+    let consumed = store.consume_invite(&raw_token).await.unwrap();
+    assert_eq!(consumed.session_id, session_id);
+    assert_eq!(consumed.role, Role::Operator);
+    assert_eq!(consumed.max_uses, 5);
+    assert_eq!(consumed.used_count, 1);
 }
 
 #[tokio::test]
