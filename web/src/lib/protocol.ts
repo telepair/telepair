@@ -72,4 +72,12 @@ export interface InviteInfo {
 export interface RedeemResult {
   session_id: string;
   role: Role;
+  /**
+   * Freshly issued guest token when the redeem call was made without
+   * (or with an invalid) bearer token. The frontend should store this
+   * into auth state before navigating to the session. `null` when the
+   * caller was already authenticated — they keep using their own
+   * token in that case.
+   */
+  token: string | null;
 }
