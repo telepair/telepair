@@ -33,6 +33,11 @@ impl TargetEngine {
         &self.targets
     }
 
+    /// Look up a target by name without cloning. Returns `None` if missing.
+    pub fn find(&self, name: &str) -> Option<&Target> {
+        self.targets.iter().find(|t| t.name == name)
+    }
+
     /// Resolve a target name to (command, args, env) with env substitution applied.
     pub fn resolve(&self, name: &str) -> Option<(String, Vec<String>, HashMap<String, String>)> {
         let target = self.targets.iter().find(|t| t.name == name)?;

@@ -16,6 +16,11 @@ impl TargetService {
         self.engine.list_targets()
     }
 
+    /// Look up a single target by name without cloning the list.
+    pub fn find(&self, name: &str) -> Option<&Target> {
+        self.engine.find(name)
+    }
+
     pub fn resolve(&self, name: &str) -> Option<(String, Vec<String>, HashMap<String, String>)> {
         self.engine.resolve(name)
     }
