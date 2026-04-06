@@ -252,4 +252,104 @@ describe('TelepairSocket', () => {
     expect((sock as any).sessionId).toBe('my-session');
     expect((sock as any).token).toBe('my-token');
   });
+
+  it('emits reconnect info on scheduled retry', async () => {
+    vi.useFakeTimers();
+    const onInfo = vi.fn();
+    const sock = new TelepairSocket(vi.fn(), vi.fn(), vi.fn());
+    sock.onReconnectInfo = onInfo;
+    sock.connect('s', 't');
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const ws = (sock as any).ws as MockWebSocket;
+    ws.onclose?.({ code: 1006, reason: '' });
+
+    expect(onInfo).toHaveBeenCalled();
+    const info = onInfo.mock.calls[onInfo.mock.calls.length - 1][0];
+    expect(info).toMatchObject({ attempt: 1, maxAttempts: 5, nextDelayMs: 1000 });
+    vi.useRealTimers();
+  });
+
+  it('clears reconnect info after a successful reconnect', async () => {
+    vi.useFakeTimers();
+    const onStatus = vi.fn();
+    const onInfo = vi.fn();
+    const sock = new TelepairSocket(vi.fn(), vi.fn(), onStatus);
+    sock.onReconnectInfo = onInfo;
+    sock.connect('s', 't');
+
+    await vi.advanceTimersByTimeAsync(10);
+    const ws = (sock as any).ws as MockWebSocket;
+    ws.onclose?.({ code: 1006, reason: '' });
+    expect(onInfo).toHaveBeenLastCalledWith(
+      expect.objectContaining({ attempt: 1 }),
+    );
+
+    // Advance past the scheduled retry so doConnect runs again.
+    await vi.advanceTimersByTimeAsync(1100);
+    const ws2 = (sock as any).ws as MockWebSocket;
+    // Simulate SessionState arrival which marks connected and clears info.
+    ws2.onmessage?.({
+      data: JSON.stringify({
+        type: 'SessionState',
+        session: { id: 's', owner_id: 'u', target_name: 't', input_mode: 'serialized', status: 'active', created_at: '', closed_at: null },
+        participants: [],
+        your_role: 'owner',
+        your_user_id: 'u',
+      }),
+    });
+    expect(onInfo).toHaveBeenLastCalledWith(null);
+    expect(onStatus).toHaveBeenCalledWith('connected');
+    vi.useRealTimers();
+  });
+
+  it('transitions to giveup after exhausting auto-retries', async () => {
+    vi.useFakeTimers();
+    const onStatus = vi.fn();
+    const onInfo = vi.fn();
+    const sock = new TelepairSocket(vi.fn(), vi.fn(), onStatus);
+    sock.onReconnectInfo = onInfo;
+    sock.connect('s', 't');
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Pin reconnectAttempts at the max so the next scheduleReconnect call
+    // falls into the giveup branch. Walking the full loop via mock close is
+    // fragile because MockWebSocket auto-fires onopen, which resets attempts.
+    (sock as any).reconnectAttempts = 5;
+
+    const ws = (sock as any).ws as MockWebSocket;
+    ws.onclose?.({ code: 1006, reason: '' });
+
+    const statusCalls = onStatus.mock.calls.map((c: any[]) => c[0]);
+    expect(statusCalls).toContain('giveup');
+    expect(onInfo).toHaveBeenLastCalledWith(null);
+    expect((sock as any).reconnectTimer).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it('reconnectNow cancels pending retry and immediately reconnects', async () => {
+    vi.useFakeTimers();
+    const onStatus = vi.fn();
+    const onInfo = vi.fn();
+    const sock = new TelepairSocket(vi.fn(), vi.fn(), onStatus);
+    sock.onReconnectInfo = onInfo;
+    sock.connect('s', 't');
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const ws = (sock as any).ws as MockWebSocket;
+    ws.onclose?.({ code: 1006, reason: '' });
+    expect((sock as any).reconnectTimer).not.toBeNull();
+
+    sock.reconnectNow();
+
+    // Pending timer should be cleared and a fresh ws created.
+    expect((sock as any).reconnectTimer).toBeNull();
+    expect((sock as any).reconnectAttempts).toBe(0);
+    // onReconnectInfo should have been told to clear (null) on manual reset.
+    expect(onInfo).toHaveBeenLastCalledWith(null);
+    vi.useRealTimers();
+  });
 });

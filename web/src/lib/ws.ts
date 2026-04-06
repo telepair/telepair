@@ -1,21 +1,46 @@
 // web/src/lib/ws.ts
 import type { ClientMessage, ServerMessage } from './protocol';
 
+export type ConnectionStatus =
+  | 'connecting'
+  | 'connected'
+  | 'disconnected'
+  | 'error'
+  | 'giveup';
+
+export type ReconnectInfo = {
+  /** 1-based retry attempt number currently in flight. */
+  attempt: number;
+  /** Maximum number of automatic retries before falling back to manual. */
+  maxAttempts: number;
+  /** Milliseconds until the scheduled retry fires. */
+  nextDelayMs: number;
+};
+
 export type MessageHandler = (msg: ServerMessage) => void;
 export type BinaryHandler = (data: Uint8Array) => void;
-export type StatusHandler = (status: 'connecting' | 'connected' | 'disconnected' | 'error') => void;
+export type StatusHandler = (status: ConnectionStatus) => void;
+export type ReconnectInfoHandler = (info: ReconnectInfo | null) => void;
 
 export class TelepairSocket {
   private ws: WebSocket | null = null;
   private onMessage: MessageHandler;
   private onBinary: BinaryHandler;
   private onStatus: StatusHandler;
+  /**
+   * Optional listener for reconnect progress — fires with a fresh
+   * {@link ReconnectInfo} on each scheduled retry and with `null` when
+   * reconnection is no longer in progress (success, giveup, or manual reset).
+   * Assign after construction: `sock.onReconnectInfo = (info) => ...`.
+   */
+  onReconnectInfo: ReconnectInfoHandler | null = null;
+
   private sessionId = '';
   private token = '';
   private cols = 80;
   private rows = 24;
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 10;
+  private maxReconnectAttempts = 5;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private intentionalClose = false;
 
@@ -32,6 +57,23 @@ export class TelepairSocket {
     this.rows = rows;
     this.intentionalClose = false;
     this.reconnectAttempts = 0;
+    this.onReconnectInfo?.(null);
+    this.doConnect();
+  }
+
+  /**
+   * Abort any pending auto-retry and immediately attempt a fresh connect.
+   * Intended for the user-facing "Reconnect" button shown after the auto-retry
+   * budget is exhausted.
+   */
+  reconnectNow() {
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnectAttempts = 0;
+    this.intentionalClose = false;
+    this.onReconnectInfo?.(null);
     this.doConnect();
   }
 
@@ -62,6 +104,7 @@ export class TelepairSocket {
         const msg: ServerMessage = JSON.parse(event.data);
         if (msg.type === 'SessionState') {
           this.onStatus('connected');
+          this.onReconnectInfo?.(null);
         }
         this.onMessage(msg);
       } catch {
@@ -76,6 +119,7 @@ export class TelepairSocket {
       }
       if (event.code === 1008 || event.code === 4001) {
         this.onStatus('error');
+        this.onReconnectInfo?.(null);
         return;
       }
       this.scheduleReconnect();
@@ -86,13 +130,22 @@ export class TelepairSocket {
 
   private scheduleReconnect() {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      this.onStatus('disconnected');
+      this.onStatus('giveup');
+      this.onReconnectInfo?.(null);
       return;
     }
-    this.onStatus('connecting');
-    const delay = Math.min(1000 * 2 ** this.reconnectAttempts, 30000);
     this.reconnectAttempts++;
-    this.reconnectTimer = setTimeout(() => this.doConnect(), delay);
+    const delay = Math.min(1000 * 2 ** (this.reconnectAttempts - 1), 30_000);
+    this.onStatus('connecting');
+    this.onReconnectInfo?.({
+      attempt: this.reconnectAttempts,
+      maxAttempts: this.maxReconnectAttempts,
+      nextDelayMs: delay,
+    });
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.doConnect();
+    }, delay);
   }
 
   send(msg: ClientMessage) {
@@ -111,8 +164,12 @@ export class TelepairSocket {
 
   disconnect() {
     this.intentionalClose = true;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.ws?.close();
     this.ws = null;
+    this.onReconnectInfo?.(null);
   }
 }
