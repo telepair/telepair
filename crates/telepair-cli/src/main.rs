@@ -47,9 +47,17 @@ struct Cli {
     #[arg(long)]
     web_dir: Option<PathBuf>,
 
-    /// Allowed CORS origins (comma-separated). If unset, allows all origins.
+    /// Allowed CORS origins (comma-separated). Unset defaults to
+    /// loopback dev origins (http://localhost:5173, http://127.0.0.1:5173).
+    /// Use absolute URLs only. Parse failures are fatal at startup.
     #[arg(long, value_delimiter = ',')]
     allowed_origins: Vec<String>,
+
+    /// Allow any origin (equivalent to `Access-Control-Allow-Origin: *`).
+    /// Only safe in dev or behind a reverse proxy that enforces CORS.
+    /// Mutually exclusive with `--allowed-origins` (this flag wins).
+    #[arg(long, default_value_t = false)]
+    allow_any_origin: bool,
 }
 
 #[derive(Subcommand)]
@@ -183,8 +191,13 @@ async fn main() -> anyhow::Result<()> {
             })
             .transpose()?;
         let state = AppState::new(storage, engine).await;
-        let router =
-            telepair_gateway::build_router_with_options(state, web_dir, &cli.allowed_origins);
+        let cors_mode = if cli.allow_any_origin {
+            telepair_gateway::CorsMode::AllowAny
+        } else {
+            telepair_gateway::CorsMode::Origins(cli.allowed_origins)
+        };
+        let router = telepair_gateway::build_router_with_options(state, web_dir, cors_mode)
+            .map_err(|e| anyhow::anyhow!("CORS config error: {e}"))?;
         let addr = format!("{}:{}", cli.host, cli.port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         tracing::info!("telepair listening on http://{addr}");
