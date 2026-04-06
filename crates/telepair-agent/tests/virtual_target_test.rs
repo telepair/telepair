@@ -7,7 +7,6 @@ targets:
     command: echo
     args: ["hello", "world"]
     tags: [test]
-    required_role: viewer
 
   - name: local-shell
     display: "Local Shell"

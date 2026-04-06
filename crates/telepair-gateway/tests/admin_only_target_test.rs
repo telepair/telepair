@@ -13,7 +13,7 @@ targets:
   - name: restricted
     display: Restricted Target
     command: echo
-    required_role: operator
+    admin_only: true
   - name: open
     display: Open Target
     command: echo
@@ -32,7 +32,7 @@ async fn setup() -> (axum::Router, String, String) {
 }
 
 #[tokio::test]
-async fn non_admin_blocked_by_required_role() {
+async fn non_admin_blocked_from_admin_only_target() {
     let (app, user_token, _) = setup().await;
 
     let resp = app
@@ -50,7 +50,7 @@ async fn non_admin_blocked_by_required_role() {
 }
 
 #[tokio::test]
-async fn admin_bypasses_required_role() {
+async fn admin_can_access_admin_only_target() {
     let (app, _, admin_token) = setup().await;
 
     let resp = app
@@ -68,7 +68,7 @@ async fn admin_bypasses_required_role() {
 }
 
 #[tokio::test]
-async fn no_required_role_allows_non_admin() {
+async fn unrestricted_target_allows_non_admin() {
     let (app, user_token, _) = setup().await;
 
     let resp = app

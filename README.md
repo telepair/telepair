@@ -127,7 +127,7 @@ targets:
     display: "Staging SSH"
     command: ssh
     args: ["deploy@staging.example.com"]
-    required_role: operator
+    admin_only: true
     tags: [server, staging]
 
   - name: monitor
@@ -136,7 +136,7 @@ targets:
     tags: [monitoring]
 ```
 
-Environment variables in `${VAR}` syntax are expanded at launch time. Use `required_role` to restrict which users can create sessions for a target (non-admin users without the required role receive `403 Forbidden`). A default local shell target is always available.
+Environment variables in `${VAR}` syntax are expanded at launch time. Set `admin_only: true` on a target to restrict session creation to admin users — non-admins hitting it receive `403 Forbidden`. A default local shell target is always available.
 
 ### Data Directory
 

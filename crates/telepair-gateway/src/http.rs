@@ -97,16 +97,14 @@ pub async fn create_session(
 ) -> Result<impl IntoResponse, StatusCode> {
     let user = extract_user(&state, &headers).await?;
 
-    // Verify target exists and check required_role
+    // Verify target exists and enforce admin-only restriction
     let target = state
         .targets
         .find(&body.target_name)
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    if let Some(required) = &target.required_role {
-        if !user.is_admin && *required != Role::Viewer {
-            return Err(StatusCode::FORBIDDEN);
-        }
+    if target.admin_only && !user.is_admin {
+        return Err(StatusCode::FORBIDDEN);
     }
 
     let mode = match body.input_mode.as_deref() {
