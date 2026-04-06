@@ -91,7 +91,7 @@ Browser                     telepair (single process)
 ### Terminal I/O
 
 1. User types in xterm.js
-2. Frontend encodes keystrokes as `TermInput { data: Vec<u8> }` (JSON text frame)
+2. Frontend sends the raw UTF-8 bytes as a **binary WebSocket frame** (no JSON wrapper)
 3. WS handler checks `role.can_input()` — silently drops if viewer
 4. Sends bytes to PTY via `SessionHub` command channel
 5. PTY output is broadcast via `output_tx` to all connected participants
