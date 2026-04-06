@@ -22,4 +22,23 @@ pub enum Error {
     Json(#[from] serde_json::Error),
 }
 
+impl Error {
+    /// HTTP status classification for this error. Handlers should prefer
+    /// this over hand-rolling `map_err(|_| StatusCode::X)` so that a
+    /// client-side problem (bad input, expired invite) never bubbles up
+    /// as a 500. Anything not explicitly mapped here is treated as an
+    /// internal server error.
+    pub fn http_status(&self) -> u16 {
+        match self {
+            // Token missing/invalid or invite expired — client must
+            // retry with different credentials.
+            Error::Auth(_) => 401,
+            Error::PermissionDenied(_) => 403,
+            Error::SessionNotFound(_) | Error::TargetNotFound(_) => 404,
+            Error::InvalidInput(_) | Error::Json(_) => 400,
+            Error::Storage(_) | Error::Io(_) | Error::Yaml(_) => 500,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
