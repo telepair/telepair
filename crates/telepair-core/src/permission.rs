@@ -17,14 +17,6 @@ impl Role {
         matches!(self, Self::Owner | Self::Operator)
     }
 
-    pub fn can_manage_participants(&self) -> bool {
-        matches!(self, Self::Owner)
-    }
-
-    pub fn can_close_session(&self) -> bool {
-        matches!(self, Self::Owner)
-    }
-
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Owner => "owner",

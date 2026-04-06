@@ -69,7 +69,7 @@ struct LiveSession {
     /// Subscribe to PTY output. Uses `Bytes` so broadcast cloning is a cheap
     /// refcount bump per subscriber instead of a per-chunk `Vec<u8>` copy.
     output_tx: broadcast::Sender<Bytes>,
-    /// Broadcast collaboration messages (PeerJoined, PeerLeft, PermUpdate, etc.)
+    /// Broadcast collaboration messages (PeerJoined, PeerLeft, PeerChat, PeerCursor).
     collab_tx: broadcast::Sender<ServerMessage>,
     /// Signal to all connected WS handlers that this session is being force-stopped
     shutdown_tx: broadcast::Sender<()>,
@@ -445,27 +445,4 @@ impl SessionHub {
         })
     }
 
-    /// Update a participant's role and broadcast `PermUpdate` to all subscribers.
-    pub async fn update_participant_role(
-        &self,
-        session_id: &str,
-        user_id: Uuid,
-        new_role: Role,
-    ) -> bool {
-        let mut sessions = self.sessions.write().await;
-        let Some(live) = sessions.get_mut(session_id) else {
-            return false;
-        };
-        let Some(participant) = live.participants.get_mut(&user_id) else {
-            return false;
-        };
-
-        participant.role = new_role;
-
-        let _ = live
-            .collab_tx
-            .send(ServerMessage::PermUpdate { user_id, new_role });
-
-        true
-    }
 }
