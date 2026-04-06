@@ -122,24 +122,24 @@ Each live session has two independent broadcast channels:
 | Channel | Capacity | Content |
 |---------|----------|---------|
 | `output_tx` | 256 messages | PTY bytes (forwarded as raw binary WS frames) |
-| `collab_tx` | 64 messages | `PeerJoined`, `PeerLeft`, `PeerChat`, `PeerCursor`, `PermUpdate` |
+| `collab_tx` | 64 messages | `PeerJoined`, `PeerLeft`, `PeerChat`, `PeerCursor` |
 
 Separation ensures high-frequency terminal output does not starve collaboration messages. Both use `tokio::broadcast` — slow receivers lose oldest messages.
 
 ## Storage Schema
 
 ```sql
-users (id, name, token_hash, is_admin, created_at, updated_at)
+users (id, name, token_sha256, is_admin, created_at, updated_at)
 sessions (id, owner_id, target_name, input_mode, status, created_at, closed_at)
 participants (session_id, user_id, role, joined_at, left_at)
-invite_tokens (token_hash, session_id, role, max_uses, used_count, expires_at)
+invite_tokens (token_sha256, session_id, role, max_uses, used_count, expires_at)
 ```
 
 All IDs are UUIDs stored as TEXT. Timestamps are ISO 8601 TEXT. The `Storage` trait is async and implementation-agnostic — SQLite is the v1 backend.
 
 ## Security Model
 
-- **Authentication**: Bearer token in `Authorization` header. Tokens are bcrypt-hashed in storage, never stored in plaintext.
+- **Authentication**: Bearer token in `Authorization` header. Tokens are stored as their SHA-256 hex digest only — the raw value is returned to the caller exactly once at creation and never persisted.
 - **Authorization**: Role-based per session. WS handler checks role on every input/resize action.
-- **Invite tokens**: Single-use by default. Hashed with bcrypt. Atomic consumption prevents concurrent redemption race conditions.
+- **Invite tokens**: Single-use by default. Stored as SHA-256 digests; atomic `used_count < max_uses` increment prevents concurrent redemption race conditions.
 - **CORS**: Configurable via `--allowed-origins`. When unset, the server allows **all origins** (permissive default for development). In production behind a reverse proxy, set `--allowed-origins` to restrict access to trusted domains.

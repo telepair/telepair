@@ -28,7 +28,6 @@ export default function SessionPage() {
   const [chatMessages, setChatMessages] = createSignal<ChatMessage[]>([]);
   const [showInvite, setShowInvite] = createSignal(false);
   const [sidebarOpen, setSidebarOpen] = createSignal(true);
-  const [currentUserId, setCurrentUserId] = createSignal('');
   let hasConnectedOnce = false;
 
   let termHandle: TerminalHandle | undefined;
@@ -48,7 +47,6 @@ export default function SessionPage() {
       case 'SessionState':
         setRole(msg.your_role);
         setParticipants(msg.participants);
-        setCurrentUserId(msg.your_user_id);
         break;
       case 'PeerJoined':
         setParticipants((prev) => [
@@ -66,16 +64,6 @@ export default function SessionPage() {
         ]);
         break;
       case 'PeerCursor':
-        break;
-      case 'PermUpdate':
-        setParticipants((prev) =>
-          prev.map((p) =>
-            p.user_id === msg.user_id ? { ...p, role: msg.new_role } : p
-          )
-        );
-        if (msg.user_id === currentUserId()) {
-          setRole(msg.new_role);
-        }
         break;
       case 'Error':
         handleServerError(msg.code, msg.message);

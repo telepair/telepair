@@ -1,21 +1,17 @@
 use telepair_core::permission::Role;
 
 #[test]
-fn owner_has_all_permissions() {
+fn owner_can_input_and_resize() {
     let role = Role::Owner;
     assert!(role.can_input());
     assert!(role.can_resize());
-    assert!(role.can_manage_participants());
-    assert!(role.can_close_session());
 }
 
 #[test]
-fn operator_can_input_but_not_manage() {
+fn operator_can_input_and_resize() {
     let role = Role::Operator;
     assert!(role.can_input());
     assert!(role.can_resize());
-    assert!(!role.can_manage_participants());
-    assert!(!role.can_close_session());
 }
 
 #[test]
@@ -23,8 +19,6 @@ fn viewer_is_read_only() {
     let role = Role::Viewer;
     assert!(!role.can_input());
     assert!(!role.can_resize());
-    assert!(!role.can_manage_participants());
-    assert!(!role.can_close_session());
 }
 
 #[test]

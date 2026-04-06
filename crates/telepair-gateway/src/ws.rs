@@ -210,12 +210,9 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     }
 
     // Spawn a forwarder that pumps PTY output + collab messages to the WS sink.
-    // `stop_tx` (oneshot) lets the main loop tell the forwarder to exit;
-    // `role_watch_tx` (watch) lets it react to PermUpdate without blocking the input loop.
+    // `stop_tx` (oneshot) lets the main loop tell the forwarder to exit.
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
-    let (role_watch_tx, role_watch_rx) = tokio::sync::watch::channel(my_role);
 
-    let my_user_id = user.id;
     let session_id_for_output = session_id.clone();
     let output_handle = tokio::spawn(async move {
         loop {
@@ -240,12 +237,6 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                 result = collab_rx.recv() => {
                     match result {
                         Ok(collab_msg) => {
-                            // Detect PermUpdate targeting current user and update role watch
-                            if let ServerMessage::PermUpdate { user_id, new_role } = &collab_msg {
-                                if *user_id == my_user_id {
-                                    let _ = role_watch_tx.send(*new_role);
-                                }
-                            }
                             let Ok(json) = serde_json::to_string(&collab_msg) else {
                                 tracing::error!("failed to serialize collab message");
                                 continue;
@@ -272,16 +263,22 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let user_name = user.name.clone();
     let input_mode = session.input_mode;
 
-    let can_forward_input = |role: Role| -> bool {
-        role.can_input() && !(input_mode == InputMode::Serialized && role != Role::Owner)
-    };
+    // Role is captured at join time and never mutates for the lifetime of
+    // this WS connection. The previous code maintained a `tokio::sync::watch`
+    // updated by `PermUpdate`, but with no role-mutation API exposed there
+    // was nothing to update — every connection's role was constant from
+    // join to disconnect. If/when role updates land, the right place to
+    // re-check is on reconnect (so the auth model stays consistent across
+    // tabs), not via a side-channel that races the input loop.
+    let current_role = my_role;
+    let can_forward_input = current_role.can_input()
+        && !(input_mode == InputMode::Serialized && current_role != Role::Owner);
 
     // Track the last accepted CursorMove timestamp per connection so we can
     // drop floods without spinning up a timer task.
     let mut last_cursor_at: Option<Instant> = None;
 
     loop {
-        let current_role = *role_watch_rx.borrow();
         tokio::select! {
             msg = ws_rx.next() => {
                 let Some(Ok(msg)) = msg else { break };
@@ -331,7 +328,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                         }
                     }
                     Message::Binary(data) => {
-                        if can_forward_input(current_role) {
+                        if can_forward_input {
                             let _ = cmd_tx.send(PtyCommand::Input(data.to_vec())).await;
                         }
                     }

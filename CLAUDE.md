@@ -84,7 +84,7 @@ Client/server messages are defined in `telepair-core/src/protocol.rs` (Rust) and
 
 ## Permissions
 
-Role capabilities are checked in `telepair-core/src/permission.rs` via methods like `can_input()`, `can_resize()`, `can_manage_participants()`. The WebSocket handler in `telepair-gateway/src/ws.rs` enforces these before processing messages.
+Role capabilities are checked in `telepair-core/src/permission.rs` via `can_input()` and `can_resize()`. The WebSocket handler in `telepair-gateway/src/ws.rs` enforces these on every input/resize message; admin-only target gating happens in the REST `create_session` handler against `Target::admin_only`.
 
 ## Environment
 

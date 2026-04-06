@@ -167,18 +167,6 @@ Forwarded cursor position from another participant.
 }
 ```
 
-#### PermUpdate
-
-Broadcast when a participant's role changes.
-
-```json
-{
-  "type": "PermUpdate",
-  "user_id": "...",
-  "new_role": "operator"
-}
-```
-
 #### Error
 
 Server-side error notification.

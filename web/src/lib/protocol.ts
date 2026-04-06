@@ -48,7 +48,6 @@ export type ServerMessage =
   | { type: 'PeerLeft'; user_id: string }
   | { type: 'PeerCursor'; user_id: string; x: number; y: number }
   | { type: 'PeerChat'; user_id: string; name: string; text: string; ts: string }
-  | { type: 'PermUpdate'; user_id: string; new_role: Role }
   | { type: 'Error'; code: string; message: string };
 
 // --- Helpers ---

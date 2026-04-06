@@ -65,10 +65,6 @@ pub enum ServerMessage {
         text: String,
         ts: String,
     },
-    PermUpdate {
-        user_id: Uuid,
-        new_role: Role,
-    },
     Error {
         code: String,
         message: String,
