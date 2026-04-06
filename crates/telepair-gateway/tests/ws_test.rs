@@ -87,8 +87,7 @@ async fn ws_auth_timeout() {
         .expect("failed to connect");
 
     // Don't send anything — the server should close within ~5 seconds
-    let result =
-        tokio::time::timeout(std::time::Duration::from_secs(7), recv_json(&mut ws)).await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(7), recv_json(&mut ws)).await;
 
     match result {
         Ok(Some(ServerMessage::Error { code, .. })) => {

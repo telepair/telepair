@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use telepair_agent::pty::PtyManager;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 #[tokio::test]
 async fn spawn_shell_and_read_output() {

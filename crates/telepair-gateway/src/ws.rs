@@ -1,7 +1,7 @@
 use axum::{
     extract::{
-        ws::{CloseFrame, Message, WebSocket},
         Path, State, WebSocketUpgrade,
+        ws::{CloseFrame, Message, WebSocket},
     },
     response::IntoResponse,
 };
@@ -49,39 +49,32 @@ async fn send_error(
 async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    let (user, initial_cols, initial_rows) = match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        ws_rx.next(),
-    )
-    .await
-    {
-        Ok(Some(Ok(Message::Text(text)))) => {
-            match serde_json::from_str::<ClientMessage>(&text) {
-                Ok(ClientMessage::SessionJoin {
-                    token,
-                    cols,
-                    rows,
-                    ..
-                }) => match state.auth.validate(&token).await {
-                    Ok(user) => (user, cols, rows),
-                    Err(_) => {
-                        send_error(&mut ws_tx, "AUTH_FAILED", "invalid token".into()).await;
-                        return;
-                    }
-                },
-                _ => return,
+    let (user, initial_cols, initial_rows) =
+        match tokio::time::timeout(std::time::Duration::from_secs(5), ws_rx.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                match serde_json::from_str::<ClientMessage>(&text) {
+                    Ok(ClientMessage::SessionJoin {
+                        token, cols, rows, ..
+                    }) => match state.auth.validate(&token).await {
+                        Ok(user) => (user, cols, rows),
+                        Err(_) => {
+                            send_error(&mut ws_tx, "AUTH_FAILED", "invalid token".into()).await;
+                            return;
+                        }
+                    },
+                    _ => return,
+                }
             }
-        }
-        _ => {
-            send_error(
-                &mut ws_tx,
-                "AUTH_TIMEOUT",
-                "expected SessionJoin within 5 seconds".into(),
-            )
-            .await;
-            return;
-        }
-    };
+            _ => {
+                send_error(
+                    &mut ws_tx,
+                    "AUTH_TIMEOUT",
+                    "expected SessionJoin within 5 seconds".into(),
+                )
+                .await;
+                return;
+            }
+        };
 
     // Run session lookup and participant listing concurrently — both depend
     // only on session_id and account for ~half the handshake DB time.
@@ -133,13 +126,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         .iter()
         .find(|p| p.user_id == user.id)
         .map(|p| p.role)
-        .unwrap_or_else(|| {
-            if is_owner {
-                Role::Owner
-            } else {
-                Role::Viewer
-            }
-        });
+        .unwrap_or_else(|| if is_owner { Role::Owner } else { Role::Viewer });
 
     let hub = &state.hub;
     let (cmd, args, env) = match state.targets.resolve(&session.target_name) {
@@ -154,17 +141,16 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
             return;
         }
     };
-    let (cmd_tx, mut output_rx, mut collab_rx, mut shutdown_rx) =
-        match hub
-            .start_or_join(&session_id, &cmd, &args, &env, initial_cols, initial_rows)
-            .await
-        {
-            Ok(channels) => channels,
-            Err(e) => {
-                send_error(&mut ws_tx, "PTY_ERROR", e).await;
-                return;
-            }
-        };
+    let (cmd_tx, mut output_rx, mut collab_rx, mut shutdown_rx) = match hub
+        .start_or_join(&session_id, &cmd, &args, &env, initial_cols, initial_rows)
+        .await
+    {
+        Ok(channels) => channels,
+        Err(e) => {
+            send_error(&mut ws_tx, "PTY_ERROR", e).await;
+            return;
+        }
+    };
 
     let _color = hub
         .add_participant(&session_id, user.id, user.name.clone(), my_role)
@@ -325,7 +311,12 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     }
     hub.remove_participant(&session_id, user_id).await;
     // Update DB left_at so participant history is accurate
-    if let Err(e) = state.sessions.storage().remove_participant(&session_id, user_id).await {
+    if let Err(e) = state
+        .sessions
+        .storage()
+        .remove_participant(&session_id, user_id)
+        .await
+    {
         tracing::warn!(session = %session_id, user = %user_name, "failed to update DB left_at: {e}");
     }
     tracing::info!(user = %user_name, session = %session_id, "WebSocket disconnected");

@@ -74,11 +74,9 @@ impl SqliteStorage {
         }
 
         // Index on sessions.status for faster list_active_sessions
-        sqlx::raw_sql(
-            "CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);",
-        )
-        .execute(&self.pool)
-        .await?;
+        sqlx::raw_sql("CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);")
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }
@@ -231,8 +229,14 @@ impl SqliteStorage {
 
     /// Look up an invite by raw token. Does NOT check expiry or usage limits.
     async fn find_invite_by_token(&self, token: &str) -> Result<InviteToken> {
-        self.lookup_by_token("invite_tokens", "token_hash", token, row_to_invite, "invalid invite token")
-            .await
+        self.lookup_by_token(
+            "invite_tokens",
+            "token_hash",
+            token,
+            row_to_invite,
+            "invalid invite token",
+        )
+        .await
     }
 }
 
@@ -439,24 +443,21 @@ impl Storage for SqliteStorage {
 
     async fn remove_participant(&self, session_id: &str, user_id: Uuid) -> Result<()> {
         let now = Utc::now();
-        sqlx::query(
-            "UPDATE participants SET left_at = ? WHERE session_id = ? AND user_id = ?",
-        )
-        .bind(now.to_rfc3339())
-        .bind(session_id)
-        .bind(user_id.to_string())
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE participants SET left_at = ? WHERE session_id = ? AND user_id = ?")
+            .bind(now.to_rfc3339())
+            .bind(session_id)
+            .bind(user_id.to_string())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     async fn list_participants(&self, session_id: &str) -> Result<Vec<Participant>> {
-        let rows = sqlx::query(
-            "SELECT * FROM participants WHERE session_id = ? AND left_at IS NULL",
-        )
-        .bind(session_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows =
+            sqlx::query("SELECT * FROM participants WHERE session_id = ? AND left_at IS NULL")
+                .bind(session_id)
+                .fetch_all(&self.pool)
+                .await?;
 
         rows.into_iter()
             .map(|r| row_to_participant(&r))
@@ -471,9 +472,7 @@ impl Storage for SqliteStorage {
         expires_at: Option<chrono::DateTime<Utc>>,
     ) -> Result<(InviteToken, String)> {
         if max_uses < 1 {
-            return Err(Error::InvalidInput(
-                "max_uses must be at least 1".into(),
-            ));
+            return Err(Error::InvalidInput("max_uses must be at least 1".into()));
         }
         let (raw_token, token_hash, sha256_hex) = generate_token()?;
 

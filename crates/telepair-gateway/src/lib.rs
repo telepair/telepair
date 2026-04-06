@@ -6,8 +6,8 @@ pub mod state;
 pub mod ws;
 
 use axum::{
-    routing::{delete, get, post},
     Router,
+    routing::{delete, get, post},
 };
 use state::AppState;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -46,10 +46,7 @@ pub fn build_router_with_options(
             "/api/sessions",
             post(http::create_session).get(http::list_sessions),
         )
-        .route(
-            "/api/sessions/{session_id}",
-            delete(http::close_session),
-        )
+        .route("/api/sessions/{session_id}", delete(http::close_session))
         .route(
             "/api/sessions/{session_id}/invite",
             post(http::create_invite),
@@ -61,8 +58,8 @@ pub fn build_router_with_options(
 
     match web_dir {
         Some(dir) => {
-            let serve = ServeDir::new(dir)
-                .not_found_service(ServeFile::new(format!("{dir}/index.html")));
+            let serve =
+                ServeDir::new(dir).not_found_service(ServeFile::new(format!("{dir}/index.html")));
             api.fallback_service(serve)
         }
         None => api,

@@ -150,10 +150,7 @@ where
 }
 
 /// Common setup: create a user, session, and add the user as owner participant.
-async fn create_owned_session(
-    state: &AppState,
-    username: &str,
-) -> (String, String, uuid::Uuid) {
+async fn create_owned_session(state: &AppState, username: &str) -> (String, String, uuid::Uuid) {
     let token = state.create_test_user(username).await;
     let user = state.auth.validate(&token).await.unwrap();
     let session = state
@@ -194,9 +191,7 @@ async fn join_session(
     addr: &str,
     session_id: &str,
     token: &str,
-) -> tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-> {
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     let (mut ws, _) = connect_async(ws_url(addr, session_id)).await.unwrap();
     ws.send(session_join_msg(session_id, token)).await.unwrap();
     expect_json(&mut ws, 5, |m| {
@@ -212,10 +207,8 @@ async fn join_session(
 async fn e2e_full_collaboration_flow() {
     let (addr, state) = start_server().await;
 
-    let (session_id, owner_token, _) =
-        create_owned_session(&state, "alice").await;
-    let (op_token, op_id) =
-        add_participant(&state, &session_id, "bob", Role::Operator).await;
+    let (session_id, owner_token, _) = create_owned_session(&state, "alice").await;
+    let (op_token, op_id) = add_participant(&state, &session_id, "bob", Role::Operator).await;
 
     // Owner connects and joins
     let mut ws_owner = join_session(&addr, &session_id, &owner_token).await;
@@ -255,10 +248,7 @@ async fn e2e_full_collaboration_flow() {
         _ => false,
     })
     .await;
-    if let ServerMessage::PeerJoined {
-        name, role, ..
-    } = peer
-    {
+    if let ServerMessage::PeerJoined { name, role, .. } = peer {
         assert_eq!(name, "bob");
         assert_eq!(role, Role::Operator);
     }
@@ -273,10 +263,8 @@ async fn e2e_full_collaboration_flow() {
 async fn e2e_chat_broadcast() {
     let (addr, state) = start_server().await;
 
-    let (session_id, token_a, user_a_id) =
-        create_owned_session(&state, "alice").await;
-    let (token_b, _) =
-        add_participant(&state, &session_id, "bob", Role::Operator).await;
+    let (session_id, token_a, user_a_id) = create_owned_session(&state, "alice").await;
+    let (token_b, _) = add_participant(&state, &session_id, "bob", Role::Operator).await;
 
     let mut ws_a = join_session(&addr, &session_id, &token_a).await;
     let mut ws_b = join_session(&addr, &session_id, &token_b).await;
@@ -344,12 +332,9 @@ async fn e2e_pty_io_roundtrip() {
 async fn e2e_permission_enforcement() {
     let (addr, state) = start_server().await;
 
-    let (session_id, owner_token, _) =
-        create_owned_session(&state, "owner").await;
-    let (op_token, _) =
-        add_participant(&state, &session_id, "operator", Role::Operator).await;
-    let (viewer_token, _) =
-        add_participant(&state, &session_id, "viewer", Role::Viewer).await;
+    let (session_id, owner_token, _) = create_owned_session(&state, "owner").await;
+    let (op_token, _) = add_participant(&state, &session_id, "operator", Role::Operator).await;
+    let (viewer_token, _) = add_participant(&state, &session_id, "viewer", Role::Viewer).await;
 
     let mut ws_owner = join_session(&addr, &session_id, &owner_token).await;
     let mut ws_op = join_session(&addr, &session_id, &op_token).await;
@@ -403,10 +388,8 @@ async fn e2e_permission_enforcement() {
 async fn e2e_session_close_disconnects_all() {
     let (addr, state) = start_server().await;
 
-    let (session_id, owner_token, _) =
-        create_owned_session(&state, "alice").await;
-    let (op_token, _) =
-        add_participant(&state, &session_id, "bob", Role::Operator).await;
+    let (session_id, owner_token, _) = create_owned_session(&state, "alice").await;
+    let (op_token, _) = add_participant(&state, &session_id, "bob", Role::Operator).await;
 
     let mut ws_owner = join_session(&addr, &session_id, &owner_token).await;
     let mut ws_op = join_session(&addr, &session_id, &op_token).await;
@@ -414,11 +397,7 @@ async fn e2e_session_close_disconnects_all() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Close the session (same path as DELETE /api/sessions/{id})
-    state
-        .sessions
-        .close_session(&session_id)
-        .await
-        .unwrap();
+    state.sessions.close_session(&session_id).await.unwrap();
     state.hub.stop_session(&session_id).await;
 
     // Both connections should close

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use uuid::Uuid;
 
 use telepair_agent::pty::PtyManager;
@@ -11,8 +11,7 @@ use telepair_core::storage::{SqliteStorage, Storage};
 
 /// Color palette for participant cursors / identifiers.
 const COLORS: &[&str] = &[
-    "#58a6ff", "#3fb950", "#d29922", "#f85149",
-    "#bc8cff", "#39c5cf", "#ffa198", "#56d364",
+    "#58a6ff", "#3fb950", "#d29922", "#f85149", "#bc8cff", "#39c5cf", "#ffa198", "#56d364",
 ];
 
 fn assign_color(index: usize) -> String {
@@ -269,10 +268,9 @@ impl SessionHub {
 
         participant.role = new_role;
 
-        let _ = live.collab_tx.send(ServerMessage::PermUpdate {
-            user_id,
-            new_role,
-        });
+        let _ = live
+            .collab_tx
+            .send(ServerMessage::PermUpdate { user_id, new_role });
 
         true
     }
