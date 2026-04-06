@@ -53,7 +53,7 @@ Open `http://localhost:7700` in your browser, paste the admin token to log in.
 1. Launch a session from the dashboard by clicking a target
 2. Click **Invite** in the top bar
 3. Choose a role (Operator or Viewer) and copy the invite link
-4. Share the link — the collaborator pastes their token and joins
+4. Share the link — the collaborator opens it and joins instantly; no token or account needed. A throwaway guest user is minted automatically on first click and their token is cached in the browser for the rest of the session.
 
 ## Architecture
 
@@ -162,13 +162,13 @@ telepair stores its data in `~/.telepair/`:
 ## Development
 
 ```bash
-# Run backend tests (68 tests)
+# Run backend tests (87 tests)
 cargo test --workspace
 
-# Run frontend unit tests (45 tests)
+# Run frontend unit tests (67 tests)
 cd web && npm test
 
-# Run browser E2E tests (12 tests, requires running server + Chromium)
+# Run browser E2E tests (18 tests, requires running server + Chromium)
 cd web && npx playwright install chromium    # first time only
 cd web && npm run e2e                        # server auto-starts or reuses :7700
 
@@ -206,7 +206,7 @@ RUST_LOG=debug ./target/release/telepair
 | Backend | Rust, axum, tokio, sqlx (SQLite), portable-pty |
 | Frontend | SolidJS, TypeScript, xterm.js, Vite |
 | Protocol | JSON over WebSocket (control + collab), binary frames (terminal I/O) |
-| Auth | Token-based with bcrypt hashing |
+| Auth | Token-based with SHA-256 hashed storage |
 | Storage | SQLite (async via sqlx) |
 
 ## License

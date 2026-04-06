@@ -2,11 +2,13 @@
 
 Base URL: `http://localhost:7700/api`
 
-All endpoints except `/api/health` require authentication via Bearer token:
+All endpoints except `/api/health` and `POST /api/invite/redeem` require authentication via Bearer token:
 
 ```
 Authorization: Bearer <token>
 ```
+
+`POST /api/invite/redeem` accepts both authenticated and anonymous callers — anonymous redemptions mint a fresh guest user and return a new token in the response (see below).
 
 ## Health
 
@@ -74,6 +76,7 @@ Create a new session. The authenticated user becomes the session owner.
 ```
 
 **Errors**
+- `400 Bad Request` — `input_mode` is present but not one of `serialized` / `multiplexed` (unknown values used to silently collapse to `serialized`; that was masking client bugs)
 - `401 Unauthorized` — missing or invalid token
 - `403 Forbidden` — target is marked `admin_only: true` in target config and the caller is not an admin
 - `404 Not Found` — target does not exist
@@ -140,6 +143,7 @@ Create an invite link for a session. Only the session owner can create invites.
 ```
 
 **Errors**
+- `400 Bad Request` — `role` is `owner` (only `operator` / `viewer` can be invited), `max_uses` is zero or negative, or the body is otherwise malformed
 - `401 Unauthorized` — missing or invalid token
 - `403 Forbidden` — not the session owner
 - `404 Not Found` — session does not exist
@@ -147,6 +151,12 @@ Create an invite link for a session. Only the session owner can create invites.
 ### POST /api/invite/redeem
 
 Redeem an invite token to join a session.
+
+**Authentication is optional.** The endpoint accepts three shapes of caller:
+
+1. **Anonymous visitor (the common case).** Drop the `Authorization` header entirely. The server consumes one `max_uses` slot, mints a new guest user named `guest-<nanoid>`, and returns a freshly issued token in the `token` field. The client is expected to persist that token and use it for all subsequent API / WebSocket calls in that tab.
+2. **Authenticated caller.** Send a valid bearer token. The server reuses the caller's existing identity (useful for an admin previewing their own invite link) and returns `"token": null` — you already have a token.
+3. **Stale bearer token.** An invalid `Authorization` header is treated the same as an anonymous visitor: the server silently drops it and mints a guest. This is intentional so a browser with an expired admin token can still follow an invite link.
 
 **Request Body**
 ```json
@@ -159,10 +169,18 @@ Redeem an invite token to join a session.
 ```json
 {
   "session_id": "550e8400-...",
-  "role": "operator"
+  "role": "operator",
+  "token": "newly-minted-guest-token-or-null"
 }
 ```
 
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | string | Session to join |
+| `role` | string | Role granted by the invite (`operator` or `viewer`) |
+| `token` | string \| null | Bearer token for the newly minted guest, or `null` when an authenticated caller reused their existing identity |
+
 **Errors**
-- `400 Bad Request` — invalid or exhausted invite token
-- `401 Unauthorized` — missing or invalid auth token
+- `400 Bad Request` — the invite token is unknown, expired, or has hit `max_uses` (guest accounts are **not** created on rejected invites, so a bad link never leaves orphan users behind)
+- `404 Not Found` — the invite points at a session that never existed
+- `410 Gone` — the target session has been closed; the invite is not consumed, so the operator can still revoke it or reassign uses to a new session

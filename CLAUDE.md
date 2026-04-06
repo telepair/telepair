@@ -20,15 +20,15 @@ cd web && npm run dev                        # dev server on :5173, proxies /api
 ## Testing
 
 ```bash
-cargo test --workspace                       # 77 Rust tests across all crates
+cargo test --workspace                       # 87 Rust tests across all crates
 cargo test -p telepair-core                  # single crate
 cargo test -p telepair-core storage          # single test by name substring
 
-cd web && npm test                           # 63 Vitest unit tests
+cd web && npm test                           # 67 Vitest unit tests
 cd web && npm run test:watch                 # watch mode
 cd web && npm run type-check                 # TypeScript type checking
 
-cd web && npm run e2e                        # 16 Playwright browser E2E tests
+cd web && npm run e2e                        # 18 Playwright browser E2E tests
 cd web && npm run e2e:ui                     # Playwright UI mode (interactive)
 ```
 
@@ -53,7 +53,7 @@ telepair-cli          Entry point. Parses --agent/--control/--gateway flags.
     ├── telepair-gateway    Axum HTTP/WS server. REST API + static file serving.
     │                       SessionHub manages live sessions (PTY channels + participants).
     │
-    ├── telepair-control    Session lifecycle, auth service (bcrypt tokens), target registry.
+    ├── telepair-control    Session lifecycle, auth service (nanoid tokens, SHA-256 at rest), target registry.
     │
     ├── telepair-agent      PTY spawning (portable-pty), virtual target engine (targets.yaml).
     │
