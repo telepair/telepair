@@ -4,8 +4,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use telepair_agent::virtual_target::TargetEngine;
 use telepair_core::storage::{SqliteStorage, Storage};
-use telepair_gateway::build_router_with_options;
 use telepair_gateway::state::AppState;
+use telepair_gateway::{CorsMode, build_router_with_options};
 use tower::ServiceExt;
 
 const TARGETS_YAML: &str = r#"
@@ -26,7 +26,7 @@ async fn setup() -> (axum::Router, String, String) {
 
     let (_, user_token) = storage.create_user("regular", false).await.unwrap();
     let (_, admin_token) = storage.create_user("admin", true).await.unwrap();
-    let router = build_router_with_options(state, None, &[]);
+    let router = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
 
     (router, user_token, admin_token)
 }
