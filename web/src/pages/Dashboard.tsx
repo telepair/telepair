@@ -3,6 +3,8 @@ import { createSignal, onMount, Show, For } from 'solid-js';
 import { useNavigate } from '@solidjs/router';
 import { auth } from '../stores/auth';
 import { sessionStore } from '../stores/session';
+import Banner from '../components/Banner';
+import { TargetCardSkeleton } from '../components/Skeleton';
 
 export default function Dashboard() {
   const navigate = useNavigate();
@@ -23,38 +25,80 @@ export default function Dashboard() {
     }
   };
 
+  const handleRefresh = () => {
+    setLaunchError('');
+    sessionStore.refresh();
+  };
+
   return (
     <div class="dashboard">
       <header class="topbar">
         <h1>telepair</h1>
-        <button onClick={() => auth.logout()}>Logout</button>
+        <div class="topbar-actions">
+          <button
+            class="refresh-btn"
+            onClick={handleRefresh}
+            disabled={sessionStore.loading()}
+            aria-label="Refresh targets and sessions"
+            title="Refresh"
+          >
+            {sessionStore.loading() ? 'Refreshing…' : 'Refresh'}
+          </button>
+          <button onClick={() => auth.logout()}>Logout</button>
+        </div>
       </header>
 
       <Show when={launchError()}>
-        <div class="error-banner">{launchError()}</div>
+        <Banner variant="error" onDismiss={() => setLaunchError('')}>
+          {launchError()}
+        </Banner>
       </Show>
 
       <main class="content">
         <section>
           <h2>Targets</h2>
-          <Show when={!sessionStore.loading()} fallback={<p class="muted">Loading...</p>}>
-            <div class="target-grid">
-              <For each={sessionStore.targets()} fallback={<p class="muted">No targets configured</p>}>
-                {(target) => (
-                  <div class="target-card" onClick={() => handleLaunch(target.name)}>
-                    <div class="target-name">{target.display}</div>
-                    <div class="target-id">{target.name}</div>
-                    <Show when={target.tags.length > 0}>
-                      <div class="tags">
-                        <For each={target.tags}>
-                          {(tag) => <span class="tag">{tag}</span>}
-                        </For>
-                      </div>
-                    </Show>
-                  </div>
-                )}
-              </For>
-            </div>
+          <Show
+            when={!sessionStore.loading()}
+            fallback={
+              <div class="target-grid">
+                <For each={Array.from({ length: 6 })}>
+                  {() => <TargetCardSkeleton />}
+                </For>
+              </div>
+            }
+          >
+            <Show
+              when={sessionStore.targets().length > 0}
+              fallback={
+                <div class="empty-state">
+                  <p class="empty-title">No targets available</p>
+                  <p class="empty-body">
+                    Define named commands in <code>~/.telepair/targets.yaml</code>.
+                    A default <code>local-shell</code> target should always be
+                    present — if you don't see it, check the server logs for
+                    config errors.
+                  </p>
+                </div>
+              }
+            >
+              <div class="target-grid">
+                <For each={sessionStore.targets()}>
+                  {(target) => (
+                    <div class="target-card" onClick={() => handleLaunch(target.name)}>
+                      <div class="target-name">{target.display}</div>
+                      <div class="target-id">{target.name}</div>
+                      <Show when={target.tags.length > 0}>
+                        <div class="tags">
+                          <For each={target.tags}>
+                            {(tag) => <span class="tag">{tag}</span>}
+                          </For>
+                        </div>
+                      </Show>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </Show>
           </Show>
         </section>
 
@@ -78,11 +122,6 @@ export default function Dashboard() {
 
       <style>{`
         .dashboard { min-height: 100vh; }
-        .error-banner {
-          padding: 8px 16px; background: rgba(248,81,73,0.15);
-          color: var(--error); font-size: 13px;
-          border-bottom: 1px solid rgba(248,81,73,0.3);
-        }
         .topbar {
           display: flex;
           align-items: center;
@@ -92,10 +131,38 @@ export default function Dashboard() {
           background: var(--bg-secondary);
         }
         .topbar h1 { font-size: 18px; font-weight: 700; }
+        .topbar-actions { display: flex; gap: 8px; align-items: center; }
+        .refresh-btn:disabled {
+          opacity: 0.6;
+          cursor: default;
+        }
         .content { padding: 24px; max-width: 960px; margin: 0 auto; }
         .content h2 { font-size: 16px; font-weight: 600; margin-bottom: 12px; color: var(--text-secondary); }
         .content section { margin-bottom: 32px; }
         .muted { color: var(--text-secondary); font-size: 14px; }
+        .empty-state {
+          border: 1px dashed var(--border);
+          border-radius: 8px;
+          padding: 20px 24px;
+          background: var(--bg-secondary);
+        }
+        .empty-title {
+          font-weight: 600;
+          margin-bottom: 6px;
+          color: var(--text-primary);
+        }
+        .empty-body {
+          color: var(--text-secondary);
+          font-size: 13px;
+          line-height: 1.6;
+        }
+        .empty-body code {
+          font-family: var(--font-mono);
+          font-size: 12px;
+          padding: 1px 6px;
+          background: var(--bg-tertiary);
+          border-radius: 4px;
+        }
 
         .target-grid {
           display: grid;

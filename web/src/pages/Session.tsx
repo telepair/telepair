@@ -3,6 +3,7 @@ import { createSignal, onCleanup, Show } from 'solid-js';
 import { useParams, useNavigate } from '@solidjs/router';
 import { auth } from '../stores/auth';
 import { TelepairSocket } from '../lib/ws';
+import type { ConnectionStatus, ReconnectInfo } from '../lib/ws';
 import { encodeInput, canInput } from '../lib/protocol';
 import type { ServerMessage, Role, ParticipantInfo } from '../lib/protocol';
 import type { TerminalHandle } from '../components/Terminal';
@@ -11,21 +12,24 @@ import Terminal from '../components/Terminal';
 import ParticipantList from '../components/ParticipantList';
 import ChatPanel from '../components/ChatPanel';
 import InviteDialog from '../components/InviteDialog';
-
-type ConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
+import Banner from '../components/Banner';
+import { toast } from '../stores/toast';
 
 export default function SessionPage() {
   const params = useParams<{ id: string }>();
   const navigate = useNavigate();
 
   const [status, setStatus] = createSignal<ConnectionStatus>('connecting');
+  const [reconnectInfo, setReconnectInfo] = createSignal<ReconnectInfo | null>(null);
   const [role, setRole] = createSignal<Role>('viewer');
   const [errorMsg, setErrorMsg] = createSignal('');
+  const [endedReason, setEndedReason] = createSignal<string | null>(null);
   const [participants, setParticipants] = createSignal<ParticipantInfo[]>([]);
   const [chatMessages, setChatMessages] = createSignal<ChatMessage[]>([]);
   const [showInvite, setShowInvite] = createSignal(false);
   const [sidebarOpen, setSidebarOpen] = createSignal(true);
   const [currentUserId, setCurrentUserId] = createSignal('');
+  let hasConnectedOnce = false;
 
   let termHandle: TerminalHandle | undefined;
   let pendingOutput: Uint8Array[] = [];
@@ -74,12 +78,48 @@ export default function SessionPage() {
         }
         break;
       case 'Error':
-        setErrorMsg(`${msg.code}: ${msg.message}`);
+        handleServerError(msg.code, msg.message);
         break;
     }
   };
 
+  const handleServerError = (code: string, message: string) => {
+    switch (code) {
+      case 'SESSION_CLOSED':
+        setEndedReason('This session has ended.');
+        toast.info('Session has ended', { duration: 4000 });
+        break;
+      case 'SESSION_NOT_FOUND':
+        setEndedReason('Session not found — it may have been deleted.');
+        break;
+      case 'NOT_PARTICIPANT':
+        setErrorMsg('You are not a participant of this session.');
+        break;
+      case 'AUTH_FAILED':
+      case 'AUTH_TIMEOUT':
+        // Token is invalid/expired — clear auth state so AuthGuard redirects
+        // to /login. A banner would be invisible since this page is about to
+        // unmount, so surface the reason via a global toast instead.
+        toast.error('Authentication failed. Please log in again.');
+        auth.logout();
+        break;
+      default:
+        setErrorMsg(`${code}: ${message}`);
+    }
+  };
+
   const handleStatus = (s: ConnectionStatus) => {
+    if (s === 'connected') {
+      if (hasConnectedOnce) {
+        toast.success('Reconnected', { id: 'reconnect' });
+      }
+      hasConnectedOnce = true;
+    } else if (s === 'giveup') {
+      toast.error('Could not reconnect to session', {
+        id: 'reconnect',
+        action: { label: 'Retry', onClick: () => socket?.reconnectNow() },
+      });
+    }
     setStatus(s);
   };
 
@@ -97,11 +137,20 @@ export default function SessionPage() {
     socket?.send({ type: 'ChatMessage', text });
   };
 
+  const handleManualReconnect = () => {
+    toast.info('Reconnecting…', { id: 'reconnect', duration: 2000 });
+    socket?.reconnectNow();
+  };
+
   // Connect WebSocket
   socket = new TelepairSocket(handleMessage, handleBinary, handleStatus);
+  socket.onReconnectInfo = setReconnectInfo;
   socket.connect(params.id, auth.token());
 
   onCleanup(() => {
+    // Drop any sticky reconnect toast so its Retry action cannot resurrect
+    // this page's socket after the user has navigated away or logged out.
+    toast.dismiss('reconnect');
     socket?.disconnect();
   });
 
@@ -123,7 +172,39 @@ export default function SessionPage() {
       </header>
 
       <Show when={errorMsg()}>
-        <div class="error-banner">{errorMsg()}</div>
+        <Banner variant="error" onDismiss={() => setErrorMsg('')}>
+          {errorMsg()}
+        </Banner>
+      </Show>
+
+      <Show when={endedReason()}>
+        <div class="reconnect-bar" data-variant="ended" role="status">
+          <span>{endedReason()}</span>
+          <button class="reconnect-btn" type="button" onClick={() => navigate('/')}>
+            Back to Dashboard
+          </button>
+        </div>
+      </Show>
+
+      <Show when={!endedReason() && (reconnectInfo() || status() === 'giveup')}>
+        <div class="reconnect-bar" data-variant={status() === 'giveup' ? 'giveup' : 'retrying'} role="status">
+          <Show
+            when={status() === 'giveup'}
+            fallback={
+              <span>
+                Connection lost — retrying
+                {' '}
+                <strong>{reconnectInfo()?.attempt}/{reconnectInfo()?.maxAttempts}</strong>
+                {' '}(next in {Math.round((reconnectInfo()?.nextDelayMs ?? 0) / 1000)}s)
+              </span>
+            }
+          >
+            <span>Connection lost. Automatic retry gave up.</span>
+            <button class="reconnect-btn" type="button" onClick={handleManualReconnect}>
+              Reconnect
+            </button>
+          </Show>
+        </div>
       </Show>
 
       <div class="session-body">
@@ -172,13 +253,44 @@ export default function SessionPage() {
         .status-dot[data-status="connected"] { background: var(--success); }
         .status-dot[data-status="disconnected"] { background: var(--text-secondary); }
         .status-dot[data-status="error"] { background: var(--error); }
+        .status-dot[data-status="giveup"] { background: var(--error); }
+        .reconnect-bar {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          padding: 8px 16px;
+          font-size: 13px;
+          border-bottom: 1px solid var(--border);
+          background: rgba(210, 153, 34, 0.12);
+          color: var(--warning);
+        }
+        .reconnect-bar[data-variant="giveup"] {
+          background: rgba(248, 81, 73, 0.12);
+          color: var(--error);
+          border-bottom-color: rgba(248, 81, 73, 0.3);
+        }
+        .reconnect-bar[data-variant="ended"] {
+          background: rgba(139, 148, 158, 0.12);
+          color: var(--text-primary);
+          border-bottom-color: rgba(139, 148, 158, 0.3);
+        }
+        .reconnect-bar[data-variant="ended"] .reconnect-btn {
+          background: var(--accent);
+          border-color: var(--accent);
+        }
+        .reconnect-bar strong { font-weight: 600; }
+        .reconnect-btn {
+          margin-left: auto;
+          font-size: 12px;
+          padding: 4px 12px;
+          background: var(--error);
+          color: #fff;
+          border: 1px solid var(--error);
+          border-radius: 4px;
+        }
+        .reconnect-btn:hover { filter: brightness(1.1); }
         .topbar-actions { margin-left: auto; display: flex; gap: 8px; }
         .topbar-actions .action-btn { font-size: 12px; padding: 4px 10px; }
-        .error-banner {
-          padding: 8px 16px; background: rgba(248,81,73,0.15);
-          color: var(--error); font-size: 13px;
-          border-bottom: 1px solid rgba(248,81,73,0.3);
-        }
         .session-body { flex: 1; display: flex; overflow: hidden; }
         .terminal-container { flex: 1; padding: 4px; overflow: hidden; }
         .sidebar {
