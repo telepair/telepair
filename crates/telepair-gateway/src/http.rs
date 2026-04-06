@@ -28,22 +28,26 @@ pub async fn extract_user(state: &AppState, headers: &HeaderMap) -> Result<User,
         .map_err(|_| StatusCode::UNAUTHORIZED)
 }
 
-async fn require_owned_session(
+/// Run auth extraction and session lookup concurrently, then verify the
+/// authenticated user owns the session. Shaves one DB-query latency off
+/// each authenticated single-session endpoint.
+async fn extract_user_and_owned_session(
     state: &AppState,
+    headers: &HeaderMap,
     session_id: &str,
-    user: &User,
-) -> Result<Session, StatusCode> {
-    let session = state
-        .sessions
-        .storage()
-        .get_session(session_id)
-        .await
+) -> Result<(User, Session), StatusCode> {
+    let (user_res, session_res) = tokio::join!(
+        extract_user(state, headers),
+        state.sessions.storage().get_session(session_id),
+    );
+    let user = user_res?;
+    let session = session_res
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
     if session.owner_id != user.id {
         return Err(StatusCode::FORBIDDEN);
     }
-    Ok(session)
+    Ok((user, session))
 }
 
 // --- Handlers ---
@@ -96,10 +100,7 @@ pub async fn create_session(
     // Verify target exists and check required_role
     let target = state
         .targets
-        .list_targets()
-        .iter()
-        .find(|t| t.name == body.target_name)
-        .cloned()
+        .find(&body.target_name)
         .ok_or(StatusCode::NOT_FOUND)?;
 
     if let Some(required) = &target.required_role {
@@ -155,8 +156,7 @@ pub async fn create_invite(
     Path(session_id): Path<String>,
     Json(body): Json<CreateInviteRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let user = extract_user(&state, &headers).await?;
-    require_owned_session(&state, &session_id, &user).await?;
+    extract_user_and_owned_session(&state, &headers, &session_id).await?;
 
     // Only operator and viewer roles can be invited
     if body.role == Role::Owner {
@@ -193,8 +193,7 @@ pub async fn close_session(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let user = extract_user(&state, &headers).await?;
-    require_owned_session(&state, &session_id, &user).await?;
+    extract_user_and_owned_session(&state, &headers, &session_id).await?;
     state
         .sessions
         .close_session(&session_id)
