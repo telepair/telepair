@@ -508,7 +508,91 @@ async fn e2e_cursor_move_rate_limited() {
     let _ = ws_b.close(None).await;
 }
 
-// ─── Scenario 8: Resize accepted ────────────────────────
+// ─── Scenario 8: Multi-tab participant refcount ─────────
+
+#[tokio::test]
+async fn e2e_multi_tab_keeps_participant_alive() {
+    let (addr, state) = start_server().await;
+
+    // Alice owns the session; Bob is an operator observer used to count
+    // PeerJoined / PeerLeft events about Alice.
+    let (session_id, alice_token, alice_id) = create_owned_session(&state, "alice").await;
+    let (bob_token, _) = add_participant(&state, &session_id, "bob", Role::Operator).await;
+
+    // Tab 1: alice joins first so Bob's SessionState already includes her.
+    let mut alice_ws1 = join_session(&addr, &session_id, &alice_token).await;
+    let mut bob_ws = join_session(&addr, &session_id, &bob_token).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Tab 2: second alice connection. Under the refcount fix this must NOT
+    // broadcast a second PeerJoined for alice — the participant record and
+    // color were set when Tab 1 joined.
+    let mut alice_ws2 = join_session(&addr, &session_id, &alice_token).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Close Tab 1. Bob must NOT see a PeerLeft for alice: Tab 2 is still
+    // open, so alice is still present from any observer's point of view.
+    let _ = alice_ws1.close(None).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Anchor: send a chat from Tab 2 so Bob has a guaranteed event to wait
+    // on. Receiving this proves alice's participant record is still wired
+    // into the collab broadcast after Tab 1 closed.
+    alice_ws2.send(chat_msg("still-here")).await.unwrap();
+
+    // Scan everything Bob has seen until the anchor chat arrives, then
+    // assert no PeerLeft / spurious PeerJoined for alice slipped through.
+    let mut saw_peer_left_alice = false;
+    let mut extra_peer_joined_alice = 0_usize;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match bob_ws.next().await {
+                Some(Ok(ref msg)) => {
+                    if let Some(sm) = parse_server_msg(msg) {
+                        match sm {
+                            ServerMessage::PeerLeft { user_id } if user_id == alice_id => {
+                                saw_peer_left_alice = true;
+                            }
+                            ServerMessage::PeerJoined { user_id, .. } if user_id == alice_id => {
+                                extra_peer_joined_alice += 1;
+                            }
+                            ServerMessage::PeerChat { text, .. } if text == "still-here" => {
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => return,
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for anchor chat from alice tab 2");
+
+    assert!(
+        !saw_peer_left_alice,
+        "closing one of alice's tabs must not broadcast PeerLeft while another tab is open"
+    );
+    assert_eq!(
+        extra_peer_joined_alice, 0,
+        "alice's second tab must not broadcast a second PeerJoined"
+    );
+
+    // Now close Tab 2 — this is the final connection, so Bob should finally
+    // see PeerLeft for alice.
+    let _ = alice_ws2.close(None).await;
+
+    let left = expect_json(&mut bob_ws, 5, |m| {
+        matches!(m, ServerMessage::PeerLeft { user_id, .. } if *user_id == alice_id)
+    })
+    .await;
+    assert!(matches!(left, ServerMessage::PeerLeft { .. }));
+
+    let _ = bob_ws.close(None).await;
+}
+
+// ─── Scenario 9: Resize accepted ────────────────────────
 
 #[tokio::test]
 async fn e2e_resize_accepted() {
