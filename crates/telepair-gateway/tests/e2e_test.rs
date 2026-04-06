@@ -9,8 +9,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use telepair_core::permission::Role;
 use telepair_core::protocol::ServerMessage;
-use telepair_core::session::InputMode;
+use telepair_core::session::{InputMode, SessionStatus};
 use telepair_core::storage::Storage;
+use telepair_gateway::session_hub::ReaperConfig;
 use telepair_gateway::state::AppState;
 
 // ─── Helpers ─────────────────────────────────────────────
@@ -622,4 +623,121 @@ async fn e2e_resize_accepted() {
     );
 
     let _ = ws.close(None).await;
+}
+
+// ─── Scenario 10: Idle session reaper ────────────────────
+
+/// When every WebSocket client disconnects, the hub's cmd_tx clone keeps the
+/// PTY I/O loop alive forever — there's nothing to push `cmd_rx.recv()` to
+/// `None`. The reaper fixes that: it sweeps sessions whose `idle_since` has
+/// elapsed beyond the configured timeout, drops them from the map (which
+/// drops the last cmd_tx, which lets the PTY loop exit cleanly), and marks
+/// the row closed in the DB.
+///
+/// This test runs the reaper with a 200 ms idle grace and a 100 ms check
+/// interval. A real-world deployment uses 120 s / 30 s.
+#[tokio::test]
+async fn e2e_reaper_kills_idle_session() {
+    let (addr, state) = start_server().await;
+
+    // `new_test` intentionally skips the reaper so most tests don't race
+    // against it. Spawn our own with a fast config — we want to prove the
+    // reaper kicks in within a test-scale timeout.
+    let _reaper = state.hub.spawn_reaper(ReaperConfig {
+        idle_timeout: Duration::from_millis(200),
+        check_interval: Duration::from_millis(100),
+    });
+
+    let (session_id, token, _) = create_owned_session(&state, "alice").await;
+
+    // Connect, let the handshake settle, then immediately close.
+    let mut ws = join_session(&addr, &session_id, &token).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = ws.close(None).await;
+
+    // After close, handle_socket needs to flush output, call
+    // `remove_participant` (which sets idle_since), then the reaper needs
+    // to tick twice past the 200 ms grace. 800 ms gives comfortable slack.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // The row should now be marked `closed` in the DB.
+    let reloaded = state
+        .sessions
+        .storage()
+        .get_session(&session_id)
+        .await
+        .expect("storage get_session failed")
+        .expect("session row should still exist after reaping (just closed)");
+    assert_eq!(
+        reloaded.status,
+        SessionStatus::Closed,
+        "reaper should have closed the idle session in the DB"
+    );
+
+    // Reconnecting must fail with SESSION_CLOSED because the row is closed
+    // and the live entry is gone from the hub map.
+    let (mut ws_again, _) = connect_async(ws_url(&addr, &session_id)).await.unwrap();
+    ws_again
+        .send(session_join_msg(&session_id, &token))
+        .await
+        .unwrap();
+    let err = expect_json(&mut ws_again, 5, |m| {
+        matches!(m, ServerMessage::Error { .. })
+    })
+    .await;
+    if let ServerMessage::Error { code, .. } = err {
+        assert_eq!(
+            code, "SESSION_CLOSED",
+            "reconnect after reap should report SESSION_CLOSED"
+        );
+    }
+}
+
+/// Inverse of the reaper test: a reconnect inside the grace window must
+/// cancel the pending reap. This verifies that `add_participant` correctly
+/// clears `idle_since` and that the write-lock re-check in the reaper
+/// honours the fresh value instead of blindly trusting the read-lock scan.
+#[tokio::test]
+async fn e2e_reaper_skips_reconnected_session() {
+    let (addr, state) = start_server().await;
+
+    let _reaper = state.hub.spawn_reaper(ReaperConfig {
+        idle_timeout: Duration::from_millis(300),
+        check_interval: Duration::from_millis(100),
+    });
+
+    let (session_id, token, _) = create_owned_session(&state, "alice").await;
+
+    // First connection, then close — starts the idle clock.
+    let mut ws1 = join_session(&addr, &session_id, &token).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = ws1.close(None).await;
+
+    // Reconnect well inside the grace window. This should clear idle_since
+    // and prevent the reaper from collecting the session.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let mut ws2 = join_session(&addr, &session_id, &token).await;
+
+    // Wait long enough that the original grace window would have expired,
+    // plus a couple of reaper ticks. If the reconnect didn't clear the
+    // clock, the session would be closed by now.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let reloaded = state
+        .sessions
+        .storage()
+        .get_session(&session_id)
+        .await
+        .unwrap()
+        .expect("session row should still exist");
+    assert_eq!(
+        reloaded.status,
+        SessionStatus::Active,
+        "a reconnect inside the grace window must cancel the pending reap"
+    );
+
+    // And the live session is still usable — send a resize to prove the
+    // PTY command channel is alive.
+    ws2.send(term_resize_msg(100, 30)).await.unwrap();
+    let _ = ws2.close(None).await;
 }

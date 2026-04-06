@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
 use telepair_agent::pty::PtyManager;
@@ -23,6 +26,31 @@ fn assign_color(index: usize) -> String {
 pub enum PtyCommand {
     Input(Vec<u8>),
     Resize(u16, u16),
+}
+
+/// Configuration for the background idle-session reaper.
+///
+/// `idle_timeout` is how long a `LiveSession` may sit with zero WebSocket
+/// connections before the reaper tears it down (killing the PTY child and
+/// marking the row closed in SQLite). `check_interval` is how often the
+/// reaper wakes up to scan the session map.
+#[derive(Debug, Clone, Copy)]
+pub struct ReaperConfig {
+    pub idle_timeout: Duration,
+    pub check_interval: Duration,
+}
+
+impl Default for ReaperConfig {
+    fn default() -> Self {
+        Self {
+            // 2 minutes of grace for reconnects / tab reloads before we
+            // tear down the PTY. Short enough that abandoned sessions
+            // don't leak forever, long enough that a user fumbling their
+            // network doesn't lose their shell.
+            idle_timeout: Duration::from_secs(120),
+            check_interval: Duration::from_secs(30),
+        }
+    }
 }
 
 /// A participant currently connected to a session.
@@ -54,6 +82,13 @@ struct LiveSession {
     /// user's second tab closing would broadcast `PeerLeft` and wipe the
     /// in-memory entry even though another tab is still connected.
     connections: HashMap<Uuid, usize>,
+    /// When the last WS connection dropped. `None` while at least one
+    /// connection is attached; set to `Some(Instant::now())` on the
+    /// transition to 0 connections and cleared back to `None` on reconnect.
+    /// The background reaper uses this to decide when to tear down the
+    /// session — holding cmd_tx in the hub alone keeps the PTY loop alive
+    /// forever, so we need an explicit idle tracker.
+    idle_since: Option<Instant>,
     /// Monotonic counter for color assignment
     color_counter: usize,
 }
@@ -185,6 +220,11 @@ impl SessionHub {
             shutdown_tx,
             participants: HashMap::new(),
             connections: HashMap::new(),
+            // Start the clock on creation: if nobody ever calls
+            // `add_participant` after start_or_join (e.g. the WS handler
+            // errors out between spawning the PTY and attaching) the
+            // reaper will clean this up instead of leaking a shell.
+            idle_since: Some(Instant::now()),
             color_counter: 0,
         };
         sessions.insert(session_id.to_string(), live);
@@ -218,6 +258,11 @@ impl SessionHub {
         let Some(live) = sessions.get_mut(session_id) else {
             return false;
         };
+
+        // Any successful attach clears the idle clock. Do this before the
+        // refcount bump so a reconnect during the reaper's grace period
+        // always wins against a pending sweep.
+        live.idle_since = None;
 
         let count = live.connections.entry(user_id).or_insert(0);
         *count += 1;
@@ -276,6 +321,14 @@ impl SessionHub {
         if live.participants.remove(&user_id).is_some() {
             let _ = live.collab_tx.send(ServerMessage::PeerLeft { user_id });
         }
+
+        // If this was the last connection for the whole session, start
+        // the idle clock so the reaper can collect it after the grace
+        // period. A new `add_participant` call will clear this again.
+        if live.connections.is_empty() {
+            live.idle_since = Some(Instant::now());
+        }
+
         true
     }
 
@@ -294,6 +347,102 @@ impl SessionHub {
         if let Some(live) = sessions.get(session_id) {
             let _ = live.collab_tx.send(msg);
         }
+    }
+
+    /// Spawn a background task that periodically reaps sessions which
+    /// have had zero WS connections for longer than `config.idle_timeout`.
+    ///
+    /// This is the load-bearing piece of the "all clients left → shell
+    /// goes away" story. The hub keeps a clone of `cmd_tx` inside
+    /// `LiveSession` so it can hand it out to late joiners, which means
+    /// the PTY I/O loop's `cmd_rx.recv()` never returns `None` on its
+    /// own. Instead, the reaper removes the whole `LiveSession` from the
+    /// map; dropping it drops the last `cmd_tx` and the PTY loop exits
+    /// cleanly via its `Action::Command(None)` branch, which kills the
+    /// child process (via `PtyManager::Drop`) and marks the row closed.
+    ///
+    /// Returns the `JoinHandle` so callers can abort the reaper during
+    /// graceful shutdown (or just drop it to let it run for the process
+    /// lifetime).
+    pub fn spawn_reaper(self: &Arc<Self>, config: ReaperConfig) -> JoinHandle<()> {
+        let sessions = self.sessions.clone();
+        let storage = self.storage.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(config.check_interval);
+            // Skip missed ticks instead of bursting — if the reaper was
+            // delayed by a heavy write lock holder we don't want to scan
+            // the map back-to-back.
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            // `interval` fires immediately on first tick; drop that one
+            // so brand-new sessions aren't evaluated before anybody had
+            // a chance to attach.
+            ticker.tick().await;
+
+            loop {
+                ticker.tick().await;
+
+                // Collect under a read lock so we don't block input
+                // handling on every sweep. Only upgrade to write when we
+                // have something to kill.
+                let to_reap: Vec<String> = {
+                    let guard = sessions.read().await;
+                    guard
+                        .iter()
+                        .filter_map(|(id, live)| {
+                            let idle_since = live.idle_since?;
+                            (idle_since.elapsed() >= config.idle_timeout)
+                                .then(|| id.clone())
+                        })
+                        .collect()
+                };
+
+                if to_reap.is_empty() {
+                    continue;
+                }
+
+                // Re-check each candidate under the write lock in case a
+                // reconnect raced in between the read-lock scan and now.
+                let reaped: Vec<String> = {
+                    let mut guard = sessions.write().await;
+                    to_reap
+                        .into_iter()
+                        .filter(|id| {
+                            let Some(live) = guard.get(id) else {
+                                return false;
+                            };
+                            let Some(idle_since) = live.idle_since else {
+                                return false;
+                            };
+                            if idle_since.elapsed() < config.idle_timeout {
+                                return false;
+                            }
+                            // Remove now while we hold the lock. Dropping
+                            // `live` drops the last cmd_tx and the PTY
+                            // loop will notice and exit.
+                            guard.remove(id);
+                            true
+                        })
+                        .collect()
+                };
+
+                for id in reaped {
+                    tracing::info!(
+                        session = %id,
+                        idle_secs = config.idle_timeout.as_secs(),
+                        "reaped idle session"
+                    );
+                    // Best-effort close in the DB. The PTY loop's
+                    // cleanup path will also call this, but whichever
+                    // lands first wins — `close_session` is idempotent
+                    // enough (the second call returns SessionNotFound
+                    // because the row is already closed), and we'd
+                    // rather double-log than leak an open row.
+                    if let Err(e) = storage.close_session(&id).await {
+                        tracing::debug!(session = %id, "reaper close_session: {e}");
+                    }
+                }
+            }
+        })
     }
 
     /// Update a participant's role and broadcast `PermUpdate` to all subscribers.
