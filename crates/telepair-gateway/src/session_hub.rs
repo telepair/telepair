@@ -45,8 +45,15 @@ struct LiveSession {
     collab_tx: broadcast::Sender<ServerMessage>,
     /// Signal to all connected WS handlers that this session is being force-stopped
     shutdown_tx: broadcast::Sender<()>,
-    /// Currently connected participants
+    /// Currently connected participants, keyed by user_id. A single user may
+    /// open multiple tabs/devices; the map stores one canonical record and
+    /// `connections` below counts how many live WS handlers are attached.
     participants: HashMap<Uuid, ConnectedParticipant>,
+    /// WS-handler reference count per user_id. Invariant: a `user_id` is in
+    /// `participants` iff `connections[user_id] > 0`. Without this counter a
+    /// user's second tab closing would broadcast `PeerLeft` and wipe the
+    /// in-memory entry even though another tab is still connected.
+    connections: HashMap<Uuid, usize>,
     /// Monotonic counter for color assignment
     color_counter: usize,
 }
@@ -177,6 +184,7 @@ impl SessionHub {
             collab_tx: collab_tx.clone(),
             shutdown_tx,
             participants: HashMap::new(),
+            connections: HashMap::new(),
             color_counter: 0,
         };
         sessions.insert(session_id.to_string(), live);
@@ -194,11 +202,11 @@ impl SessionHub {
         sessions.remove(session_id);
     }
 
-    /// Add a participant to a session. Auto-broadcasts `PeerJoined` to all subscribers.
-    /// Returns `true` when the session exists and the participant was registered.
-    /// The assigned color is embedded in the broadcast and in the participant
-    /// snapshot returned by `get_participants`; callers should read it from
-    /// there instead of here.
+    /// Register a WS connection for a participant. The first connection for
+    /// a given `user_id` broadcasts `PeerJoined` and assigns a color;
+    /// subsequent connections (e.g. a second tab) just bump the refcount and
+    /// reuse the existing participant record. Returns `true` when the
+    /// session exists and the connection was registered.
     pub async fn add_participant(
         &self,
         session_id: &str,
@@ -210,6 +218,15 @@ impl SessionHub {
         let Some(live) = sessions.get_mut(session_id) else {
             return false;
         };
+
+        let count = live.connections.entry(user_id).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            // Additional connection from an already-joined user. Don't
+            // re-broadcast PeerJoined or reassign a color — the existing
+            // participant record stays authoritative.
+            return true;
+        }
 
         let color = assign_color(live.color_counter);
         live.color_counter += 1;
@@ -235,14 +252,31 @@ impl SessionHub {
         true
     }
 
-    /// Remove a participant from a session. Auto-broadcasts `PeerLeft` to all subscribers.
-    pub async fn remove_participant(&self, session_id: &str, user_id: Uuid) {
+    /// Unregister a WS connection. Only the final connection for a `user_id`
+    /// removes the participant record and broadcasts `PeerLeft`. Returns
+    /// `true` when the caller was that final connection — callers use this
+    /// to decide whether to update the DB `left_at` column, which must only
+    /// move when the user really left all their tabs.
+    pub async fn remove_participant(&self, session_id: &str, user_id: Uuid) -> bool {
         let mut sessions = self.sessions.write().await;
-        if let Some(live) = sessions.get_mut(session_id) {
-            if live.participants.remove(&user_id).is_some() {
-                let _ = live.collab_tx.send(ServerMessage::PeerLeft { user_id });
-            }
+        let Some(live) = sessions.get_mut(session_id) else {
+            return false;
+        };
+
+        let Some(count) = live.connections.get_mut(&user_id) else {
+            return false;
+        };
+        if *count > 1 {
+            *count -= 1;
+            return false;
         }
+
+        // Last connection for this user — tear down the participant record.
+        live.connections.remove(&user_id);
+        if live.participants.remove(&user_id).is_some() {
+            let _ = live.collab_tx.send(ServerMessage::PeerLeft { user_id });
+        }
+        true
     }
 
     /// Get a snapshot of all participants in a session.

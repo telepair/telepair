@@ -354,15 +354,19 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     {
         tracing::warn!(session = %session_id, "output handler did not stop within 2s");
     }
-    hub.remove_participant(&session_id, user_id).await;
-    // Update DB left_at so participant history is accurate
-    if let Err(e) = state
-        .sessions
-        .storage()
-        .remove_participant(&session_id, user_id)
-        .await
-    {
-        tracing::warn!(session = %session_id, user = %user_name, "failed to update DB left_at: {e}");
+    // Only update DB `left_at` when this was the user's final connection;
+    // otherwise other tabs stay authoritative and the participant row must
+    // remain active. `hub.remove_participant` handles the refcount.
+    let was_last = hub.remove_participant(&session_id, user_id).await;
+    if was_last {
+        if let Err(e) = state
+            .sessions
+            .storage()
+            .remove_participant(&session_id, user_id)
+            .await
+        {
+            tracing::warn!(session = %session_id, user = %user_name, "failed to update DB left_at: {e}");
+        }
     }
     tracing::info!(user = %user_name, session = %session_id, "WebSocket disconnected");
 }
