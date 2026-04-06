@@ -339,3 +339,48 @@ async fn redeem_invite_on_closed_session_rejected() {
         "no ghost operator participant should exist after rejected redeem"
     );
 }
+
+#[tokio::test]
+async fn create_session_rejects_unknown_input_mode() {
+    // Before the error-handling pass, an unknown `input_mode` value
+    // silently collapsed to Serialized. That's a client-side typo
+    // masquerading as a successful request, and it could flip input
+    // permissions in a way the caller never asked for. Loud 400.
+    let (_state, app, owner_token) = setup().await;
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/sessions")
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    r#"{"target_name":"local-shell","input_mode":"not-a-real-mode"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn create_invite_rejects_zero_max_uses_with_400() {
+    // The storage layer returns InvalidInput for max_uses < 1, but
+    // the old handler mapped every error to 500. A bad client request
+    // should come back as a 4xx so the caller knows it's their fault,
+    // not the server's.
+    let (_state, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    let resp = app
+        .oneshot(
+            Request::post(format!("/api/sessions/{session_id}/invite"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"viewer","max_uses":0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
