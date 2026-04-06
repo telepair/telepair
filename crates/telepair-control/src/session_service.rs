@@ -2,7 +2,6 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use telepair_core::error::Result;
-use telepair_core::permission::Role;
 use telepair_core::session::{InputMode, Session};
 use telepair_core::storage::{SqliteStorage, Storage};
 
@@ -25,14 +24,11 @@ impl SessionService {
         target_name: &str,
         input_mode: InputMode,
     ) -> Result<Session> {
-        let session = self
-            .storage
-            .create_session(owner_id, target_name, input_mode)
-            .await?;
+        // Atomic: session row + owner participant row land together or
+        // not at all. See `Storage::create_session_with_owner`.
         self.storage
-            .upsert_participant(&session.id, owner_id, Role::Owner)
-            .await?;
-        Ok(session)
+            .create_session_with_owner(owner_id, target_name, input_mode)
+            .await
     }
 
     pub async fn close_session(&self, session_id: &str) -> Result<()> {

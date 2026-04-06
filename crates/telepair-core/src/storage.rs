@@ -24,6 +24,17 @@ pub trait Storage: Send + Sync {
         target_name: &str,
         input_mode: InputMode,
     ) -> Result<Session>;
+    /// Atomically create a session row and insert the owner as its first
+    /// participant. This must be a single transaction — a crash or error
+    /// between the two statements would otherwise leave the session
+    /// without its owner participant, making the owner appear unable to
+    /// join their own session.
+    async fn create_session_with_owner(
+        &self,
+        owner_id: Uuid,
+        target_name: &str,
+        input_mode: InputMode,
+    ) -> Result<Session>;
     async fn get_session(&self, id: &str) -> Result<Option<Session>>;
     async fn close_session(&self, id: &str) -> Result<()>;
     async fn list_active_sessions(&self) -> Result<Vec<Session>>;
@@ -48,5 +59,11 @@ pub trait Storage: Send + Sync {
         max_uses: i32,
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<(InviteToken, String)>;
+    /// Look up an invite by its raw token without decrementing any
+    /// counters. Useful for pre-validation (e.g. "is the target
+    /// session still active?") before calling `consume_invite`.
+    /// Does NOT check expiry / max_uses — callers that want to
+    /// enforce those should call `consume_invite`.
+    async fn find_invite(&self, token: &str) -> Result<InviteToken>;
     async fn consume_invite(&self, token: &str) -> Result<InviteToken>;
 }

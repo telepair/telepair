@@ -123,6 +123,26 @@ fn row_to_user(r: &SqliteRow) -> Result<User> {
     })
 }
 
+/// Parse an optional RFC3339 timestamp column. Returns `Ok(None)` if the
+/// column was SQL NULL; returns `Err` if the column held a non-null value
+/// that failed to parse. The old code swallowed parse errors with
+/// `and_then(|s| s.parse().ok())`, which silently converted a corrupt
+/// `closed_at` / `left_at` / `expires_at` into `None` — downstream code
+/// then thought the row was "still active" / "never expires", which is
+/// exactly the kind of subtle data-loss bug we want to fail loudly on.
+fn parse_optional_datetime(
+    raw: Option<String>,
+    column: &'static str,
+) -> Result<Option<chrono::DateTime<Utc>>> {
+    match raw {
+        None => Ok(None),
+        Some(s) => s
+            .parse()
+            .map(Some)
+            .map_err(|e| Error::InvalidInput(format!("invalid {column}: {e}"))),
+    }
+}
+
 fn row_to_session(r: &SqliteRow) -> Result<Session> {
     Ok(Session {
         id: r.get("id"),
@@ -137,9 +157,7 @@ fn row_to_session(r: &SqliteRow) -> Result<Session> {
             .parse()
             .map_err(|e: String| Error::InvalidInput(e))?,
         created_at: parse_datetime(r.get("created_at"))?,
-        closed_at: r
-            .get::<Option<String>, _>("closed_at")
-            .and_then(|s| s.parse().ok()),
+        closed_at: parse_optional_datetime(r.get("closed_at"), "closed_at")?,
     })
 }
 
@@ -152,9 +170,7 @@ fn row_to_participant(r: &SqliteRow) -> Result<Participant> {
             .parse()
             .map_err(|e: String| Error::InvalidInput(e))?,
         joined_at: parse_datetime(r.get("joined_at"))?,
-        left_at: r
-            .get::<Option<String>, _>("left_at")
-            .and_then(|s| s.parse().ok()),
+        left_at: parse_optional_datetime(r.get("left_at"), "left_at")?,
     })
 }
 
@@ -168,9 +184,7 @@ fn row_to_invite(r: &SqliteRow) -> Result<InviteToken> {
             .map_err(|e: String| Error::InvalidInput(e))?,
         max_uses: r.get("max_uses"),
         used_count: r.get("used_count"),
-        expires_at: r
-            .get::<Option<String>, _>("expires_at")
-            .and_then(|s| s.parse().ok()),
+        expires_at: parse_optional_datetime(r.get("expires_at"), "expires_at")?,
     })
 }
 
@@ -226,16 +240,6 @@ impl SqliteStorage {
         }
     }
 
-    /// Look up an invite by raw token. Does NOT check expiry or usage limits.
-    async fn find_invite_by_token(&self, token: &str) -> Result<InviteToken> {
-        self.lookup_by_token(
-            "invite_tokens",
-            token,
-            row_to_invite,
-            "invalid invite token",
-        )
-        .await
-    }
 }
 
 impl Storage for SqliteStorage {
@@ -313,6 +317,61 @@ impl Storage for SqliteStorage {
         .bind(now.to_rfc3339())
         .execute(&self.pool)
         .await?;
+
+        Ok(Session {
+            id,
+            owner_id,
+            target_name: target_name.into(),
+            input_mode,
+            status: SessionStatus::Active,
+            created_at: now,
+            closed_at: None,
+        })
+    }
+
+    async fn create_session_with_owner(
+        &self,
+        owner_id: Uuid,
+        target_name: &str,
+        input_mode: InputMode,
+    ) -> Result<Session> {
+        let id = nanoid::nanoid!(10);
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let owner_str = owner_id.to_string();
+
+        // One transaction covers both INSERTs: either the caller gets a
+        // session row with its owner participant, or neither exists.
+        // Previously these were two separate calls — a failure between
+        // them (DB disconnect, foreign-key violation, crash) left an
+        // owner-less session that the owner couldn't rejoin because
+        // ws.rs's NOT_PARTICIPANT check walks the participants table.
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO sessions (id, owner_id, target_name, input_mode, status, created_at) \
+             VALUES (?, ?, ?, ?, 'active', ?)",
+        )
+        .bind(&id)
+        .bind(&owner_str)
+        .bind(target_name)
+        .bind(input_mode.as_str())
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO participants (session_id, user_id, role, joined_at) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(&owner_str)
+        .bind(Role::Owner.as_str())
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
 
         Ok(Session {
             id,
@@ -471,8 +530,18 @@ impl Storage for SqliteStorage {
         Ok((invite, raw_token))
     }
 
+    async fn find_invite(&self, token: &str) -> Result<InviteToken> {
+        self.lookup_by_token(
+            "invite_tokens",
+            token,
+            row_to_invite,
+            "invalid invite token",
+        )
+        .await
+    }
+
     async fn consume_invite(&self, token: &str) -> Result<InviteToken> {
-        let invite = self.find_invite_by_token(token).await?;
+        let invite = self.find_invite(token).await?;
 
         // Atomic increment with WHERE guard — no separate validity pre-check needed
         let result = sqlx::query(
