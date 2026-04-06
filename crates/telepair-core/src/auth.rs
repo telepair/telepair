@@ -1,8 +1,14 @@
 use std::sync::Arc;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::session::User;
 use crate::storage::{SqliteStorage, Storage};
+
+/// Max attempts when generating a unique guest name before giving up.
+/// `users.name` is UNIQUE; with 8 chars of nanoid entropy (~47 bits)
+/// a single collision is astronomically rare, but we still bound the
+/// retry loop so an unexpected DB state can't spin forever.
+const GUEST_NAME_MAX_ATTEMPTS: usize = 5;
 
 pub struct TokenAuthProvider {
     storage: Arc<SqliteStorage>,
@@ -17,11 +23,48 @@ impl TokenAuthProvider {
         self.storage.validate_token(token).await
     }
 
-    pub async fn create_user(&self, name: &str) -> Result<(User, String)> {
-        self.storage.create_user(name, false).await
-    }
-
     pub async fn setup_initial_admin(&self, name: &str) -> Result<(User, String)> {
         self.storage.create_user(name, true).await
+    }
+
+    /// Create a new anonymous guest user with a freshly minted token.
+    /// The caller is responsible for returning the raw token to the
+    /// client exactly once — the DB only stores its SHA-256. The guest
+    /// name is `guest-<nanoid8>`; on the (vanishingly rare) unique-name
+    /// collision we retry up to `GUEST_NAME_MAX_ATTEMPTS` times before
+    /// surfacing the storage error.
+    pub async fn create_guest(&self) -> Result<(User, String)> {
+        let mut last_err = None;
+        for _ in 0..GUEST_NAME_MAX_ATTEMPTS {
+            let name = format!("guest-{}", nanoid::nanoid!(8));
+            match self.storage.create_user(&name, false).await {
+                Ok(pair) => return Ok(pair),
+                Err(e) => {
+                    // Only retry on the unique-constraint collision.
+                    // Anything else (disk full, schema drift, etc.) is
+                    // a real failure — surface it immediately so the
+                    // caller doesn't waste retries on a doomed DB.
+                    if !is_unique_violation(&e) {
+                        return Err(e);
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            Error::Storage(sqlx::Error::Protocol("exhausted guest name retries".into()))
+        }))
+    }
+}
+
+fn is_unique_violation(err: &Error) -> bool {
+    match err {
+        Error::Storage(sqlx::Error::Database(db_err)) => {
+            // SQLite's UNIQUE-constraint violation is SQLITE_CONSTRAINT_UNIQUE
+            // (error code 2067). `is_unique_violation` on the driver error
+            // also returns true for this, which is the portable check.
+            db_err.is_unique_violation()
+        }
+        _ => false,
     }
 }

@@ -10,19 +10,29 @@ export default function Join() {
   const [redeeming, setRedeeming] = createSignal(true);
 
   onMount(async () => {
-    if (!auth.isAuthenticated()) {
-      sessionStorage.setItem('pending_invite', params.token);
-      navigate('/login', { replace: true });
-      return;
-    }
-
+    // The redeem endpoint accepts anonymous callers: if the visitor
+    // has no token, the backend mints a fresh guest account and
+    // returns its token in the response. That removes the old
+    // "please paste a token first" wall that blocked every new
+    // collaborator. If we DO already have a token (the inviter
+    // testing their own link, for instance), the backend reuses
+    // that identity and returns `token: null`.
     try {
       const result = await api.redeemInvite(params.token);
+      if (result.token) {
+        auth.setToken(result.token);
+      }
       navigate(`/session/${result.session_id}`, { replace: true });
     } catch (e) {
       setRedeeming(false);
       if (e instanceof ApiError) {
-        setError(e.status === 400 ? 'Invalid or expired invite link' : e.message);
+        if (e.status === 400) {
+          setError('Invalid or expired invite link');
+        } else if (e.status === 410) {
+          setError('This session has been closed');
+        } else {
+          setError(e.message);
+        }
       } else {
         setError('Failed to join session');
       }

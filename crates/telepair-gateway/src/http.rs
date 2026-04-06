@@ -217,12 +217,34 @@ pub async fn close_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /api/invite/redeem`
+///
+/// Auth is **optional**. If the request carries a valid bearer token,
+/// the caller is added to the session under their existing identity
+/// (lets an admin test their own invite link without spawning a
+/// throwaway guest account). If no token, or the token is invalid,
+/// the handler mints a fresh guest user and returns its freshly
+/// issued token in the response — this is the load-bearing flow that
+/// makes collaborators work without any out-of-band token handoff.
+///
+/// Response always contains `session_id` and `role`. The `token`
+/// field is present **only** when a new guest was created; an
+/// already-authenticated caller keeps using the token they came in
+/// with and gets `token: null`.
 pub async fn redeem_invite(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<RedeemInviteRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let user = extract_user(&state, &headers).await?;
+    // Best-effort auth: a bearer token is no longer required. We try
+    // to validate it so a logged-in user reuses their identity, but
+    // a missing/invalid token falls through to the guest path instead
+    // of failing the whole request.
+    let existing_user = match extract_user(&state, &headers).await {
+        Ok(u) => Some(u),
+        Err(StatusCode::UNAUTHORIZED) => None,
+        Err(status) => return Err(status),
+    };
 
     // Look up the invite first (no state change) so we can validate
     // the session is still alive before burning a use on a closed
@@ -237,7 +259,7 @@ pub async fn redeem_invite(
     let session = storage
         .get_session(&preview.session_id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| status_for(&e))?
         .ok_or(StatusCode::NOT_FOUND)?;
     if session.status != telepair_core::session::SessionStatus::Active {
         // Gone / closed — fail without consuming the invite so the
@@ -255,13 +277,30 @@ pub async fn redeem_invite(
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
+    // Decide which user joins: reuse the authenticated caller, or
+    // mint a fresh guest. Guests are only created **after** the
+    // invite was successfully consumed, so a rejected invite can
+    // never leave an orphan user behind.
+    let (user, issued_token) = match existing_user {
+        Some(u) => (u, None),
+        None => {
+            let (guest, raw_token) = state
+                .auth
+                .create_guest()
+                .await
+                .map_err(|e| status_for(&e))?;
+            (guest, Some(raw_token))
+        }
+    };
+
     storage
         .upsert_participant(&invite.session_id, user.id, invite.role)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| status_for(&e))?;
 
     Ok(Json(serde_json::json!({
         "session_id": invite.session_id,
         "role": invite.role.as_str(),
+        "token": issued_token,
     })))
 }

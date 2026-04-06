@@ -12,13 +12,7 @@ export default function Login() {
     e.preventDefault();
     const ok = await auth.validateToken(input());
     if (ok) {
-      const pendingInvite = sessionStorage.getItem('pending_invite');
-      if (pendingInvite) {
-        sessionStorage.removeItem('pending_invite');
-        navigate(`/join/${pendingInvite}`, { replace: true });
-      } else {
-        navigate('/', { replace: true });
-      }
+      navigate('/', { replace: true });
     }
   };
 
@@ -70,8 +64,8 @@ export default function Login() {
               again.
             </p>
             <p>
-              <strong>Joining a session?</strong> Ask the session owner to send
-              you an invite link — you'll still need a token of your own.
+              <strong>Joining a session?</strong> Just open your invite link —
+              no token needed. You'll be signed in automatically as a guest.
             </p>
           </div>
         </Show>
