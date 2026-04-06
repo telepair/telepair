@@ -6,11 +6,21 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use telepair_core::error::Error;
 use telepair_core::permission::Role;
 use telepair_core::session::{InputMode, Session, User};
 use telepair_core::storage::Storage;
 
 use crate::state::AppState;
+
+/// Lift a `core::Error` into the right HTTP status. Handlers should use
+/// this instead of hand-written `map_err(|_| StatusCode::X)` so that
+/// `InvalidInput` never leaks out as 500 and authorization failures
+/// always come back as 401 / 403, even when the underlying call site
+/// only knows it got "some error".
+fn status_for(err: &Error) -> StatusCode {
+    StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
 
 // --- Auth extraction ---
 
@@ -107,16 +117,22 @@ pub async fn create_session(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    // Strict parse: unknown values used to silently collapse to
+    // Serialized, which masked client bugs and could surprise the
+    // caller with the wrong input semantics. Return 400 instead so
+    // typos are loud.
     let mode = match body.input_mode.as_deref() {
-        Some("multiplexed") => InputMode::Multiplexed,
-        _ => InputMode::Serialized,
+        None => InputMode::Serialized,
+        Some(raw) => raw
+            .parse::<InputMode>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?,
     };
 
     let session = state
         .sessions
         .create_session(user.id, &body.target_name, mode)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| status_for(&e))?;
 
     Ok((StatusCode::CREATED, Json(session)))
 }
@@ -130,7 +146,7 @@ pub async fn list_sessions(
         .sessions
         .list_sessions_for_user(user.id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| status_for(&e))?;
 
     Ok(Json(visible))
 }
@@ -168,7 +184,7 @@ pub async fn create_invite(
         .storage()
         .create_invite(&session_id, role, body.max_uses, None)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| status_for(&e))?;
 
     Ok((
         StatusCode::CREATED,
@@ -196,7 +212,7 @@ pub async fn close_session(
         .sessions
         .close_session(&session_id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| status_for(&e))?;
     state.hub.stop_session(&session_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
