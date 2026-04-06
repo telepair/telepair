@@ -4,15 +4,30 @@ import type { JSX } from 'solid-js';
 
 export type BannerVariant = 'info' | 'success' | 'warning' | 'error';
 
+export interface BannerAction {
+  label: string;
+  onClick: () => void;
+}
+
 export default function Banner(props: {
   variant?: BannerVariant;
   onDismiss?: () => void;
+  action?: BannerAction;
+  /** ARIA role — defaults to "alert"; use "status" for non-assertive updates. */
+  role?: 'alert' | 'status';
   children: JSX.Element;
 }) {
   const variant = () => props.variant ?? 'error';
   return (
-    <div class="banner" data-variant={variant()} role="alert">
+    <div class="banner" data-variant={variant()} role={props.role ?? 'alert'}>
       <span class="banner-text">{props.children}</span>
+      <Show when={props.action}>
+        {(action) => (
+          <button class="banner-action" type="button" onClick={action().onClick}>
+            {action().label}
+          </button>
+        )}
+      </Show>
       <Show when={props.onDismiss}>
         <button
           class="banner-close"
@@ -33,21 +48,25 @@ export default function Banner(props: {
           border-bottom: 1px solid var(--border);
         }
         .banner[data-variant="info"] {
+          --banner-accent: var(--accent);
           background: rgba(88, 166, 255, 0.12);
           color: var(--accent);
           border-bottom-color: rgba(88, 166, 255, 0.3);
         }
         .banner[data-variant="success"] {
+          --banner-accent: var(--success);
           background: rgba(63, 185, 80, 0.12);
           color: var(--success);
           border-bottom-color: rgba(63, 185, 80, 0.3);
         }
         .banner[data-variant="warning"] {
+          --banner-accent: var(--warning);
           background: rgba(210, 153, 34, 0.15);
           color: var(--warning);
           border-bottom-color: rgba(210, 153, 34, 0.3);
         }
         .banner[data-variant="error"] {
+          --banner-accent: var(--error);
           background: rgba(248, 81, 73, 0.15);
           color: var(--error);
           border-bottom-color: rgba(248, 81, 73, 0.3);
@@ -56,6 +75,22 @@ export default function Banner(props: {
           flex: 1;
           line-height: 1.4;
           word-break: break-word;
+        }
+        .banner-action {
+          /* Use a variant-scoped custom property instead of currentColor:
+             currentColor would resolve against this button's own color
+             (which we set to --bg-primary below), not the banner's. */
+          padding: 4px 12px;
+          font-size: 12px;
+          font-weight: 500;
+          color: var(--bg-primary);
+          background: var(--banner-accent);
+          border: 1px solid var(--banner-accent);
+          border-radius: 4px;
+          cursor: pointer;
+        }
+        .banner-action:hover {
+          filter: brightness(1.15);
         }
         .banner-close {
           padding: 0;

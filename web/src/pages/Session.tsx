@@ -178,33 +178,35 @@ export default function SessionPage() {
       </Show>
 
       <Show when={endedReason()}>
-        <div class="reconnect-bar" data-variant="ended" role="status">
-          <span>{endedReason()}</span>
-          <button class="reconnect-btn" type="button" onClick={() => navigate('/')}>
-            Back to Dashboard
-          </button>
-        </div>
+        <Banner
+          variant="info"
+          role="status"
+          action={{ label: 'Back to Dashboard', onClick: () => navigate('/') }}
+        >
+          {endedReason()}
+        </Banner>
       </Show>
 
-      <Show when={!endedReason() && (reconnectInfo() || status() === 'giveup')}>
-        <div class="reconnect-bar" data-variant={status() === 'giveup' ? 'giveup' : 'retrying'} role="status">
-          <Show
-            when={status() === 'giveup'}
-            fallback={
-              <span>
-                Connection lost — retrying
-                {' '}
-                <strong>{reconnectInfo()?.attempt}/{reconnectInfo()?.maxAttempts}</strong>
-                {' '}(next in {Math.round((reconnectInfo()?.nextDelayMs ?? 0) / 1000)}s)
-              </span>
-            }
-          >
-            <span>Connection lost. Automatic retry gave up.</span>
-            <button class="reconnect-btn" type="button" onClick={handleManualReconnect}>
-              Reconnect
-            </button>
-          </Show>
-        </div>
+      <Show when={!endedReason() && status() === 'giveup'}>
+        <Banner
+          variant="error"
+          role="status"
+          action={{ label: 'Reconnect', onClick: handleManualReconnect }}
+        >
+          Connection lost. Automatic retry gave up.
+        </Banner>
+      </Show>
+
+      <Show when={!endedReason() && status() !== 'giveup' && reconnectInfo()}>
+        <Banner variant="warning" role="status">
+          <span>
+            Connection lost — retrying{' '}
+            <strong>
+              {reconnectInfo()?.attempt}/{reconnectInfo()?.maxAttempts}
+            </strong>{' '}
+            (next in {Math.round((reconnectInfo()?.nextDelayMs ?? 0) / 1000)}s)
+          </span>
+        </Banner>
       </Show>
 
       <div class="session-body">
@@ -254,41 +256,6 @@ export default function SessionPage() {
         .status-dot[data-status="disconnected"] { background: var(--text-secondary); }
         .status-dot[data-status="error"] { background: var(--error); }
         .status-dot[data-status="giveup"] { background: var(--error); }
-        .reconnect-bar {
-          display: flex;
-          align-items: center;
-          gap: 12px;
-          padding: 8px 16px;
-          font-size: 13px;
-          border-bottom: 1px solid var(--border);
-          background: rgba(210, 153, 34, 0.12);
-          color: var(--warning);
-        }
-        .reconnect-bar[data-variant="giveup"] {
-          background: rgba(248, 81, 73, 0.12);
-          color: var(--error);
-          border-bottom-color: rgba(248, 81, 73, 0.3);
-        }
-        .reconnect-bar[data-variant="ended"] {
-          background: rgba(139, 148, 158, 0.12);
-          color: var(--text-primary);
-          border-bottom-color: rgba(139, 148, 158, 0.3);
-        }
-        .reconnect-bar[data-variant="ended"] .reconnect-btn {
-          background: var(--accent);
-          border-color: var(--accent);
-        }
-        .reconnect-bar strong { font-weight: 600; }
-        .reconnect-btn {
-          margin-left: auto;
-          font-size: 12px;
-          padding: 4px 12px;
-          background: var(--error);
-          color: #fff;
-          border: 1px solid var(--error);
-          border-radius: 4px;
-        }
-        .reconnect-btn:hover { filter: brightness(1.1); }
         .topbar-actions { margin-left: auto; display: flex; gap: 8px; }
         .topbar-actions .action-btn { font-size: 12px; padding: 4px 10px; }
         .session-body { flex: 1; display: flex; overflow: hidden; }

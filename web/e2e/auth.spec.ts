@@ -28,7 +28,7 @@ test.describe('Authentication', () => {
     await login(page);
 
     // Click the logout button in the topbar
-    await page.locator('.topbar button').click();
+    await page.getByRole('button', { name: 'Logout' }).click();
     await expect(page).toHaveURL(/\/login/);
 
     // Revisiting dashboard should redirect back to login
