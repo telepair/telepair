@@ -29,76 +29,18 @@ impl SqliteStorage {
     }
 
     async fn run_migrations(&self) -> Result<()> {
-        // Enable WAL mode for better concurrent read performance
+        // WAL mode gives us concurrent readers while a writer is active.
         sqlx::raw_sql("PRAGMA journal_mode=WAL;")
             .execute(&self.pool)
             .await?;
 
-        // Schema is the single source of truth — all DDL lives in SQL files.
-        // Fresh DBs created before this file included token_sha256 must be
-        // recreated (pre-1.0, no backwards-compat shims).
+        // Schema is the single source of truth — pre-1.0, the only
+        // supported upgrade path is to delete the DB file and start
+        // fresh, so we don't ship compat shims or column-level probes.
         sqlx::raw_sql(include_str!("../../../../migrations/001_initial.sql"))
             .execute(&self.pool)
             .await?;
 
-        // `CREATE TABLE IF NOT EXISTS` is a silent no-op when an old table
-        // with the same name already exists. Verify the expected columns are
-        // present so we fail fast instead of serving traffic against a stale
-        // schema and returning "invalid token" at runtime.
-        self.verify_schema().await?;
-
-        Ok(())
-    }
-
-    /// Verify the database has the columns this code depends on.
-    ///
-    /// We intentionally do NOT require the SQLite-level `NOT NULL` flag
-    /// because the previous release shipped `token_sha256 TEXT` (nullable)
-    /// while always writing a value at insert time. Rejecting that shape
-    /// would force operators to wipe `~/.telepair/telepair.db` during an
-    /// in-place upgrade. Instead we verify:
-    ///
-    ///   1. The column exists (catches ancient schemas pre-`token_sha256`).
-    ///   2. No existing row has a NULL value (catches real data corruption
-    ///      and any legacy row that slipped through).
-    async fn verify_schema(&self) -> Result<()> {
-        for table in ["users", "invite_tokens"] {
-            self.assert_column_present(table, "token_sha256").await?;
-            self.assert_no_null_rows(table, "token_sha256").await?;
-        }
-        Ok(())
-    }
-
-    async fn assert_column_present(&self, table: &str, column: &str) -> Result<()> {
-        // `PRAGMA table_info(<table>)` returns one row per column:
-        //   cid | name | type | notnull | dflt_value | pk
-        let query = format!("PRAGMA table_info({table})");
-        let rows = sqlx::query(&query).fetch_all(&self.pool).await?;
-
-        if !rows.iter().any(|r| r.get::<String, _>("name") == column) {
-            return Err(Error::SchemaOutdated(format!(
-                "table `{table}` is missing required column `{column}`. \
-                 The database was created by an older telepair release. \
-                 Remove ~/.telepair/telepair.db and restart to recreate it."
-            )));
-        }
-        Ok(())
-    }
-
-    async fn assert_no_null_rows(&self, table: &str, column: &str) -> Result<()> {
-        let query = format!("SELECT 1 FROM {table} WHERE {column} IS NULL LIMIT 1");
-        if sqlx::query(&query)
-            .fetch_optional(&self.pool)
-            .await?
-            .is_some()
-        {
-            return Err(Error::SchemaOutdated(format!(
-                "table `{table}` has row(s) with NULL `{column}`. \
-                 The database was populated by an older telepair release \
-                 before the column was backfilled. Remove ~/.telepair/telepair.db \
-                 and restart to recreate it."
-            )));
-        }
         Ok(())
     }
 }
@@ -176,7 +118,7 @@ fn row_to_participant(r: &SqliteRow) -> Result<Participant> {
 
 fn row_to_invite(r: &SqliteRow) -> Result<InviteToken> {
     Ok(InviteToken {
-        token_hash: r.get("token_hash"),
+        token_sha256: r.get("token_sha256"),
         session_id: r.get("session_id"),
         role: r
             .get::<String, _>("role")
@@ -188,20 +130,21 @@ fn row_to_invite(r: &SqliteRow) -> Result<InviteToken> {
     })
 }
 
-const BCRYPT_COST: u32 = 10;
-
 /// Compute SHA-256 hex digest of a raw token for O(1) indexed lookup.
 fn token_sha256(raw: &str) -> String {
     let hash = Sha256::digest(raw.as_bytes());
     hex::encode(hash)
 }
 
-/// Generate a new token, returning (raw, bcrypt_hash, sha256_hex).
-fn generate_token() -> Result<(String, String, String)> {
+/// Generate a new token, returning (raw, sha256_hex). The sha256 digest
+/// is the only server-side representation — we don't keep a bcrypt hash
+/// alongside it because every lookup already goes through the indexed
+/// sha256 column. Raw tokens are 32-char nanoids (≈190 bits of entropy),
+/// so the second hash added cost without raising the security floor.
+fn generate_token() -> (String, String) {
     let raw = nanoid::nanoid!(32);
-    let bcrypt_hash = bcrypt::hash(&raw, BCRYPT_COST).map_err(|e| Error::Auth(e.to_string()))?;
     let sha256_hex = token_sha256(&raw);
-    Ok((raw, bcrypt_hash, sha256_hex))
+    (raw, sha256_hex)
 }
 
 fn check_invite_validity(invite: &InviteToken) -> Result<()> {
@@ -245,15 +188,15 @@ impl SqliteStorage {
 impl Storage for SqliteStorage {
     async fn create_user(&self, name: &str, is_admin: bool) -> Result<(User, String)> {
         let id = Uuid::new_v4();
-        let (token, token_hash, sha256_hex) = generate_token()?;
+        let (token, sha256_hex) = generate_token();
         let now = Utc::now();
 
         sqlx::query(
-            "INSERT INTO users (id, name, token_hash, token_sha256, is_admin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO users (id, name, token_sha256, is_admin, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(id.to_string())
         .bind(name)
-        .bind(&token_hash)
         .bind(&sha256_hex)
         .bind(is_admin)
         .bind(now.to_rfc3339())
@@ -505,12 +448,12 @@ impl Storage for SqliteStorage {
         if max_uses < 1 {
             return Err(Error::InvalidInput("max_uses must be at least 1".into()));
         }
-        let (raw_token, token_hash, sha256_hex) = generate_token()?;
+        let (raw_token, sha256_hex) = generate_token();
 
         sqlx::query(
-            "INSERT INTO invite_tokens (token_hash, token_sha256, session_id, role, max_uses, used_count, expires_at) VALUES (?, ?, ?, ?, ?, 0, ?)",
+            "INSERT INTO invite_tokens (token_sha256, session_id, role, max_uses, used_count, expires_at) \
+             VALUES (?, ?, ?, ?, 0, ?)",
         )
-        .bind(&token_hash)
         .bind(&sha256_hex)
         .bind(session_id)
         .bind(role.as_str())
@@ -520,7 +463,7 @@ impl Storage for SqliteStorage {
         .await?;
 
         let invite = InviteToken {
-            token_hash,
+            token_sha256: sha256_hex,
             session_id: session_id.into(),
             role,
             max_uses,
@@ -546,10 +489,10 @@ impl Storage for SqliteStorage {
         // Atomic increment with WHERE guard — no separate validity pre-check needed
         let result = sqlx::query(
             "UPDATE invite_tokens SET used_count = used_count + 1 \
-             WHERE token_hash = ? AND used_count < max_uses \
+             WHERE token_sha256 = ? AND used_count < max_uses \
              AND (expires_at IS NULL OR expires_at > ?)",
         )
-        .bind(&invite.token_hash)
+        .bind(&invite.token_sha256)
         .bind(Utc::now().to_rfc3339())
         .execute(&self.pool)
         .await?;

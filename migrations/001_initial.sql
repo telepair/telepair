@@ -1,7 +1,10 @@
+-- Initial schema. Pre-1.0: no migration compatibility shims. If a
+-- dev DB exists from a previous release, delete ~/.telepair/telepair.db
+-- and let the server recreate it on startup.
+
 CREATE TABLE IF NOT EXISTS users (
     id           TEXT PRIMARY KEY,
     name         TEXT NOT NULL UNIQUE,
-    token_hash   TEXT NOT NULL,
     token_sha256 TEXT NOT NULL UNIQUE,
     is_admin     BOOLEAN NOT NULL DEFAULT FALSE,
     created_at   TEXT NOT NULL,
@@ -30,8 +33,7 @@ CREATE TABLE IF NOT EXISTS participants (
 );
 
 CREATE TABLE IF NOT EXISTS invite_tokens (
-    token_hash   TEXT PRIMARY KEY,
-    token_sha256 TEXT NOT NULL UNIQUE,
+    token_sha256 TEXT PRIMARY KEY,
     session_id   TEXT NOT NULL REFERENCES sessions(id),
     role         TEXT NOT NULL,
     max_uses     INTEGER NOT NULL DEFAULT 1,

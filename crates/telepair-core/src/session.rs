@@ -81,7 +81,10 @@ pub struct User {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InviteToken {
-    pub token_hash: String,
+    /// Hex-encoded SHA-256 digest of the raw token. Doubles as the
+    /// primary key in `invite_tokens` — the raw token is only ever
+    /// returned to the caller at creation time.
+    pub token_sha256: String,
     pub session_id: String,
     pub role: Role,
     pub max_uses: i32,

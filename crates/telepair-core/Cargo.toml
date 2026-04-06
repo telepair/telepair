@@ -14,7 +14,6 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 nanoid = { workspace = true }
 chrono = { workspace = true }
-bcrypt = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
