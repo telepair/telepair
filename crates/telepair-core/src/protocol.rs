@@ -5,6 +5,12 @@ use crate::permission::Role;
 use crate::session::Session;
 
 // --- Client -> Server ---
+//
+// Terminal input (`TermInput`) is NOT a JSON message — it is sent as a binary
+// WebSocket frame carrying raw bytes. The handler at `ws.rs::handle_socket`
+// reads `Message::Binary(data)` and forwards it straight to the PTY. JSON
+// messages below are used for everything else (session control, resize,
+// chat, cursor).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
@@ -15,9 +21,6 @@ pub enum ClientMessage {
         cols: u16,
         #[serde(default = "default_rows")]
         rows: u16,
-    },
-    TermInput {
-        data: Vec<u8>,
     },
     TermResize {
         cols: u16,

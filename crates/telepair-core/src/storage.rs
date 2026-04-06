@@ -31,12 +31,6 @@ pub trait Storage: Send + Sync {
     async fn close_stale_sessions(&self) -> Result<u64>;
 
     // Participants
-    async fn add_participant(
-        &self,
-        session_id: &str,
-        user_id: Uuid,
-        role: Role,
-    ) -> Result<Participant>;
     async fn upsert_participant(
         &self,
         session_id: &str,
@@ -54,6 +48,5 @@ pub trait Storage: Send + Sync {
         max_uses: i32,
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<(InviteToken, String)>;
-    async fn validate_invite(&self, token: &str) -> Result<InviteToken>;
     async fn consume_invite(&self, token: &str) -> Result<InviteToken>;
 }

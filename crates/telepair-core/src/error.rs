@@ -12,6 +12,8 @@ pub enum Error {
     PermissionDenied(String),
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    #[error("database schema is outdated: {0}")]
+    SchemaOutdated(String),
     #[error("storage error: {0}")]
     Storage(#[from] sqlx::Error),
     #[error("io error: {0}")]

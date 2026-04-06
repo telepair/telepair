@@ -256,11 +256,6 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                     Message::Text(text) => {
                         if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
                             match client_msg {
-                                ClientMessage::TermInput { data } => {
-                                    if can_forward_input(current_role) {
-                                        let _ = cmd_tx.send(PtyCommand::Input(data)).await;
-                                    }
-                                }
                                 ClientMessage::TermResize { cols, rows } => {
                                     if current_role.can_resize() {
                                         let _ = cmd_tx.send(PtyCommand::Resize(cols, rows)).await;

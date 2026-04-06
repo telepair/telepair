@@ -44,14 +44,9 @@ fn session_join_msg(session_id: &str, token: &str) -> Message {
 }
 
 fn term_input_msg(data: &str) -> Message {
-    Message::Text(
-        serde_json::json!({
-            "type": "TermInput",
-            "data": data.as_bytes().to_vec()
-        })
-        .to_string()
-        .into(),
-    )
+    // Terminal keystrokes flow as raw binary WebSocket frames — see
+    // `crates/telepair-core/src/protocol.rs` and `ws.rs::handle_socket`.
+    Message::Binary(data.as_bytes().to_vec().into())
 }
 
 fn term_resize_msg(cols: u16, rows: u16) -> Message {
