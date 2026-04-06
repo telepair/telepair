@@ -42,7 +42,6 @@ export type ClientMessage =
 
 export type ServerMessage =
   | { type: 'SessionState'; session: Session; participants: ParticipantInfo[]; your_role: Role; your_user_id: string }
-  | { type: 'TermOutput'; data: number[] }
   | { type: 'PeerJoined'; user_id: string; name: string; role: Role; color: string }
   | { type: 'PeerLeft'; user_id: string }
   | { type: 'PeerCursor'; user_id: string; x: number; y: number }
@@ -56,10 +55,6 @@ const textEncoder = new TextEncoder();
 
 export function encodeInput(text: string): number[] {
   return Array.from(textEncoder.encode(text));
-}
-
-export function decodeOutput(data: number[]): Uint8Array {
-  return new Uint8Array(data);
 }
 
 export function canInput(role: Role): boolean {

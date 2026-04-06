@@ -25,12 +25,9 @@ async function validateToken(t: string): Promise<boolean> {
     // Temporarily set for API call (api.ts reads from localStorage)
     localStorage.setItem(STORAGE_KEY, t);
     await api.listTargets();
-    // Validation succeeded — now persist to signal
     setTokenSignal(t);
-    setValidating(false);
     return true;
   } catch (e) {
-    // Validation failed — remove token
     localStorage.removeItem(STORAGE_KEY);
     setTokenSignal('');
     if (e instanceof ApiError && e.status === 401) {
@@ -38,8 +35,9 @@ async function validateToken(t: string): Promise<boolean> {
     } else {
       setError('Connection failed');
     }
-    setValidating(false);
     return false;
+  } finally {
+    setValidating(false);
   }
 }
 

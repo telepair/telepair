@@ -184,42 +184,55 @@ fn check_invite_validity(invite: &InviteToken) -> Result<()> {
 }
 
 impl SqliteStorage {
-    /// Look up an invite by raw token (SHA-256 fast path + bcrypt legacy fallback).
-    /// Does NOT check expiry or usage limits.
-    async fn find_invite_by_token(&self, token: &str) -> Result<InviteToken> {
-        let sha256_hex = token_sha256(token);
+    /// Resolve a raw token via SHA-256 indexed lookup, falling back to a bcrypt
+    /// scan for legacy rows. On bcrypt match, backfills `token_sha256` so
+    /// subsequent lookups hit the fast path.
+    ///
+    /// `table` and `id_col` are interpolated into SQL — they MUST be hardcoded
+    /// constants, never user input.
+    async fn lookup_by_token<T>(
+        &self,
+        table: &str,
+        id_col: &str,
+        raw_token: &str,
+        map_row: impl Fn(&SqliteRow) -> Result<T>,
+        not_found_error: &'static str,
+    ) -> Result<T> {
+        let sha256_hex = token_sha256(raw_token);
 
-        // Fast path: O(1) indexed lookup by SHA-256
-        if let Some(row) = sqlx::query("SELECT * FROM invite_tokens WHERE token_sha256 = ?")
+        let sha_query = format!("SELECT * FROM {table} WHERE token_sha256 = ?");
+        if let Some(row) = sqlx::query(&sha_query)
             .bind(&sha256_hex)
             .fetch_optional(&self.pool)
             .await?
         {
-            return row_to_invite(&row);
+            return map_row(&row);
         }
 
-        // Slow path: legacy invite tokens without token_sha256 — bcrypt scan
-        let rows = sqlx::query("SELECT * FROM invite_tokens WHERE token_sha256 IS NULL")
-            .fetch_all(&self.pool)
-            .await?;
+        let scan_query = format!("SELECT * FROM {table} WHERE token_sha256 IS NULL");
+        let rows = sqlx::query(&scan_query).fetch_all(&self.pool).await?;
 
         for row in rows {
             let hash: String = row.get("token_hash");
-            if bcrypt::verify(token, &hash).unwrap_or(false) {
-                // Backfill token_sha256 for future O(1) lookups
-                let token_hash_val: String = row.get("token_hash");
-                let _ = sqlx::query(
-                    "UPDATE invite_tokens SET token_sha256 = ? WHERE token_hash = ?",
-                )
-                .bind(&sha256_hex)
-                .bind(&token_hash_val)
-                .execute(&self.pool)
-                .await;
-                return row_to_invite(&row);
+            if bcrypt::verify(raw_token, &hash).unwrap_or(false) {
+                let id: String = row.get(id_col);
+                let backfill = format!("UPDATE {table} SET token_sha256 = ? WHERE {id_col} = ?");
+                let _ = sqlx::query(&backfill)
+                    .bind(&sha256_hex)
+                    .bind(&id)
+                    .execute(&self.pool)
+                    .await;
+                return map_row(&row);
             }
         }
 
-        Err(Error::Auth("invalid invite token".into()))
+        Err(Error::Auth(not_found_error.into()))
+    }
+
+    /// Look up an invite by raw token. Does NOT check expiry or usage limits.
+    async fn find_invite_by_token(&self, token: &str) -> Result<InviteToken> {
+        self.lookup_by_token("invite_tokens", "token_hash", token, row_to_invite, "invalid invite token")
+            .await
     }
 }
 
@@ -275,41 +288,8 @@ impl Storage for SqliteStorage {
     }
 
     async fn validate_token(&self, token: &str) -> Result<User> {
-        let sha256_hex = token_sha256(token);
-
-        // Fast path: O(1) indexed lookup by SHA-256
-        if let Some(row) = sqlx::query(
-            "SELECT id, name, is_admin, created_at, updated_at FROM users WHERE token_sha256 = ?",
-        )
-        .bind(&sha256_hex)
-        .fetch_optional(&self.pool)
-        .await?
-        {
-            return row_to_user(&row);
-        }
-
-        // Slow path: legacy tokens without token_sha256 — bcrypt scan only those rows
-        let rows = sqlx::query(
-            "SELECT id, name, token_hash, is_admin, created_at, updated_at FROM users WHERE token_sha256 IS NULL",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        for row in rows {
-            let hash: String = row.get("token_hash");
-            if bcrypt::verify(token, &hash).unwrap_or(false) {
-                // Backfill token_sha256 for future O(1) lookups
-                let user_id: String = row.get("id");
-                let _ = sqlx::query("UPDATE users SET token_sha256 = ? WHERE id = ?")
-                    .bind(&sha256_hex)
-                    .bind(&user_id)
-                    .execute(&self.pool)
-                    .await;
-                return row_to_user(&row);
-            }
-        }
-
-        Err(Error::Auth("invalid token".into()))
+        self.lookup_by_token("users", "id", token, row_to_user, "invalid token")
+            .await
     }
 
     async fn create_session(

@@ -1,5 +1,6 @@
 import { createSignal, Show } from 'solid-js';
 import { api } from '../lib/api';
+import type { Role } from '../lib/protocol';
 
 interface InviteDialogProps {
   sessionId: string;
@@ -8,7 +9,7 @@ interface InviteDialogProps {
 }
 
 export default function InviteDialog(props: InviteDialogProps) {
-  const [role, setRole] = createSignal('operator');
+  const [role, setRole] = createSignal<Role>('operator');
   const [inviteUrl, setInviteUrl] = createSignal('');
   const [creating, setCreating] = createSignal(false);
   const [copied, setCopied] = createSignal(false);

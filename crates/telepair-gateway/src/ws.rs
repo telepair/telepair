@@ -49,7 +49,6 @@ async fn send_error(
 async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // 1. Auth: wait for SessionJoin message with 5-second timeout
     let (user, initial_cols, initial_rows) = match tokio::time::timeout(
         std::time::Duration::from_secs(5),
         ws_rx.next(),
@@ -84,8 +83,15 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         }
     };
 
-    // 2. Session lookup from DB
-    let session = match state.sessions.storage().get_session(&session_id).await {
+    // Run session lookup and participant listing concurrently — both depend
+    // only on session_id and account for ~half the handshake DB time.
+    let storage = state.sessions.storage();
+    let (session_res, participants_res) = tokio::join!(
+        storage.get_session(&session_id),
+        storage.list_participants(&session_id),
+    );
+
+    let session = match session_res {
         Ok(Some(s)) => s,
         _ => {
             send_error(
@@ -108,13 +114,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         return;
     }
 
-    // 3. Role lookup from DB participants
-    let db_participants = state
-        .sessions
-        .storage()
-        .list_participants(&session_id)
-        .await
-        .unwrap_or_default();
+    let db_participants = participants_res.unwrap_or_default();
     let is_owner = session.owner_id == user.id;
     let is_participant = db_participants.iter().any(|p| p.user_id == user.id);
 
@@ -141,7 +141,6 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
             }
         });
 
-    // 4. Start or join the live PTY session (atomic — no TOCTOU race)
     let hub = &state.hub;
     let (cmd, args, env) = match state.targets.resolve(&session.target_name) {
         Some(resolved) => resolved,
@@ -167,12 +166,10 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
             }
         };
 
-    // 5. Register participant in the hub
     let _color = hub
         .add_participant(&session_id, user.id, user.name.clone(), my_role)
         .await;
 
-    // 6. Build SessionState with real participant list
     let connected = hub.get_participants(&session_id).await;
     let participant_infos: Vec<ParticipantInfo> = connected
         .iter()
@@ -200,9 +197,9 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         }
     }
 
-    // 7. Output forwarder: PTY output + collab messages -> WebSocket
-    //    Use a oneshot channel to signal stop.
-    //    Use a watch channel for reactive role updates.
+    // Spawn a forwarder that pumps PTY output + collab messages to the WS sink.
+    // `stop_tx` (oneshot) lets the main loop tell the forwarder to exit;
+    // `role_watch_tx` (watch) lets it react to PermUpdate without blocking the input loop.
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
     let (role_watch_tx, role_watch_rx) = tokio::sync::watch::channel(my_role);
 
@@ -256,7 +253,6 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         }
     });
 
-    // 8. Input loop with permission enforcement (reactive role via watch channel)
     let user_id = user.id;
     let user_name = user.name.clone();
     let input_mode = session.input_mode;
@@ -319,7 +315,6 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         }
     }
 
-    // 9. Cleanup
     let _ = stop_tx.send(());
     // Give the output handler time to flush pending sends before force-aborting
     if tokio::time::timeout(std::time::Duration::from_secs(2), output_handle)

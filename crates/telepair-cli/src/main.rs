@@ -91,14 +91,8 @@ async fn main() -> anyhow::Result<()> {
             );
             TargetEngine::empty()
         }),
-        None => {
-            let targets_path = data_dir.join("targets.yaml");
-            if targets_path.exists() {
-                TargetEngine::from_file(&targets_path).unwrap_or_else(|_| TargetEngine::empty())
-            } else {
-                TargetEngine::empty()
-            }
-        }
+        None => TargetEngine::from_file(&data_dir.join("targets.yaml"))
+            .unwrap_or_else(|_| TargetEngine::empty()),
     };
 
     // Close any sessions left "active" from a previous unclean shutdown
