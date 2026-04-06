@@ -62,7 +62,15 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                             return;
                         }
                     },
-                    _ => return,
+                    _ => {
+                        send_error(
+                            &mut ws_tx,
+                            "EXPECTED_JOIN",
+                            "first message must be SessionJoin".into(),
+                        )
+                        .await;
+                        return;
+                    }
                 }
             }
             _ => {
@@ -152,8 +160,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         }
     };
 
-    let _color = hub
-        .add_participant(&session_id, user.id, user.name.clone(), my_role)
+    hub.add_participant(&session_id, user.id, user.name.clone(), my_role)
         .await;
 
     let connected = hub.get_participants(&session_id).await;
@@ -197,7 +204,10 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                 result = output_rx.recv() => {
                     match result {
                         Ok(data) => {
-                            if ws_tx.send(Message::Binary(data.into())).await.is_err() {
+                            // `data` is already a refcounted `Bytes`; axum's
+                            // `Message::Binary` takes `Bytes` directly so this
+                            // forwards without an extra allocation or copy.
+                            if ws_tx.send(Message::Binary(data)).await.is_err() {
                                 break;
                             }
                         }

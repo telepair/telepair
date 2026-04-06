@@ -4,11 +4,33 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+use uuid::Uuid;
+
 use telepair_core::permission::Role;
 use telepair_core::protocol::ServerMessage;
-use telepair_core::session::InputMode;
+use telepair_core::session::{InputMode, Session};
 use telepair_core::storage::Storage;
 use telepair_gateway::state::AppState;
+
+/// Create a user, a session they own, and the owner participant row.
+/// Returns `(token, user_id, session)` so tests can skip 4 lines of setup.
+async fn owned_session(state: &AppState, username: &str) -> (String, Uuid, Session) {
+    let token = state.create_test_user(username).await;
+    let user = state.auth.validate(&token).await.unwrap();
+    let session = state
+        .sessions
+        .storage()
+        .create_session(user.id, "local-shell", InputMode::Serialized)
+        .await
+        .unwrap();
+    state
+        .sessions
+        .storage()
+        .upsert_participant(&session.id, user.id, Role::Owner)
+        .await
+        .unwrap();
+    (token, user.id, session)
+}
 
 async fn start_server() -> (String, AppState) {
     let state = AppState::new_test().await;
@@ -73,14 +95,7 @@ where
 #[tokio::test]
 async fn ws_auth_timeout() {
     let (addr, state) = start_server().await;
-    let token = state.create_test_user("tester").await;
-    let user = state.auth.validate(&token).await.unwrap();
-    let session = state
-        .sessions
-        .storage()
-        .create_session(user.id, "local-shell", InputMode::Serialized)
-        .await
-        .unwrap();
+    let (_token, _user_id, session) = owned_session(&state, "tester").await;
 
     let (mut ws, _) = connect_async(ws_url(&addr, &session.id))
         .await
@@ -110,14 +125,7 @@ async fn ws_auth_timeout() {
 #[tokio::test]
 async fn ws_invalid_token_rejected() {
     let (addr, state) = start_server().await;
-    let token = state.create_test_user("tester").await;
-    let user = state.auth.validate(&token).await.unwrap();
-    let session = state
-        .sessions
-        .storage()
-        .create_session(user.id, "local-shell", InputMode::Serialized)
-        .await
-        .unwrap();
+    let (_token, _user_id, session) = owned_session(&state, "tester").await;
 
     let (mut ws, _) = connect_async(ws_url(&addr, &session.id))
         .await
@@ -147,20 +155,7 @@ async fn ws_non_participant_rejected() {
     let (addr, state) = start_server().await;
 
     // User A creates a session
-    let token_a = state.create_test_user("alice").await;
-    let user_a = state.auth.validate(&token_a).await.unwrap();
-    let session = state
-        .sessions
-        .storage()
-        .create_session(user_a.id, "local-shell", InputMode::Serialized)
-        .await
-        .unwrap();
-    state
-        .sessions
-        .storage()
-        .upsert_participant(&session.id, user_a.id, Role::Owner)
-        .await
-        .unwrap();
+    let (_token_a, _user_a_id, session) = owned_session(&state, "alice").await;
 
     // User B is NOT added as participant
     let token_b = state.create_test_user("bob").await;
@@ -192,20 +187,7 @@ async fn ws_non_participant_rejected() {
 async fn ws_closed_session_rejected() {
     let (addr, state) = start_server().await;
 
-    let token = state.create_test_user("tester").await;
-    let user = state.auth.validate(&token).await.unwrap();
-    let session = state
-        .sessions
-        .storage()
-        .create_session(user.id, "local-shell", InputMode::Serialized)
-        .await
-        .unwrap();
-    state
-        .sessions
-        .storage()
-        .upsert_participant(&session.id, user.id, Role::Owner)
-        .await
-        .unwrap();
+    let (token, _user_id, session) = owned_session(&state, "tester").await;
 
     // Close the session
     state
@@ -242,20 +224,7 @@ async fn ws_closed_session_rejected() {
 async fn ws_successful_join_receives_session_state() {
     let (addr, state) = start_server().await;
 
-    let token = state.create_test_user("tester").await;
-    let user = state.auth.validate(&token).await.unwrap();
-    let session = state
-        .sessions
-        .storage()
-        .create_session(user.id, "local-shell", InputMode::Serialized)
-        .await
-        .unwrap();
-    state
-        .sessions
-        .storage()
-        .upsert_participant(&session.id, user.id, Role::Owner)
-        .await
-        .unwrap();
+    let (token, user_id, session) = owned_session(&state, "tester").await;
 
     let (mut ws, _) = connect_async(ws_url(&addr, &session.id))
         .await
@@ -278,12 +247,12 @@ async fn ws_successful_join_receives_session_state() {
         }) => {
             assert_eq!(sess.id, session.id);
             assert_eq!(your_role, Role::Owner);
-            assert_eq!(your_user_id, user.id);
+            assert_eq!(your_user_id, user_id);
             assert!(
                 !participants.is_empty(),
                 "expected at least one participant"
             );
-            assert_eq!(participants[0].user_id, user.id);
+            assert_eq!(participants[0].user_id, user_id);
             assert_eq!(participants[0].name, "tester");
             assert_eq!(participants[0].role, Role::Owner);
         }
@@ -301,20 +270,7 @@ async fn ws_successful_join_receives_session_state() {
 async fn ws_disconnects_after_session_stopped() {
     let (addr, state) = start_server().await;
 
-    let token = state.create_test_user("owner").await;
-    let user = state.auth.validate(&token).await.unwrap();
-    let session = state
-        .sessions
-        .storage()
-        .create_session(user.id, "local-shell", InputMode::Serialized)
-        .await
-        .unwrap();
-    state
-        .sessions
-        .storage()
-        .upsert_participant(&session.id, user.id, Role::Owner)
-        .await
-        .unwrap();
+    let (token, _user_id, session) = owned_session(&state, "owner").await;
 
     let (mut ws, _) = connect_async(ws_url(&addr, &session.id))
         .await
