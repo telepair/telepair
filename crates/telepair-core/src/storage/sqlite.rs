@@ -337,16 +337,48 @@ impl Storage for SqliteStorage {
     }
 
     async fn close_session(&self, id: &str) -> Result<()> {
+        // Close the session AND stamp left_at on every still-active
+        // participant in one transaction. The two used to be split:
+        // `close_session` only touched the sessions row, and the WS
+        // handler eagerly wrote `left_at` the moment a socket closed.
+        // That eager write caused invitee reconnects to fail — the
+        // Reaper grace period kept the in-memory session alive so the
+        // client was still welcome back, but the participant row had
+        // already been marked "left", so the WS handshake's
+        // NOT_PARTICIPANT check rejected them. Folding the cleanup
+        // into the single close path keeps both sides in sync: while
+        // the session is alive, participants stay rejoinable; once
+        // it's closed, everybody is consistently marked gone.
         let now = Utc::now();
-        let result =
-            sqlx::query("UPDATE sessions SET status = 'closed', closed_at = ? WHERE id = ? AND status = 'active'")
-                .bind(now.to_rfc3339())
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+        let now_str = now.to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+
+        let result = sqlx::query(
+            "UPDATE sessions SET status = 'closed', closed_at = ? \
+             WHERE id = ? AND status = 'active'",
+        )
+        .bind(&now_str)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         if result.rows_affected() == 0 {
+            // Nothing to do — either the row doesn't exist or another
+            // caller already closed it. Roll back the empty tx and
+            // propagate NotFound so idempotent close still behaves
+            // like "not active anymore".
             return Err(Error::SessionNotFound(id.to_string()));
         }
+
+        sqlx::query(
+            "UPDATE participants SET left_at = ? \
+             WHERE session_id = ? AND left_at IS NULL",
+        )
+        .bind(&now_str)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
         Ok(())
     }
 
@@ -378,13 +410,32 @@ impl Storage for SqliteStorage {
     }
 
     async fn close_stale_sessions(&self) -> Result<u64> {
+        // Boot-time recovery: an unclean shutdown can leave "active"
+        // sessions in the DB that no longer map to any running PTY.
+        // Close them AND settle their participants in the same tx
+        // so `left_at` stays consistent with the sessions row.
         let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+
         let result = sqlx::query(
             "UPDATE sessions SET status = 'closed', closed_at = ? WHERE status = 'active'",
         )
-        .bind(now.to_rfc3339())
-        .execute(&self.pool)
+        .bind(&now_str)
+        .execute(&mut *tx)
         .await?;
+
+        sqlx::query(
+            "UPDATE participants SET left_at = ? \
+             WHERE left_at IS NULL AND session_id IN \
+               (SELECT id FROM sessions WHERE status = 'closed' AND closed_at = ?)",
+        )
+        .bind(&now_str)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 
@@ -413,17 +464,6 @@ impl Storage for SqliteStorage {
             joined_at: now,
             left_at: None,
         })
-    }
-
-    async fn remove_participant(&self, session_id: &str, user_id: Uuid) -> Result<()> {
-        let now = Utc::now();
-        sqlx::query("UPDATE participants SET left_at = ? WHERE session_id = ? AND user_id = ?")
-            .bind(now.to_rfc3339())
-            .bind(session_id)
-            .bind(user_id.to_string())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
     }
 
     async fn list_participants(&self, session_id: &str) -> Result<Vec<Participant>> {
