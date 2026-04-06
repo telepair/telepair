@@ -1,4 +1,4 @@
-import { createSignal, createEffect, For } from 'solid-js';
+import { createSignal, createEffect, on, For } from 'solid-js';
 
 export interface ChatMessage {
   user_id: string;
@@ -16,10 +16,16 @@ export default function ChatPanel(props: ChatPanelProps) {
   const [input, setInput] = createSignal('');
   let messagesEnd: HTMLDivElement | undefined;
 
-  createEffect(() => {
-    props.messages.length; // track reactive dependency
-    messagesEnd?.scrollIntoView({ behavior: 'smooth' });
-  });
+  // Track the array reference, not its length: Session.tsx caps history at
+  // 500 messages by dropping the oldest on overflow, so .length stops
+  // changing once full and the effect would stop firing. A fresh array
+  // reference on every setChatMessages call keeps auto-scroll working.
+  createEffect(
+    on(
+      () => props.messages,
+      () => messagesEnd?.scrollIntoView({ behavior: 'smooth' }),
+    ),
+  );
 
   const handleSend = () => {
     const text = input().trim();

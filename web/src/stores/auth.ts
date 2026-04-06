@@ -20,16 +20,14 @@ function setToken(value: string) {
 
 async function validateToken(t: string): Promise<boolean> {
   setValidating(true);
-  setError('');
+  // setToken clears any previous error and mirrors the value to localStorage
+  // so api.ts (which reads from localStorage) picks it up for the probe call.
+  setToken(t);
   try {
-    // Temporarily set for API call (api.ts reads from localStorage)
-    localStorage.setItem(STORAGE_KEY, t);
     await api.listTargets();
-    setTokenSignal(t);
     return true;
   } catch (e) {
-    localStorage.removeItem(STORAGE_KEY);
-    setTokenSignal('');
+    setToken('');
     if (e instanceof ApiError && e.status === 401) {
       setError('Invalid token');
     } else {
