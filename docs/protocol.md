@@ -4,7 +4,7 @@ Endpoint: `ws://localhost:7700/ws/session/{session_id}`
 
 telepair uses a hybrid protocol over a single WebSocket connection:
 - **Text frames**: JSON messages for control and collaboration
-- **Binary frames**: Compact encoding for terminal I/O
+- **Binary frames**: Raw PTY output bytes (server → client only)
 
 ## Connection Flow
 
@@ -17,8 +17,8 @@ Client                              Server
   │                                    │
   │◀─── SessionState (JSON) ──────────│  session info + participants
   │                                    │
-  │◀─── TermOutput (JSON/binary) ─────│  PTY output stream
-  │──── TermInput (JSON/binary) ──────▶│  user keystrokes
+  │◀─── PTY output (binary) ──────────│  PTY output stream
+  │──── TermInput (JSON) ─────────────▶│  user keystrokes
   │                                    │
   │◀─── PeerJoined ──────────────────│  collaboration events
   │◀─── PeerChat ────────────────────│
@@ -119,17 +119,6 @@ Sent immediately after successful `SessionJoin`.
 }
 ```
 
-#### TermOutput
-
-PTY output data, broadcast to all connected clients.
-
-```json
-{
-  "type": "TermOutput",
-  "data": [36, 32]
-}
-```
-
 #### PeerJoined
 
 Broadcast when a new participant connects.
@@ -206,30 +195,11 @@ Server-side error notification.
 }
 ```
 
-## Binary Frame Protocol
+## Binary Frames
 
-For high-throughput terminal I/O, binary frames provide lower overhead than JSON.
+PTY output is sent as raw binary WebSocket frames (server → client), with no type byte or length prefix — each frame is a single opaque payload that the client writes directly to xterm.js. Terminal resize is handled via the JSON `TermResize` message.
 
-### Frame Format
-
-Binary WebSocket frames carry **raw bytes** with no framing header:
-
-| Direction | Content | Description |
-|-----------|---------|-------------|
-| Server → Client | Raw PTY output bytes | Sent as binary WS frame, write directly to xterm.js |
-| Client → Server | Raw keystroke bytes | Sent as binary WS frame, forwarded to PTY stdin |
-
-There is no type byte or length prefix — each binary frame is a single opaque payload. Terminal resize is handled via the JSON `TermResize` message (text frame), not binary.
-
-### Examples
-
-Terminal input `ls\n` (3 bytes):
-```
-6C 73 0A
-└── raw UTF-8 bytes: "ls\n"
-```
-
-PTY output `$ ` (2 bytes):
+Example PTY output `$ ` (2 bytes):
 ```
 24 20
 └── raw PTY bytes: "$ "

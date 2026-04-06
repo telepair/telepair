@@ -22,7 +22,7 @@ The foundation crate. Contains no business logic — only shared abstractions.
 |--------|---------|
 | `session.rs` | Domain types: `User`, `Session`, `Participant`, `InviteToken`, `InputMode`, `SessionStatus` |
 | `permission.rs` | `Role` enum (Owner/Operator/Viewer) with capability methods (`can_input`, `can_resize`, `can_manage`) |
-| `protocol.rs` | `ClientMessage`/`ServerMessage` enums (JSON, `#[serde(tag = "type")]`) + `BinaryFrame` (terminal I/O) |
+| `protocol.rs` | `ClientMessage`/`ServerMessage` enums (JSON, `#[serde(tag = "type")]`); PTY output is sent as raw binary WS frames |
 | `storage.rs` | Async `Storage` trait — CRUD for users, sessions, participants, invite tokens |
 | `storage/sqlite.rs` | `SqliteStorage` implementation using sqlx |
 | `auth.rs` | `TokenAuthProvider` — bcrypt-based token validation |
@@ -91,12 +91,12 @@ Browser                     telepair (single process)
 ### Terminal I/O
 
 1. User types in xterm.js
-2. Frontend encodes keystrokes as `TermInput { data: Vec<u8> }` (JSON text frame) or raw binary frame (no framing header)
+2. Frontend encodes keystrokes as `TermInput { data: Vec<u8> }` (JSON text frame)
 3. WS handler checks `role.can_input()` — silently drops if viewer
 4. Sends bytes to PTY via `SessionHub` command channel
 5. PTY output is broadcast via `output_tx` to all connected participants
-6. WS handler forwards as `TermOutput { data: Vec<u8> }` to each client
-7. Frontend decodes and writes to xterm.js
+6. WS handler forwards each chunk as a raw binary WS frame
+7. Frontend writes the bytes directly to xterm.js
 
 ### Collaboration Messages
 
@@ -121,7 +121,7 @@ Each live session has two independent broadcast channels:
 
 | Channel | Capacity | Content |
 |---------|----------|---------|
-| `output_tx` | 256 messages | `TermOutput` — PTY bytes |
+| `output_tx` | 256 messages | PTY bytes (forwarded as raw binary WS frames) |
 | `collab_tx` | 64 messages | `PeerJoined`, `PeerLeft`, `PeerChat`, `PeerCursor`, `PermUpdate` |
 
 Separation ensures high-frequency terminal output does not starve collaboration messages. Both use `tokio::broadcast` — slow receivers lose oldest messages.

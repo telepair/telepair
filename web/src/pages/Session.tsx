@@ -1,5 +1,5 @@
 // web/src/pages/Session.tsx
-import { createSignal, onCleanup, Show, createMemo } from 'solid-js';
+import { createSignal, onCleanup, Show } from 'solid-js';
 import { useParams, useNavigate } from '@solidjs/router';
 import { auth } from '../stores/auth';
 import { TelepairSocket } from '../lib/ws';
@@ -30,8 +30,6 @@ export default function SessionPage() {
   let termHandle: TerminalHandle | undefined;
   let pendingOutput: Uint8Array[] = [];
   let socket: TelepairSocket | undefined;
-
-  const isOwner = createMemo(() => role() === 'owner');
 
   const handleBinary = (data: Uint8Array) => {
     if (termHandle) {
@@ -115,7 +113,7 @@ export default function SessionPage() {
         <span class="role-badge" data-role={role()}>{role()}</span>
         <span class="status-dot" data-status={status()} />
         <div class="topbar-actions">
-          <Show when={isOwner()}>
+          <Show when={role() === 'owner'}>
             <button class="action-btn" onClick={() => setShowInvite(true)}>Invite</button>
           </Show>
           <button class="action-btn" onClick={() => setSidebarOpen(!sidebarOpen())}>

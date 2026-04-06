@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { encodeInput, decodeOutput } from './protocol';
+import { encodeInput } from './protocol';
 import type { ClientMessage, ServerMessage } from './protocol';
 
 describe('encodeInput', () => {
@@ -16,19 +16,6 @@ describe('encodeInput', () => {
     const result = encodeInput('日');
     // '日' is U+65E5, encoded as 3 bytes in UTF-8: 0xE6, 0x97, 0xA5
     expect(result).toEqual([0xe6, 0x97, 0xa5]);
-  });
-});
-
-describe('decodeOutput', () => {
-  it('converts number array to Uint8Array', () => {
-    const result = decodeOutput([104, 101, 108, 108, 111]);
-    expect(result).toBeInstanceOf(Uint8Array);
-    expect(result).toEqual(new Uint8Array([104, 101, 108, 108, 111]));
-  });
-
-  it('handles empty array', () => {
-    const result = decodeOutput([]);
-    expect(result).toEqual(new Uint8Array([]));
   });
 });
 
