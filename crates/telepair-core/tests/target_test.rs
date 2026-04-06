@@ -9,7 +9,7 @@ targets:
     env:
       PGPASSWORD: "${PROD_DB_PASS}"
     tags: [database]
-    required_role: operator
+    admin_only: true
 
   - name: local-shell
     display: "Local Shell"
@@ -28,10 +28,12 @@ fn parse_targets_yaml() {
     assert_eq!(db.command.as_deref(), Some("psql"));
     assert_eq!(db.args, vec!["-h", "db.internal", "-U", "readonly"]);
     assert_eq!(db.env.get("PGPASSWORD").unwrap(), "${PROD_DB_PASS}");
+    assert!(db.admin_only);
 
     let shell = &config.targets[1];
     assert_eq!(shell.kind, TargetKind::Local);
     assert!(shell.command.is_none());
+    assert!(!shell.admin_only, "admin_only must default to false");
 }
 
 #[test]

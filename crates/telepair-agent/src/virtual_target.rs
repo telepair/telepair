@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use telepair_core::target::{Target, TargetConfig, TargetKind, substitute_env_vars};
+use telepair_core::target::{substitute_env_vars, Target, TargetConfig, TargetKind};
 
 pub struct TargetEngine {
     targets: Vec<Target>,
@@ -74,7 +74,7 @@ fn default_local_shell() -> Target {
         args: vec![],
         env: Default::default(),
         tags: vec![],
-        required_role: None,
+        admin_only: false,
         shell: None,
     }
 }

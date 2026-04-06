@@ -1,4 +1,3 @@
-use crate::permission::Role;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -23,7 +22,15 @@ pub struct Target {
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub tags: Vec<String>,
-    pub required_role: Option<Role>,
+    /// Restrict session creation on this target to admin users. The
+    /// previous spelling was `required_role: Option<Role>` — that name
+    /// was misleading because the handler never looked at the user's
+    /// actual role, only `is_admin`. Everything short of `Viewer` was
+    /// effectively "admin-only" and `Viewer` was a silent wildcard.
+    /// Spelling it `admin_only: bool` matches the real semantics and
+    /// kills the wildcard footgun.
+    #[serde(default)]
+    pub admin_only: bool,
     pub shell: Option<String>,
 }
 
