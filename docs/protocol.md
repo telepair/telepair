@@ -4,7 +4,8 @@ Endpoint: `ws://localhost:7700/ws/session/{session_id}`
 
 telepair uses a hybrid protocol over a single WebSocket connection:
 - **Text frames**: JSON messages for control and collaboration
-- **Binary frames**: Raw PTY output bytes (server → client only)
+- **Binary frames**: Raw PTY bytes — server → client (PTY output) and
+  client → server (keystrokes/paste)
 
 ## Connection Flow
 
@@ -18,7 +19,7 @@ Client                              Server
   │◀─── SessionState (JSON) ──────────│  session info + participants
   │                                    │
   │◀─── PTY output (binary) ──────────│  PTY output stream
-  │──── TermInput (JSON) ─────────────▶│  user keystrokes
+  │──── keystrokes (binary) ──────────▶│  raw bytes, no framing
   │                                    │
   │◀─── PeerJoined ──────────────────│  collaboration events
   │◀─── PeerChat ────────────────────│
@@ -46,18 +47,13 @@ Must be the first message after connection. Authenticates the client.
 
 If authentication fails or the user is not a participant, the connection is closed.
 
-#### TermInput
+#### Terminal input (binary frame, not JSON)
 
-Send keystrokes to the PTY. Requires `operator` or `owner` role.
+Keystrokes are sent as **raw binary WebSocket frames** — the client writes
+UTF-8 bytes straight into the socket (no JSON wrapper, no framing header).
+Requires `operator` or `owner` role.
 
-```json
-{
-  "type": "TermInput",
-  "data": [108, 115, 10]
-}
-```
-
-`data` is an array of bytes (UTF-8 encoded). For example, `ls\n` encodes as `[108, 115, 10]`.
+For example, `ls\n` is sent as a 3-byte binary frame containing `[0x6c, 0x73, 0x0a]`.
 
 #### TermResize
 
@@ -197,7 +193,10 @@ Server-side error notification.
 
 ## Binary Frames
 
-PTY output is sent as raw binary WebSocket frames (server → client), with no type byte or length prefix — each frame is a single opaque payload that the client writes directly to xterm.js. Terminal resize is handled via the JSON `TermResize` message.
+PTY I/O uses raw binary WebSocket frames in both directions — no type byte,
+no length prefix, just opaque payloads. The server forwards client frames
+straight into the PTY writer and streams PTY output straight back. Terminal
+resize is still handled via the JSON `TermResize` message.
 
 Example PTY output `$ ` (2 bytes):
 ```
@@ -211,7 +210,7 @@ The server enforces permissions on every action:
 
 | Action | Owner | Operator | Viewer |
 |--------|-------|----------|--------|
-| TermInput | Yes | Yes | Rejected |
+| Terminal input (binary) | Yes | Yes | Rejected |
 | TermResize | Yes | Yes | Rejected |
 | ChatMessage | Yes | Yes | Yes |
 | CursorMove | Yes | Yes | Yes |
