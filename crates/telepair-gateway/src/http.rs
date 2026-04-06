@@ -210,19 +210,38 @@ pub async fn redeem_invite(
 ) -> Result<impl IntoResponse, StatusCode> {
     let user = extract_user(&state, &headers).await?;
 
-    // Consume atomically first — validates expiry, max_uses, and increments used_count.
-    // If this fails, no participant is added.
-    let invite = state
-        .sessions
-        .storage()
+    // Look up the invite first (no state change) so we can validate
+    // the session is still alive before burning a use on a closed
+    // session. Without this check, redeeming against a closed session
+    // would decrement `max_uses` and insert a ghost participant — the
+    // invite counter drains and nothing useful happens.
+    let storage = state.sessions.storage();
+    let preview = storage
+        .find_invite(&body.token)
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let session = storage
+        .get_session(&preview.session_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if session.status != telepair_core::session::SessionStatus::Active {
+        // Gone / closed — fail without consuming the invite so the
+        // operator can still retract it or reuse uses on a new session.
+        return Err(StatusCode::GONE);
+    }
+
+    // Now consume atomically. This validates expiry, max_uses, and
+    // increments used_count in one transaction. A session close that
+    // races in between the check above and this call is possible but
+    // harmless — the participant insert below just won't be visible
+    // because the stopped session's in-memory hub entry is gone.
+    let invite = storage
         .consume_invite(&body.token)
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Only now upsert participant — invite was valid and consumed
-    state
-        .sessions
-        .storage()
+    storage
         .upsert_participant(&invite.session_id, user.id, invite.role)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

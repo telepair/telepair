@@ -265,3 +265,77 @@ async fn redeem_exhausted_invite_rejected() {
         "only the first redeemer should be a participant"
     );
 }
+
+#[tokio::test]
+async fn redeem_invite_on_closed_session_rejected() {
+    // Redeeming an invite against a closed session used to burn a use
+    // and still insert a ghost participant — the invite counter drained
+    // without doing anything useful. The fix rejects with GONE before
+    // consuming the invite.
+    let (state, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    // Create a valid invite.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/sessions/{session_id}/invite"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"operator","max_uses":5}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let invite_body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let raw_token = invite_body["token"].as_str().unwrap().to_owned();
+
+    // Close the session out-of-band (same path DELETE /api/sessions/:id uses).
+    state.sessions.close_session(&session_id).await.unwrap();
+
+    // Try to redeem — should be rejected with 410 Gone.
+    let joiner_token = state.create_test_user("joiner_after_close").await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/invite/redeem")
+                .header("Authorization", format!("Bearer {joiner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"token": raw_token}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::GONE,
+        "redeeming against a closed session should report 410 Gone"
+    );
+
+    // Verify the invite use counter is still 0 (not burned) and no
+    // ghost participant was added.
+    let invite = state
+        .sessions
+        .storage()
+        .find_invite(&raw_token)
+        .await
+        .unwrap();
+    assert_eq!(
+        invite.used_count, 0,
+        "rejected redemption must not burn an invite use"
+    );
+    let participants = state
+        .sessions
+        .storage()
+        .list_participants(&session_id)
+        .await
+        .unwrap();
+    assert!(
+        participants.iter().all(|p| p.role != Role::Operator),
+        "no ghost operator participant should exist after rejected redeem"
+    );
+}
