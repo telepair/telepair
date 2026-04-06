@@ -185,3 +185,73 @@ async fn corrupt_closed_at_is_reported_not_silently_dropped() {
 
     drop(seed_pool);
 }
+
+#[tokio::test]
+async fn deleting_session_cascades_to_participants_and_invites() {
+    // The participants and invite_tokens FKs to sessions(id) declare
+    // ON DELETE CASCADE so admin tooling that hard-deletes a session
+    // row sweeps the dependent rows in one statement instead of
+    // leaving FK violations or orphan records. SQLite enforces
+    // CASCADE only when `PRAGMA foreign_keys=ON`, which SqliteStorage
+    // sets via SqliteConnectOptions::foreign_keys(true) — so this
+    // test pins both the schema and the connection wiring.
+    let uri = "file:cascade_delete_test?mode=memory&cache=shared".to_string();
+    // The seed pool needs foreign_keys=ON too, otherwise the manual
+    // DELETE we issue would NOT trigger the cascade and the test
+    // would silently pass for the wrong reason.
+    let options: SqliteConnectOptions = uri.parse().unwrap();
+    let options = options.foreign_keys(true);
+    let seed_pool = SqlitePool::connect_with(options).await.unwrap();
+
+    let store = SqliteStorage::new(&uri).await.unwrap();
+    let (user, _) = store.create_user("doomed", false).await.unwrap();
+    let session = store
+        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized)
+        .await
+        .unwrap();
+    let (_, _raw) = store
+        .create_invite(&session.id, Role::Operator, 3, None)
+        .await
+        .unwrap();
+
+    // Sanity: participant + invite both exist before the delete.
+    let participants_before = store.list_participants(&session.id).await.unwrap();
+    assert_eq!(participants_before.len(), 1);
+    let invite_count_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM invite_tokens WHERE session_id = ?")
+            .bind(&session.id)
+            .fetch_one(&seed_pool)
+            .await
+            .unwrap();
+    assert_eq!(invite_count_before, 1);
+
+    // Hard-delete the session row directly.
+    sqlx::query("DELETE FROM sessions WHERE id = ?")
+        .bind(&session.id)
+        .execute(&seed_pool)
+        .await
+        .unwrap();
+
+    let participant_count_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM participants WHERE session_id = ?")
+            .bind(&session.id)
+            .fetch_one(&seed_pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        participant_count_after, 0,
+        "participants must cascade-delete when their session is removed"
+    );
+    let invite_count_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM invite_tokens WHERE session_id = ?")
+            .bind(&session.id)
+            .fetch_one(&seed_pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        invite_count_after, 0,
+        "invite_tokens must cascade-delete when their session is removed"
+    );
+
+    drop(seed_pool);
+}
