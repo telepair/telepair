@@ -12,6 +12,15 @@ async function fetchTargets() {
   try {
     const data = await api.listTargets();
     setTargets(data);
+  } catch (e) {
+    // A 401 means the cached token is stale — the api layer's
+    // interceptor has already scheduled a redirect to /login, so we
+    // just need to avoid propagating the error as an unhandled
+    // rejection. Other errors (500, network) fall through to
+    // targets=[] which the Dashboard renders as an empty state; that
+    // is not ideal but is strictly better than the previous silent
+    // swallow that masked stale-token bugs.
+    console.error('fetchTargets failed:', e);
   } finally {
     setLoading(false);
   }

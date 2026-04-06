@@ -11,6 +11,13 @@ vi.stubGlobal('localStorage', {
 });
 
 const { auth, STORAGE_KEY } = await import('./auth');
+const { __setAuthExpiredHandler } = await import('../lib/api');
+// Neutralise the stale-token redirect: validateToken intentionally
+// probes with api.listTargets() and a 401 response now fires the
+// interceptor, which tries window.location.assign('/login') under
+// jsdom. Tests care about the signal/localStorage effects, not the
+// navigation, so swap the handler for a no-op.
+__setAuthExpiredHandler(() => {});
 
 function jsonResponse(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {

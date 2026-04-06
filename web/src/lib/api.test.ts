@@ -12,7 +12,7 @@ vi.stubGlobal('localStorage', {
 });
 
 // Import after stubs are in place
-const { api, ApiError } = await import('./api');
+const { api, ApiError, __setAuthExpiredHandler } = await import('./api');
 
 function jsonResponse(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -28,6 +28,12 @@ function errorResponse(body: string, status: number) {
 beforeEach(() => {
   mockFetch.mockReset();
   delete store['telepair_token'];
+  // Replace the default handler (which tries to navigate via
+  // window.location.assign and trips jsdom's "navigation not
+  // implemented" noise) with a no-op so each test that cares can
+  // override it explicitly. Tests below that need to observe the
+  // handler being called install their own spy.
+  __setAuthExpiredHandler(() => {});
 });
 
 describe('api.health', () => {
@@ -86,5 +92,51 @@ describe('error handling', () => {
       expect(e).toBeInstanceOf(ApiError);
       expect((e as InstanceType<typeof ApiError>).status).toBe(404);
     }
+  });
+});
+
+describe('401 auth-expired interceptor', () => {
+  it('invokes the stale-token handler on 401 from a protected endpoint', async () => {
+    const onExpired = vi.fn();
+    __setAuthExpiredHandler(onExpired);
+    mockFetch.mockResolvedValueOnce(errorResponse('Unauthorized', 401));
+
+    await expect(api.listTargets()).rejects.toThrow(ApiError);
+    expect(onExpired).toHaveBeenCalledTimes(1);
+  });
+
+  it('still throws ApiError alongside the handler call (callers must not silently swallow)', async () => {
+    __setAuthExpiredHandler(() => {});
+    mockFetch.mockResolvedValueOnce(errorResponse('Unauthorized', 401));
+
+    try {
+      await api.listSessions();
+      expect.fail('expected ApiError');
+    } catch (e) {
+      expect(e).toBeInstanceOf(ApiError);
+      expect((e as InstanceType<typeof ApiError>).status).toBe(401);
+    }
+  });
+
+  it('does NOT invoke the handler on a 401 from the redeem endpoint', async () => {
+    // The redeem endpoint is anonymous-friendly: an empty cached
+    // token produces a 401 (rare) without meaning the *user* is
+    // logged out of another session. Guests must not be yanked to
+    // /login from a half-completed redeem.
+    const onExpired = vi.fn();
+    __setAuthExpiredHandler(onExpired);
+    mockFetch.mockResolvedValueOnce(errorResponse('Unauthorized', 401));
+
+    await expect(api.redeemInvite('some-invite-token')).rejects.toThrow(ApiError);
+    expect(onExpired).not.toHaveBeenCalled();
+  });
+
+  it('does NOT invoke the handler on non-401 errors', async () => {
+    const onExpired = vi.fn();
+    __setAuthExpiredHandler(onExpired);
+    mockFetch.mockResolvedValueOnce(errorResponse('boom', 500));
+
+    await expect(api.listTargets()).rejects.toThrow(ApiError);
+    expect(onExpired).not.toHaveBeenCalled();
   });
 });
