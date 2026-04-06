@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use axum::{
     extract::{
         Path, State, WebSocketUpgrade,
@@ -17,12 +19,29 @@ use telepair_core::storage::Storage;
 use crate::session_hub::PtyCommand;
 use crate::state::AppState;
 
+/// Hard cap on any single WebSocket frame/message. Terminal keystrokes are
+/// tiny; this limit only matters for paste buffers and guards against a
+/// malicious client allocating tens of MB per frame on the server.
+const MAX_WS_FRAME_BYTES: usize = 256 * 1024;
+
+/// Maximum UTF-8 byte length of a single chat message. Anything longer is
+/// dropped server-side with a warn log. Prevents a client from broadcasting
+/// multi-MB strings and fanning out to every participant.
+const MAX_CHAT_BYTES: usize = 4 * 1024;
+
+/// Minimum interval between `CursorMove` broadcasts from a single connection.
+/// ~30 Hz is smooth enough for collaborative cursors and throttles flood
+/// attempts against the collab broadcast channel.
+const CURSOR_MIN_INTERVAL: Duration = Duration::from_millis(33);
+
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     Path(session_id): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, session_id, state))
+    ws.max_frame_size(MAX_WS_FRAME_BYTES)
+        .max_message_size(MAX_WS_FRAME_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, session_id, state))
 }
 
 async fn send_error(
@@ -257,6 +276,10 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         role.can_input() && !(input_mode == InputMode::Serialized && role != Role::Owner)
     };
 
+    // Track the last accepted CursorMove timestamp per connection so we can
+    // drop floods without spinning up a timer task.
+    let mut last_cursor_at: Option<Instant> = None;
+
     loop {
         let current_role = *role_watch_rx.borrow();
         tokio::select! {
@@ -272,17 +295,34 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                                     }
                                 }
                                 ClientMessage::ChatMessage { text } => {
-                                    let chat_msg = ServerMessage::PeerChat {
-                                        user_id,
-                                        name: user_name.clone(),
-                                        text,
-                                        ts: Utc::now().to_rfc3339(),
-                                    };
-                                    hub.broadcast_collab(&session_id, chat_msg).await;
+                                    if text.len() > MAX_CHAT_BYTES {
+                                        tracing::warn!(
+                                            session = %session_id,
+                                            user = %user_name,
+                                            len = text.len(),
+                                            max = MAX_CHAT_BYTES,
+                                            "dropped oversized chat message"
+                                        );
+                                    } else {
+                                        let chat_msg = ServerMessage::PeerChat {
+                                            user_id,
+                                            name: user_name.clone(),
+                                            text,
+                                            ts: Utc::now().to_rfc3339(),
+                                        };
+                                        hub.broadcast_collab(&session_id, chat_msg).await;
+                                    }
                                 }
                                 ClientMessage::CursorMove { x, y } => {
-                                    let cursor_msg = ServerMessage::PeerCursor { user_id, x, y };
-                                    hub.broadcast_collab(&session_id, cursor_msg).await;
+                                    let now = Instant::now();
+                                    let ok = last_cursor_at
+                                        .map(|prev| now.duration_since(prev) >= CURSOR_MIN_INTERVAL)
+                                        .unwrap_or(true);
+                                    if ok {
+                                        last_cursor_at = Some(now);
+                                        let cursor_msg = ServerMessage::PeerCursor { user_id, x, y };
+                                        hub.broadcast_collab(&session_id, cursor_msg).await;
+                                    }
                                 }
                                 ClientMessage::SessionJoin { .. } => {
                                     // Ignore duplicate join messages
