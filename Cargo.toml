@@ -65,6 +65,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # Futures
 futures = "0.3"
 
+# Zero-copy byte buffers (shared with axum/hyper via same version)
+bytes = "1"
+
 # Testing
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.26"

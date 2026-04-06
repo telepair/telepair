@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use uuid::Uuid;
 
@@ -37,8 +38,9 @@ pub struct ConnectedParticipant {
 struct LiveSession {
     /// Send terminal input (or resize) to PTY via command channel
     cmd_tx: mpsc::Sender<PtyCommand>,
-    /// Subscribe to PTY output
-    output_tx: broadcast::Sender<Vec<u8>>,
+    /// Subscribe to PTY output. Uses `Bytes` so broadcast cloning is a cheap
+    /// refcount bump per subscriber instead of a per-chunk `Vec<u8>` copy.
+    output_tx: broadcast::Sender<Bytes>,
     /// Broadcast collaboration messages (PeerJoined, PeerLeft, PermUpdate, etc.)
     collab_tx: broadcast::Sender<ServerMessage>,
     /// Signal to all connected WS handlers that this session is being force-stopped
@@ -76,7 +78,7 @@ impl SessionHub {
     ) -> Result<
         (
             mpsc::Sender<PtyCommand>,
-            broadcast::Receiver<Vec<u8>>,
+            broadcast::Receiver<Bytes>,
             broadcast::Receiver<ServerMessage>,
             broadcast::Receiver<()>,
         ),
@@ -101,7 +103,7 @@ impl SessionHub {
             .map_err(|e| e.to_string())?;
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<PtyCommand>(256);
-        let (output_tx, output_rx) = broadcast::channel::<Vec<u8>>(256);
+        let (output_tx, output_rx) = broadcast::channel::<Bytes>(256);
         let (collab_tx, collab_rx) = broadcast::channel::<ServerMessage>(64);
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
@@ -139,7 +141,9 @@ impl SessionHub {
 
                 match action {
                     Action::Output(Some(bytes)) => {
-                        let _ = output_tx_clone.send(bytes);
+                        // Wrap once into refcounted Bytes; every subscriber
+                        // clone is an Arc bump, not a byte copy.
+                        let _ = output_tx_clone.send(Bytes::from(bytes));
                     }
                     Action::Output(None) => {
                         tracing::info!(session = %session_id_owned, "PTY process exited");
@@ -191,37 +195,44 @@ impl SessionHub {
     }
 
     /// Add a participant to a session. Auto-broadcasts `PeerJoined` to all subscribers.
-    /// Returns the assigned color.
+    /// Returns `true` when the session exists and the participant was registered.
+    /// The assigned color is embedded in the broadcast and in the participant
+    /// snapshot returned by `get_participants`; callers should read it from
+    /// there instead of here.
     pub async fn add_participant(
         &self,
         session_id: &str,
         user_id: Uuid,
         name: String,
         role: Role,
-    ) -> Option<String> {
+    ) -> bool {
         let mut sessions = self.sessions.write().await;
-        let live = sessions.get_mut(session_id)?;
+        let Some(live) = sessions.get_mut(session_id) else {
+            return false;
+        };
 
         let color = assign_color(live.color_counter);
         live.color_counter += 1;
 
-        let participant = ConnectedParticipant {
+        live.participants.insert(
             user_id,
-            name: name.clone(),
-            role,
-            color: color.clone(),
-        };
-        live.participants.insert(user_id, participant);
+            ConnectedParticipant {
+                user_id,
+                name: name.clone(),
+                role,
+                color: color.clone(),
+            },
+        );
 
         // Broadcast PeerJoined to all collab subscribers
         let _ = live.collab_tx.send(ServerMessage::PeerJoined {
             user_id,
             name,
             role,
-            color: color.clone(),
+            color,
         });
 
-        Some(color)
+        true
     }
 
     /// Remove a participant from a session. Auto-broadcasts `PeerLeft` to all subscribers.
