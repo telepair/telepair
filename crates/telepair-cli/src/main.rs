@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use telepair_agent::virtual_target::TargetEngine;
@@ -12,6 +12,9 @@ use telepair_gateway::state::AppState;
 #[derive(Parser)]
 #[command(name = "telepair", version, about = "Web terminal collaboration tool")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Enable the agent role (PTY management, virtual targets)
     #[arg(long, hide = true)]
     agent: bool,
@@ -49,13 +52,66 @@ struct Cli {
     allowed_origins: Vec<String>,
 }
 
+#[derive(Subcommand)]
+enum Command {
+    /// Admin operations (token recovery, user management)
+    Admin {
+        #[command(subcommand)]
+        cmd: AdminCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminCommand {
+    /// Print the saved admin token from ~/.telepair/admin_token
+    ShowToken,
+}
+
+fn data_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".telepair")
+}
+
+fn run_admin_command(cmd: AdminCommand) -> anyhow::Result<()> {
+    match cmd {
+        AdminCommand::ShowToken => {
+            let token_file = data_dir().join("admin_token");
+            if !token_file.exists() {
+                anyhow::bail!(
+                    "admin token file not found at {}\n\
+                     The token is written once at first startup. If it was deleted, \
+                     you'll need to remove ~/.telepair/telepair.db and let telepair \
+                     re-create the admin user on next startup.",
+                    token_file.display()
+                );
+            }
+            let token = std::fs::read_to_string(&token_file)?;
+            let token = token.trim();
+            if token.is_empty() {
+                anyhow::bail!("admin token file is empty: {}", token_file.display());
+            }
+            println!("{token}");
+            Ok(())
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    // Subcommands short-circuit the server startup path so we don't spin up
+    // tracing / sqlite / axum just to print a single value.
+    if let Some(command) = cli.command {
+        return match command {
+            Command::Admin { cmd } => run_admin_command(cmd),
+        };
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
-
-    let cli = Cli::parse();
 
     // No flags = all roles enabled
     let (agent, control, gateway) = if !cli.agent && !cli.control && !cli.gateway {
@@ -72,9 +128,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Ensure data directory exists
-    let data_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".telepair");
+    let data_dir = data_dir();
     std::fs::create_dir_all(&data_dir)?;
 
     // Initialize storage (needed by control)
