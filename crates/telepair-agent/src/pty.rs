@@ -61,10 +61,7 @@ impl PtyManager {
         // Drop the slave side — we only use master
         drop(pair.slave);
 
-        let mut writer = pair
-            .master
-            .take_writer()
-            .map_err(std::io::Error::other)?;
+        let mut writer = pair.master.take_writer().map_err(std::io::Error::other)?;
 
         let mut reader = pair
             .master

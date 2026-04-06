@@ -37,7 +37,12 @@ impl AppState {
     }
 
     pub async fn create_test_user(&self, name: &str) -> String {
-        let (_, token) = self.sessions.storage().create_user(name, false).await.unwrap();
+        let (_, token) = self
+            .sessions
+            .storage()
+            .create_user(name, false)
+            .await
+            .unwrap();
         token
     }
 }

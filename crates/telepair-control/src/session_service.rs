@@ -25,8 +25,13 @@ impl SessionService {
         target_name: &str,
         input_mode: InputMode,
     ) -> Result<Session> {
-        let session = self.storage.create_session(owner_id, target_name, input_mode).await?;
-        self.storage.upsert_participant(&session.id, owner_id, Role::Owner).await?;
+        let session = self
+            .storage
+            .create_session(owner_id, target_name, input_mode)
+            .await?;
+        self.storage
+            .upsert_participant(&session.id, owner_id, Role::Owner)
+            .await?;
         Ok(session)
     }
 
