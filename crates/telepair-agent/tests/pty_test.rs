@@ -34,7 +34,7 @@ async fn spawn_shell_and_read_output() {
     .expect("timed out waiting for output");
 
     assert!(output.contains("HELLO_TELEPAIR"));
-    pty.shutdown();
+    // Drop runs the child reap — no explicit shutdown API.
 }
 
 #[tokio::test]
@@ -68,5 +68,4 @@ async fn resize_pty() {
     let mut pty = spawn_test_shell(80, 24);
     // Should not panic
     pty.resize(120, 40).unwrap();
-    pty.shutdown();
 }
