@@ -1,6 +1,7 @@
 // web/src/components/Banner.tsx
 import { Show } from 'solid-js';
 import type { JSX } from 'solid-js';
+import { useI18n } from '../i18n';
 
 export type BannerVariant = 'info' | 'success' | 'warning' | 'error';
 
@@ -17,6 +18,7 @@ export default function Banner(props: {
   role?: 'alert' | 'status';
   children: JSX.Element;
 }) {
+  const { t } = useI18n();
   const variant = () => props.variant ?? 'error';
   return (
     <div class="banner" data-variant={variant()} role={props.role ?? 'alert'}>
@@ -32,7 +34,7 @@ export default function Banner(props: {
         <button
           class="banner-close"
           type="button"
-          aria-label="Dismiss notification"
+          aria-label={t('common.dismiss')}
           onClick={props.onDismiss}
         >
           ×

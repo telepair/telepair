@@ -2,13 +2,15 @@
 import { For, Show } from 'solid-js';
 import { toast } from '../stores/toast';
 import type { Toast as ToastData } from '../stores/toast';
+import { useI18n } from '../i18n';
 
 export default function ToastContainer() {
+  const { t } = useI18n();
   return (
-    <div class="toast-container" role="region" aria-label="Notifications">
+    <div class="toast-container" role="region" aria-label={t('toast.region_label')}>
       <ol aria-live="polite" aria-atomic="false">
         <For each={toast.list()}>
-          {(t) => <ToastItem toast={t} />}
+          {(item) => <ToastItem toast={item} />}
         </For>
       </ol>
       <style>{`
@@ -91,6 +93,7 @@ export default function ToastContainer() {
 }
 
 function ToastItem(props: { toast: ToastData }) {
+  const { t } = useI18n();
   const handleAction = () => {
     props.toast.action?.onClick();
     toast.dismiss(props.toast.id);
@@ -109,7 +112,7 @@ function ToastItem(props: { toast: ToastData }) {
         <button
           class="toast-close"
           type="button"
-          aria-label="Dismiss notification"
+          aria-label={t('common.dismiss')}
           onClick={() => toast.dismiss(props.toast.id)}
         >
           ×

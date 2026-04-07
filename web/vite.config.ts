@@ -6,6 +6,11 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     exclude: ['e2e/**', 'node_modules/**'],
+    // Locks the i18n locale to `en` before any test imports the
+    // provider. See `src/test-setup.ts` for the rationale — without
+    // this, a developer with `navigator.language === 'zh-CN'` would
+    // see every UI assertion fail against Chinese strings.
+    setupFiles: ['./src/test-setup.ts'],
   },
   server: {
     port: 5173,

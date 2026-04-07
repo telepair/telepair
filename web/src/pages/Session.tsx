@@ -13,11 +13,19 @@ import ParticipantList from '../components/ParticipantList';
 import ChatPanel from '../components/ChatPanel';
 import InviteDialog from '../components/InviteDialog';
 import Banner from '../components/Banner';
+import LocaleSwitcher from '../components/LocaleSwitcher';
 import { toast } from '../stores/toast';
+import {
+  renderTemplate,
+  roleLabel,
+  useI18n,
+  type TranslationKey,
+} from '../i18n';
 
 const MAX_CHAT_HISTORY = 500;
 
 export default function SessionPage() {
+  const { t } = useI18n();
   const params = useParams<{ id: string }>();
   const navigate = useNavigate();
 
@@ -29,8 +37,35 @@ export default function SessionPage() {
   // safer preclusion: if SessionState ever fails to arrive, we'd rather
   // block input than silently spam a dead channel.
   const [inputMode, setInputMode] = createSignal<InputMode>('serialized');
-  const [errorMsg, setErrorMsg] = createSignal('');
-  const [endedReason, setEndedReason] = createSignal<string | null>(null);
+  // Banner state is split into two channels so locale switches re-render
+  // the text live (mirrors the `auth.errorKey` pattern):
+  //   - `*Key` holds an i18n key for messages we ship strings for, so the
+  //     translator runs at render time and follows `setLocale`.
+  //   - `errorText` holds the raw `${code}: ${message}` fallback for
+  //     server errors we don't have copy for; that text is locale-neutral
+  //     by design (server returns English) and shown verbatim.
+  // Stashing the already-translated string would cache the language at
+  // the moment of failure and produce a mixed-language UI after a
+  // language toggle.
+  const [errorKey, setErrorKey] = createSignal<TranslationKey | null>(null);
+  const [errorText, setErrorText] = createSignal('');
+  const [endedReasonKey, setEndedReasonKey] = createSignal<TranslationKey | null>(
+    null,
+  );
+
+  // Reactive view: returns the resolved banner string for the current
+  // locale, or empty when no error is set. Reads `errorKey()` /
+  // `errorText()` so Solid auto-tracks both inputs and the locale-bound
+  // `t()`.
+  const errorMessage = (): string => {
+    const k = errorKey();
+    if (k) return t(k);
+    return errorText();
+  };
+  const dismissError = () => {
+    setErrorKey(null);
+    setErrorText('');
+  };
   const [participants, setParticipants] = createSignal<ParticipantInfo[]>([]);
   const [chatMessages, setChatMessages] = createSignal<ChatMessage[]>([]);
   const [showInvite, setShowInvite] = createSignal(false);
@@ -89,19 +124,19 @@ export default function SessionPage() {
   const handleInputDenied = (reason: string) => {
     switch (reason) {
       case InputDeniedReason.VIEWER:
-        toast.info('View-only session — your keystrokes are not sent.', {
+        toast.info(t('session.toast_input_denied_viewer'), {
           id: INPUT_DENIED_TOAST_ID,
           duration: 5000,
         });
         break;
       case InputDeniedReason.SERIALIZED_NOT_OWNER:
-        toast.info('Solo mode — only the session owner can type here.', {
+        toast.info(t('session.toast_input_denied_solo'), {
           id: INPUT_DENIED_TOAST_ID,
           duration: 5000,
         });
         break;
       default:
-        toast.info('Typing is not allowed in this session.', {
+        toast.info(t('session.toast_input_denied_generic'), {
           id: INPUT_DENIED_TOAST_ID,
           duration: 5000,
         });
@@ -111,38 +146,42 @@ export default function SessionPage() {
   const handleServerError = (code: string, message: string) => {
     switch (code) {
       case ErrorCode.SESSION_CLOSED:
-        setEndedReason('This session has ended.');
-        toast.info('Session has ended', { duration: 4000 });
+        setEndedReasonKey('session.banner_ended');
+        toast.info(t('session.toast_session_ended'), { duration: 4000 });
         break;
       case ErrorCode.SESSION_NOT_FOUND:
-        setEndedReason('Session not found — it may have been deleted.');
+        setEndedReasonKey('session.banner_not_found');
         break;
       case ErrorCode.NOT_PARTICIPANT:
-        setErrorMsg('You are not a participant of this session.');
+        setErrorKey('session.banner_not_participant');
+        setErrorText('');
         break;
       case ErrorCode.AUTH_FAILED:
       case ErrorCode.AUTH_TIMEOUT:
         // Token is invalid/expired — clear auth state so AuthGuard redirects
         // to /login. A banner would be invisible since this page is about to
         // unmount, so surface the reason via a global toast instead.
-        toast.error('Authentication failed. Please log in again.');
+        toast.error(t('session.toast_auth_failed'));
         auth.logout();
         break;
       default:
-        setErrorMsg(`${code}: ${message}`);
+        // Server-side error code + raw message; the code is locale-neutral
+        // and the message comes from the server in English by design.
+        setErrorKey(null);
+        setErrorText(`${code}: ${message}`);
     }
   };
 
   const handleStatus = (s: ConnectionStatus) => {
     if (s === 'connected') {
       if (hasConnectedOnce) {
-        toast.success('Reconnected', { id: 'reconnect' });
+        toast.success(t('session.toast_reconnected'), { id: 'reconnect' });
       }
       hasConnectedOnce = true;
     } else if (s === 'giveup') {
-      toast.error('Could not reconnect to session', {
+      toast.error(t('session.toast_giveup'), {
         id: 'reconnect',
-        action: { label: 'Retry', onClick: () => socket?.reconnectNow() },
+        action: { label: t('session.toast_giveup_retry'), onClick: () => socket?.reconnectNow() },
       });
     }
     setStatus(s);
@@ -180,7 +219,7 @@ export default function SessionPage() {
   };
 
   const handleManualReconnect = () => {
-    toast.info('Reconnecting…', { id: 'reconnect', duration: 2000 });
+    toast.info(t('session.toast_reconnecting'), { id: 'reconnect', duration: 2000 });
     socket?.reconnectNow();
   };
 
@@ -222,58 +261,70 @@ export default function SessionPage() {
     <div class="session-page">
       <header class="session-topbar">
         <button class="back-btn" onClick={goHomeOrLogout}>
-          {role() === 'owner' ? '← Back' : 'Log out'}
+          {role() === 'owner' ? t('common.back') : t('common.logout')}
         </button>
-        <span class="session-label">Session: <code>{params.id}</code></span>
-        <span class="role-badge" data-role={role()}>{role()}</span>
+        <span class="session-label">
+          {/* Use `renderTemplate` so the session id stays inside a real
+              <code> element (preserving the monospace styling) instead
+              of being interpolated as plain text. Calling `t(...)`
+              without any params leaves the `{{ id }}` slot literal,
+              which is exactly what `renderTemplate` then splits on. */}
+          {renderTemplate(t('session.label'), {
+            id: <code>{params.id}</code>,
+          })}
+        </span>
+        <span class="role-badge" data-role={role()}>{roleLabel(t, role())}</span>
         <span class="status-dot" data-status={status()} />
         <div class="topbar-actions">
+          <LocaleSwitcher variant="topbar" />
           <Show when={role() === 'owner'}>
-            <button class="action-btn" onClick={() => setShowInvite(true)}>Invite</button>
+            <button class="action-btn" onClick={() => setShowInvite(true)}>{t('session.invite')}</button>
           </Show>
           <button class="action-btn" onClick={() => setSidebarOpen(!sidebarOpen())}>
-            {sidebarOpen() ? 'Hide' : 'Show'} Sidebar
+            {sidebarOpen() ? t('session.sidebar_hide') : t('session.sidebar_show')}
           </button>
         </div>
       </header>
 
-      <Show when={errorMsg()}>
-        <Banner variant="error" onDismiss={() => setErrorMsg('')}>
-          {errorMsg()}
+      <Show when={errorMessage()}>
+        <Banner variant="error" onDismiss={dismissError}>
+          {errorMessage()}
         </Banner>
       </Show>
 
-      <Show when={endedReason()}>
-        <Banner
-          variant="info"
-          role="status"
-          action={{
-            label: role() === 'owner' ? 'Back to Dashboard' : 'Log out',
-            onClick: goHomeOrLogout,
-          }}
-        >
-          {endedReason()}
-        </Banner>
+      <Show when={endedReasonKey()}>
+        {(key) => (
+          <Banner
+            variant="info"
+            role="status"
+            action={{
+              label: role() === 'owner' ? t('session.banner_back_to_dashboard') : t('common.logout'),
+              onClick: goHomeOrLogout,
+            }}
+          >
+            {t(key())}
+          </Banner>
+        )}
       </Show>
 
-      <Show when={!endedReason() && status() === 'giveup'}>
+      <Show when={!endedReasonKey() && status() === 'giveup'}>
         <Banner
           variant="error"
           role="status"
-          action={{ label: 'Reconnect', onClick: handleManualReconnect }}
+          action={{ label: t('session.banner_reconnect_action'), onClick: handleManualReconnect }}
         >
-          Connection lost. Automatic retry gave up.
+          {t('session.banner_connection_lost')}
         </Banner>
       </Show>
 
-      <Show when={!endedReason() && status() !== 'giveup' && reconnectInfo()}>
+      <Show when={!endedReasonKey() && status() !== 'giveup' && reconnectInfo()}>
         <Banner variant="warning" role="status">
           <span>
-            Connection lost — retrying{' '}
-            <strong>
-              {reconnectInfo()?.attempt}/{reconnectInfo()?.maxAttempts}
-            </strong>{' '}
-            (next in {Math.round((reconnectInfo()?.nextDelayMs ?? 0) / 1000)}s)
+            {t('session.banner_reconnecting', {
+              attempt: String(reconnectInfo()?.attempt ?? 0),
+              max: String(reconnectInfo()?.maxAttempts ?? 0),
+              seconds: String(Math.round((reconnectInfo()?.nextDelayMs ?? 0) / 1000)),
+            })}
           </span>
         </Banner>
       </Show>

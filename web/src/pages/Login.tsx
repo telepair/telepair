@@ -2,8 +2,11 @@
 import { createSignal, Show } from 'solid-js';
 import { useNavigate } from '@solidjs/router';
 import { auth } from '../stores/auth';
+import { useI18n, renderTemplate } from '../i18n';
+import LocaleSwitcher from '../components/LocaleSwitcher';
 
 export default function Login() {
+  const { t } = useI18n();
   const navigate = useNavigate();
   const [input, setInput] = createSignal('');
   const [showHelp, setShowHelp] = createSignal(false);
@@ -20,25 +23,25 @@ export default function Login() {
     <div class="login-page">
       <div class="login-card">
         <h1>telepair</h1>
-        <p class="subtitle">Web terminal collaboration</p>
+        <p class="subtitle">{t('login.subtitle')}</p>
 
         <form onSubmit={handleSubmit}>
-          <label for="token">API Token</label>
+          <label for="token">{t('login.token_label')}</label>
           <input
             id="token"
             type="password"
-            placeholder="Paste your token here"
+            placeholder={t('login.token_placeholder')}
             value={input()}
             onInput={(e) => setInput(e.currentTarget.value)}
             autofocus
           />
 
-          <Show when={auth.error()}>
-            <p class="error-msg">{auth.error()}</p>
+          <Show when={auth.errorKey()}>
+            {(key) => <p class="error-msg">{t(key())}</p>}
           </Show>
 
           <button type="submit" class="primary" disabled={auth.validating() || !input()}>
-            {auth.validating() ? 'Validating...' : 'Connect'}
+            {auth.validating() ? t('login.validating') : t('login.connect')}
           </button>
         </form>
 
@@ -48,27 +51,29 @@ export default function Login() {
           onClick={() => setShowHelp(!showHelp())}
           aria-expanded={showHelp()}
         >
-          {showHelp() ? 'Hide help' : "Don't have a token?"}
+          {showHelp() ? t('login.help_hide') : t('login.help_show')}
         </button>
 
         <Show when={showHelp()}>
           <div class="help-panel">
-            <p>
-              <strong>First run?</strong> telepair prints the admin token to the
-              server console on startup and saves it to{' '}
-              <code>~/.telepair/admin_token</code>.
-            </p>
-            <p>
-              <strong>Lost it?</strong> Run{' '}
-              <code>telepair admin show-token</code> on the server to print it
-              again.
-            </p>
-            <p>
-              <strong>Joining a session?</strong> Just open your invite link —
-              no token needed. You'll be signed in automatically as a guest.
-            </p>
+            {/* The help text mixes translated copy with literal <code>
+                tags for the on-disk path and CLI command. Splitting on
+                `{{ path }}` / `{{ cmd }}` lets the translation control
+                the surrounding sentence while keeping the technical
+                tokens untranslated and visually distinct. */}
+            <p>{renderTemplate(
+              t('login.help_first_run'),
+              { path: <code>~/.telepair/admin_token</code> },
+            )}</p>
+            <p>{renderTemplate(
+              t('login.help_lost'),
+              { cmd: <code>telepair admin show-token</code> },
+            )}</p>
+            <p>{t('login.help_joining')}</p>
           </div>
         </Show>
+
+        <LocaleSwitcher variant="card" />
       </div>
 
       <style>{`

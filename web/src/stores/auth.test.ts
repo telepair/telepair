@@ -94,7 +94,7 @@ describe('auth.setToken', () => {
     mockFetch.mockResolvedValueOnce(new Response('Unauthorized', { status: 401 }));
     auth.validateToken('bad').then(() => {
       auth.setToken('new');
-      expect(auth.error()).toBe('');
+      expect(auth.errorKey()).toBeNull();
     });
   });
 });
@@ -109,24 +109,24 @@ describe('auth.validateToken', () => {
     // identity without re-pasting the token.
     expect(tabStore[STORAGE_KEY]).toBe('good-token');
     expect(persistStore[STORAGE_KEY]).toBe('good-token');
-    expect(auth.error()).toBe('');
+    expect(auth.errorKey()).toBeNull();
     expect(auth.validating()).toBe(false);
   });
 
-  it('returns false and sets "Invalid token" on 401', async () => {
+  it('returns false and sets the invalid-token error key on 401', async () => {
     mockFetch.mockResolvedValueOnce(new Response('Unauthorized', { status: 401 }));
     const result = await auth.validateToken('bad-token');
     expect(result).toBe(false);
     expect(auth.token()).toBe('');
-    expect(auth.error()).toBe('Invalid token');
+    expect(auth.errorKey()).toBe('auth.error_invalid_token');
     expect(auth.validating()).toBe(false);
   });
 
-  it('returns false with "Connection failed" on network error', async () => {
+  it('returns false with the connection-failed error key on network error', async () => {
     mockFetch.mockRejectedValueOnce(new Error('Network error'));
     const result = await auth.validateToken('any-token');
     expect(result).toBe(false);
-    expect(auth.error()).toBe('Connection failed');
+    expect(auth.errorKey()).toBe('auth.error_connection_failed');
   });
 
   it('removes token from both tiers on failure', async () => {

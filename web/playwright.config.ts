@@ -10,6 +10,10 @@ export default defineConfig({
     baseURL: 'http://localhost:7700',
     screenshot: 'only-on-failure',
     trace: 'retain-on-failure',
+    // Pin every browser context to English so the i18n provider's
+    // navigator.language detector resolves to 'en' regardless of the
+    // host machine's locale. All existing assertions use English copy.
+    locale: 'en-US',
   },
   webServer: {
     command: 'cargo run -- --web-dir web/dist',
