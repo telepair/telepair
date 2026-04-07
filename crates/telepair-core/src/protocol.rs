@@ -20,6 +20,17 @@ pub mod error_codes {
     pub const PTY_ERROR: &str = "PTY_ERROR";
 }
 
+/// Stable `reason` codes carried by `ServerMessage::InputDenied`. The
+/// frontend switches on these to render localized guidance; keep in sync
+/// with `web/src/lib/protocol.ts::InputDeniedReason`.
+pub mod input_denied {
+    /// Connection's role is `Viewer` — read-only by design.
+    pub const VIEWER: &str = "VIEWER";
+    /// Session is in `Serialized` mode and caller is not the owner.
+    /// Operators can still resize and chat; only keystrokes are dropped.
+    pub const SERIALIZED_NOT_OWNER: &str = "SERIALIZED_NOT_OWNER";
+}
+
 // --- Client -> Server ---
 //
 // Terminal input (`TermInput`) is NOT a JSON message — it is sent as a binary
@@ -80,6 +91,15 @@ pub enum ServerMessage {
         name: String,
         text: String,
         ts: String,
+    },
+    /// Sent **only to the originating connection** (never broadcast) the
+    /// first time a binary input frame is rejected for this session. The
+    /// frontend uses this to surface a toast instead of leaving the user
+    /// wondering why typing silently does nothing — the previous
+    /// behavior that cost us finding #2/#4 in the QA sweep.
+    InputDenied {
+        /// Machine-readable reason code — see `input_denied` module.
+        reason: String,
     },
     Error {
         code: String,

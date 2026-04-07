@@ -1,5 +1,6 @@
 /target
 .superpowers/
+.playwright-mcp/
 *.swp
 *.swo
 .DS_Store

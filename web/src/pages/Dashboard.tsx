@@ -3,25 +3,51 @@ import { createSignal, onMount, Show, For } from 'solid-js';
 import { useNavigate } from '@solidjs/router';
 import { auth } from '../stores/auth';
 import { sessionStore } from '../stores/session';
+import type { InputMode, TargetInfo } from '../lib/protocol';
 import Banner from '../components/Banner';
 import { TargetCardSkeleton } from '../components/Skeleton';
+import CreateSessionDialog from '../components/CreateSessionDialog';
 
 export default function Dashboard() {
   const navigate = useNavigate();
   const [launchError, setLaunchError] = createSignal('');
+  // Remember the last mode the user picked so the next dialog opens on
+  // their preferred default instead of forcing them to re-toggle every
+  // time. Persisting across reloads would be nice but isn't worth a
+  // dedicated storage key — an in-memory signal is good enough.
+  const [lastMode, setLastMode] = createSignal<InputMode>('multiplexed');
+  const [pendingTarget, setPendingTarget] = createSignal<TargetInfo | null>(null);
+  const [launching, setLaunching] = createSignal(false);
 
   onMount(() => {
     sessionStore.refresh();
   });
 
-  const handleLaunch = async (targetName: string) => {
+  const handleCardClick = (target: TargetInfo) => {
     setLaunchError('');
+    setPendingTarget(target);
+  };
+
+  const handleCancelLaunch = () => {
+    if (launching()) return;
+    setPendingTarget(null);
+  };
+
+  const handleConfirmLaunch = async (mode: InputMode) => {
+    const target = pendingTarget();
+    if (!target || launching()) return;
+    setLaunching(true);
+    setLastMode(mode);
     try {
-      const session = await sessionStore.createSession(targetName);
+      const session = await sessionStore.createSession(target.name, mode);
+      setPendingTarget(null);
       navigate(`/session/${session.id}`);
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Failed to create session';
       setLaunchError(msg);
+      setPendingTarget(null);
+    } finally {
+      setLaunching(false);
     }
   };
 
@@ -56,7 +82,10 @@ export default function Dashboard() {
 
       <main class="content">
         <section>
-          <h2>Targets</h2>
+          <div class="section-header">
+            <h2>Targets</h2>
+            <p class="section-hint">Click a target to configure mode and launch.</p>
+          </div>
           <Show
             when={!sessionStore.loading()}
             fallback={
@@ -84,7 +113,11 @@ export default function Dashboard() {
               <div class="target-grid">
                 <For each={sessionStore.targets()}>
                   {(target) => (
-                    <div class="target-card" onClick={() => handleLaunch(target.name)}>
+                    <button
+                      type="button"
+                      class="target-card"
+                      onClick={() => handleCardClick(target)}
+                    >
                       <div class="target-name">{target.display}</div>
                       <div class="target-id">{target.name}</div>
                       <Show when={target.tags.length > 0}>
@@ -94,7 +127,7 @@ export default function Dashboard() {
                           </For>
                         </div>
                       </Show>
-                    </div>
+                    </button>
                   )}
                 </For>
               </div>
@@ -120,6 +153,14 @@ export default function Dashboard() {
         </section>
       </main>
 
+      <CreateSessionDialog
+        target={pendingTarget()}
+        defaultMode={lastMode()}
+        busy={launching()}
+        onCancel={handleCancelLaunch}
+        onLaunch={handleConfirmLaunch}
+      />
+
       <style>{`
         .dashboard { min-height: 100vh; }
         .topbar {
@@ -137,8 +178,19 @@ export default function Dashboard() {
           cursor: default;
         }
         .content { padding: 24px; max-width: 960px; margin: 0 auto; }
-        .content h2 { font-size: 16px; font-weight: 600; margin-bottom: 12px; color: var(--text-secondary); }
+        .content h2 { font-size: 16px; font-weight: 600; color: var(--text-secondary); }
         .content section { margin-bottom: 32px; }
+        .section-header {
+          display: flex;
+          align-items: baseline;
+          justify-content: space-between;
+          margin-bottom: 12px;
+          gap: 16px;
+        }
+        .section-hint {
+          font-size: 12px;
+          color: var(--text-secondary);
+        }
         .muted { color: var(--text-secondary); font-size: 14px; }
         .empty-state {
           border: 1px dashed var(--border);
@@ -176,8 +228,12 @@ export default function Dashboard() {
           padding: 16px;
           cursor: pointer;
           transition: border-color 0.15s;
+          text-align: left;
+          font: inherit;
+          color: inherit;
         }
         .target-card:hover { border-color: var(--accent); }
+        .target-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
         .target-name { font-weight: 600; margin-bottom: 4px; }
         .target-id { font-family: var(--font-mono); font-size: 12px; color: var(--text-secondary); }
         .tags { margin-top: 8px; display: flex; gap: 4px; flex-wrap: wrap; }

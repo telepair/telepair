@@ -21,10 +21,7 @@ async fn cors_allow_any_is_wildcard() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let acao = resp.headers().get("access-control-allow-origin").unwrap();
-    assert_eq!(
-        acao, "*",
-        "CorsMode::AllowAny must advertise wildcard ACAO"
-    );
+    assert_eq!(acao, "*", "CorsMode::AllowAny must advertise wildcard ACAO");
 }
 
 #[tokio::test]

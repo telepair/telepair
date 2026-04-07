@@ -40,9 +40,15 @@ test.describe('Invite flow (anonymous guest)', () => {
     const guestCtx = await browser.newContext();
     const guestPage = await guestCtx.newPage();
 
-    // Sanity: the guest really starts with nothing.
+    // Sanity: the guest really starts with nothing. Finding #10 fix
+    // moved per-tab identity into sessionStorage (with localStorage as
+    // a persistent admin fallback), so both tiers must be cleared to
+    // simulate a genuinely brand-new visitor.
     await guestPage.goto('/login');
-    await guestPage.evaluate(() => localStorage.clear());
+    await guestPage.evaluate(() => {
+      localStorage.clear();
+      sessionStorage.clear();
+    });
 
     // Extract just the path+token part so Playwright stays on the
     // test baseURL instead of hitting whatever host the backend
@@ -62,9 +68,11 @@ test.describe('Invite flow (anonymous guest)', () => {
     await waitForTerminal(guestPage);
 
     // And the backend must have handed us a token — otherwise a page
-    // reload would snap us back to /login.
+    // reload would snap us back to /login. Guest tokens land in
+    // sessionStorage (per-tab identity), not localStorage — that's
+    // the whole point of finding #10's fix.
     const storedToken = await guestPage.evaluate(() =>
-      localStorage.getItem('telepair_token'),
+      sessionStorage.getItem('telepair_token'),
     );
     expect(storedToken).toBeTruthy();
     expect(storedToken!.length).toBeGreaterThan(16);
@@ -86,7 +94,10 @@ test.describe('Invite flow (anonymous guest)', () => {
     const page = await ctx.newPage();
 
     await page.goto('/login');
-    await page.evaluate(() => localStorage.clear());
+    await page.evaluate(() => {
+      localStorage.clear();
+      sessionStorage.clear();
+    });
 
     await page.goto('/join/definitely-not-a-real-token');
 

@@ -1,7 +1,7 @@
 // web/src/stores/session.ts
 import { createSignal } from 'solid-js';
 import { api } from '../lib/api';
-import type { TargetInfo, Session } from '../lib/protocol';
+import type { TargetInfo, Session, InputMode } from '../lib/protocol';
 
 const [targets, setTargets] = createSignal<TargetInfo[]>([]);
 const [sessions, setSessions] = createSignal<Session[]>([]);
@@ -35,8 +35,8 @@ async function fetchSessions() {
   }
 }
 
-async function createSession(targetName: string): Promise<Session> {
-  const session = await api.createSession(targetName);
+async function createSession(targetName: string, inputMode?: InputMode): Promise<Session> {
+  const session = await api.createSession(targetName, inputMode);
   setSessions((prev) => [...prev, session]);
   return session;
 }

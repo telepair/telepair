@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
@@ -17,6 +17,51 @@ use telepair_core::storage::{SqliteStorage, Storage};
 const COLORS: &[&str] = &[
     "#58a6ff", "#3fb950", "#d29922", "#f85149", "#bc8cff", "#39c5cf", "#ffa198", "#56d364",
 ];
+
+/// Maximum number of bytes retained in a session's scrollback ring. A late
+/// joiner gets this much recent PTY output replayed before live broadcasts
+/// start streaming, which is enough for a fresh `ls` + a prompt banner but
+/// small enough that a `yes` loop or `cat` of a huge file won't pin per-
+/// session memory. Raise this if users complain that the replay feels too
+/// short; lower it if long-lived sessions start ballooning RSS.
+const SCROLLBACK_CAP_BYTES: usize = 64 * 1024;
+
+/// A bounded ring buffer of PTY output chunks used for scrollback replay.
+///
+/// We keep whole `Bytes` chunks rather than copying into one contiguous
+/// buffer so `push` and `snapshot` are both refcount-cheap. When the total
+/// size crosses `SCROLLBACK_CAP_BYTES` the oldest chunks are dropped; this
+/// can produce a slightly truncated first line on replay but never truncates
+/// in the middle of a keystroke-sized chunk, which is what matters for
+/// terminal escape-sequence coherence.
+struct Scrollback {
+    chunks: VecDeque<Bytes>,
+    total: usize,
+}
+
+impl Scrollback {
+    fn new() -> Self {
+        Self {
+            chunks: VecDeque::new(),
+            total: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: Bytes) {
+        self.total = self.total.saturating_add(bytes.len());
+        self.chunks.push_back(bytes);
+        while self.total > SCROLLBACK_CAP_BYTES {
+            match self.chunks.pop_front() {
+                Some(front) => self.total = self.total.saturating_sub(front.len()),
+                None => break,
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Vec<Bytes> {
+        self.chunks.iter().cloned().collect()
+    }
+}
 
 fn assign_color(index: usize) -> String {
     COLORS[index % COLORS.len()].to_string()
@@ -64,6 +109,12 @@ struct LiveSession {
     collab_tx: broadcast::Sender<ServerMessage>,
     /// Signal to all connected WS handlers that this session is being force-stopped
     shutdown_tx: broadcast::Sender<()>,
+    /// Ring buffer of recent PTY output. The PTY task locks this before each
+    /// broadcast so a new subscriber can atomically take a snapshot + the
+    /// broadcast receiver and guarantee no duplication and no gap: any chunk
+    /// that arrives while the snapshot is being taken is serialized behind
+    /// the lock and will land in the subscriber's broadcast buffer instead.
+    scrollback: Arc<Mutex<Scrollback>>,
     /// Currently connected participants, keyed by user_id. A single user may
     /// open multiple tabs/devices; the map stores one canonical record and
     /// `connections` below counts how many live WS handlers are attached.
@@ -114,18 +165,24 @@ impl SessionHub {
             broadcast::Receiver<Bytes>,
             broadcast::Receiver<ServerMessage>,
             broadcast::Receiver<()>,
+            Vec<Bytes>,
         ),
         String,
     > {
-        // Fast path: session already running — subscribe under read lock
+        // Fast path: session already running — subscribe under read lock.
+        // `subscribe_existing` grabs the scrollback lock, calls
+        // `output_tx.subscribe()` inside it, and only then snapshots, so the
+        // returned receiver and snapshot line up without gap or duplication.
         {
             let sessions = self.sessions.read().await;
             if let Some(live) = sessions.get(session_id) {
+                let (output_rx, scrollback) = Self::subscribe_existing(live).await;
                 return Ok((
                     live.cmd_tx.clone(),
-                    live.output_tx.subscribe(),
+                    output_rx,
                     live.collab_tx.subscribe(),
                     live.shutdown_tx.subscribe(),
+                    scrollback,
                 ));
             }
         }
@@ -139,6 +196,7 @@ impl SessionHub {
         let (output_tx, output_rx) = broadcast::channel::<Bytes>(256);
         let (collab_tx, collab_rx) = broadcast::channel::<ServerMessage>(64);
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+        let scrollback = Arc::new(Mutex::new(Scrollback::new()));
 
         // Re-acquire write lock and check for TOCTOU race
         let mut sessions = self.sessions.write().await;
@@ -146,11 +204,13 @@ impl SessionHub {
             // Another task spawned the session while we were spawning — use theirs,
             // our PTY will be dropped and the child process cleaned up
             drop(pty);
+            let (output_rx, snapshot) = Self::subscribe_existing(live).await;
             return Ok((
                 live.cmd_tx.clone(),
-                live.output_tx.subscribe(),
+                output_rx,
                 live.collab_tx.subscribe(),
                 live.shutdown_tx.subscribe(),
+                snapshot,
             ));
         }
 
@@ -158,6 +218,7 @@ impl SessionHub {
         let session_id_owned = session_id.to_string();
         let sessions_arc = self.sessions.clone();
         let storage_clone = self.storage.clone();
+        let scrollback_for_pty = scrollback.clone();
 
         // PTY I/O loop -- single task owns the PtyManager
         tokio::spawn(async move {
@@ -174,6 +235,32 @@ impl SessionHub {
 
                 match action {
                     Action::Output(Some(bytes)) => {
+                        // Record into the scrollback ring AND broadcast
+                        // under the same lock. Holding the scrollback
+                        // mutex across both is what gives us the "every
+                        // chunk is in the snapshot OR in the broadcast,
+                        // never both, never neither" invariant:
+                        //
+                        //   - A subscriber that grabs the lock first
+                        //     takes a snapshot that does NOT contain
+                        //     this chunk, then subscribes, then releases.
+                        //     This task then locks, pushes, broadcasts —
+                        //     the subscriber receives the chunk over the
+                        //     broadcast. No gap, no duplicate.
+                        //
+                        //   - A subscriber that arrives while this task
+                        //     holds the lock waits until push+broadcast
+                        //     complete. Its snapshot will contain the
+                        //     chunk, and because the chunk was already
+                        //     broadcast before the subscriber called
+                        //     `subscribe()`, it will NOT be re-delivered.
+                        //
+                        // If we released the lock between push and
+                        // broadcast, a subscriber could slip in and
+                        // snapshot the chunk *and* subscribe before the
+                        // broadcast fires, causing a duplicate.
+                        let mut sb = scrollback_for_pty.lock().await;
+                        sb.push(bytes.clone());
                         // Already a refcounted Bytes from the PTY reader;
                         // every subscriber clone is an Arc bump, not a copy.
                         let _ = output_tx_clone.send(bytes);
@@ -197,10 +284,29 @@ impl SessionHub {
                 }
             }
 
-            // Cleanup: remove from in-memory map and close in DB
+            // Cleanup: remove from in-memory map and close in DB.
+            // `SessionNotFound` here is the *expected* outcome when the
+            // HTTP close path or the reaper already closed the DB row;
+            // logging that as a warning spammed the logs on every
+            // deliberate `DELETE /api/sessions/{id}` call. Reserve the
+            // warn! for unexpected failures (lock contention, DB error,
+            // etc.) and drop the "already closed" case to debug so it
+            // stays out of production dashboards.
             sessions_arc.write().await.remove(&session_id_owned);
-            if let Err(e) = storage_clone.close_session(&session_id_owned).await {
-                tracing::warn!(session = %session_id_owned, "failed to close session in DB: {e}");
+            match storage_clone.close_session(&session_id_owned).await {
+                Ok(()) => {}
+                Err(telepair_core::error::Error::SessionNotFound(_)) => {
+                    tracing::debug!(
+                        session = %session_id_owned,
+                        "PTY cleanup: session already closed in DB, nothing to do",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session = %session_id_owned,
+                        "failed to close session in DB: {e}",
+                    );
+                }
             }
         });
 
@@ -209,6 +315,7 @@ impl SessionHub {
             output_tx: output_tx.clone(),
             collab_tx: collab_tx.clone(),
             shutdown_tx,
+            scrollback: scrollback.clone(),
             participants: HashMap::new(),
             connections: HashMap::new(),
             // Start the clock on creation: if nobody ever calls
@@ -220,7 +327,38 @@ impl SessionHub {
         };
         sessions.insert(session_id.to_string(), live);
 
-        Ok((cmd_tx, output_rx, collab_rx, shutdown_rx))
+        // Brand-new session: no scrollback yet, and nothing can have been
+        // broadcast on `output_rx` since we just created it.
+        Ok((cmd_tx, output_rx, collab_rx, shutdown_rx, Vec::new()))
+    }
+
+    /// Atomically subscribe to PTY output AND snapshot scrollback for a
+    /// subscriber that's joining an already-live session.
+    ///
+    /// The PTY writer takes the same `scrollback` lock around its
+    /// `push` + `output_tx.send` pair, so holding it across both
+    /// `output_tx.subscribe()` and `sb.snapshot()` here gives us the
+    /// "every chunk is in the snapshot OR delivered via the receiver,
+    /// never both, never neither" invariant:
+    ///
+    ///   - Any chunk pushed before we acquired the lock is in the
+    ///     snapshot. We were not subscribed when it was broadcast, so
+    ///     the receiver will not re-deliver it.
+    ///   - Any chunk pushed after we release the lock will be delivered
+    ///     via the receiver, because we already subscribed before the
+    ///     writer could acquire the lock again.
+    ///
+    /// If we called `subscribe()` after releasing the lock (the old
+    /// behavior), a chunk could slip in during that gap and be lost
+    /// entirely: not in the snapshot, and broadcast before the receiver
+    /// existed.
+    async fn subscribe_existing(
+        live: &LiveSession,
+    ) -> (broadcast::Receiver<Bytes>, Vec<Bytes>) {
+        let sb = live.scrollback.lock().await;
+        let output_rx = live.output_tx.subscribe();
+        let snapshot = sb.snapshot();
+        (output_rx, snapshot)
     }
 
     /// Force-stop a live session by signalling all connected WS handlers,
@@ -381,8 +519,7 @@ impl SessionHub {
                         .iter()
                         .filter_map(|(id, live)| {
                             let idle_since = live.idle_since?;
-                            (idle_since.elapsed() >= config.idle_timeout)
-                                .then(|| id.clone())
+                            (idle_since.elapsed() >= config.idle_timeout).then(|| id.clone())
                         })
                         .collect()
                 };
@@ -435,5 +572,4 @@ impl SessionHub {
             }
         })
     }
-
 }

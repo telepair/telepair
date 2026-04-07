@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { encodeInput } from './protocol';
+import { encodeInput, canInput, InputDeniedReason } from './protocol';
 import type { ClientMessage, ServerMessage } from './protocol';
 
 describe('encodeInput', () => {
@@ -61,5 +61,38 @@ describe('ServerMessage type narrowing', () => {
     if (msg.type === 'Error') {
       expect(msg.code).toBe('AUTH');
     }
+  });
+
+  it('discriminates InputDenied with a known reason', () => {
+    const msg: ServerMessage = {
+      type: 'InputDenied',
+      reason: InputDeniedReason.SERIALIZED_NOT_OWNER,
+    };
+    if (msg.type === 'InputDenied') {
+      expect(msg.reason).toBe('SERIALIZED_NOT_OWNER');
+    }
+  });
+});
+
+describe('canInput', () => {
+  // Matrix: the owner always drives; operators only drive in multiplexed
+  // sessions; viewers are always read-only. The 2-arg signature was
+  // introduced with finding #2 — an operator in a serialized session
+  // used to be silently allowed on the client and then dropped on the
+  // server, producing a dead-keyboard UX. These tests pin the matrix so
+  // a regression can't sneak back via a default-argument refactor.
+  it('owner can always input', () => {
+    expect(canInput('owner', 'multiplexed')).toBe(true);
+    expect(canInput('owner', 'serialized')).toBe(true);
+  });
+
+  it('operator can input only in multiplexed mode', () => {
+    expect(canInput('operator', 'multiplexed')).toBe(true);
+    expect(canInput('operator', 'serialized')).toBe(false);
+  });
+
+  it('viewer can never input', () => {
+    expect(canInput('viewer', 'multiplexed')).toBe(false);
+    expect(canInput('viewer', 'serialized')).toBe(false);
   });
 });

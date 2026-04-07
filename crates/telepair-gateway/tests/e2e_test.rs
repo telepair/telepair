@@ -346,20 +346,37 @@ async fn e2e_permission_enforcement() {
     // Wait for shell ready
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Viewer sends input → silently dropped
+    // Viewer sends input → dropped, and the connection gets a one-shot
+    // `InputDenied` notice with reason `VIEWER`.
     ws_viewer
         .send(term_input_msg("echo VIEWER_MARKER\n"))
         .await
         .unwrap();
 
-    // Operator sends input in serialized mode → also silently dropped
+    // Operator sends input in serialized mode → dropped, and the
+    // connection gets a one-shot `InputDenied` notice with reason
+    // `SERIALIZED_NOT_OWNER`.
     ws_op
         .send(term_input_msg("echo OPERATOR_MARKER\n"))
         .await
         .unwrap();
 
-    // Wait for dropped messages to be processed (or rather, not processed)
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Assert the denial notices actually arrived before checking that
+    // the keystrokes never reached the PTY.
+    let viewer_notice = expect_json(&mut ws_viewer, 5, |m| {
+        matches!(m, ServerMessage::InputDenied { .. })
+    })
+    .await;
+    if let ServerMessage::InputDenied { reason } = viewer_notice {
+        assert_eq!(reason, "VIEWER");
+    }
+    let op_notice = expect_json(&mut ws_op, 5, |m| {
+        matches!(m, ServerMessage::InputDenied { .. })
+    })
+    .await;
+    if let ServerMessage::InputDenied { reason } = op_notice {
+        assert_eq!(reason, "SERIALIZED_NOT_OWNER");
+    }
 
     // Owner sends input → should succeed
     ws_owner
@@ -373,7 +390,7 @@ async fn e2e_permission_enforcement() {
 
     assert!(
         !output_str.contains("VIEWER_MARKER"),
-        "viewer's input should have been silently dropped"
+        "viewer's input should have been dropped before reaching the PTY"
     );
     assert!(
         !output_str.contains("OPERATOR_MARKER"),
@@ -383,6 +400,104 @@ async fn e2e_permission_enforcement() {
     let _ = ws_owner.close(None).await;
     let _ = ws_op.close(None).await;
     let _ = ws_viewer.close(None).await;
+}
+
+// ─── Scenario 4b: Multiplexed mode lets operators type ───
+
+#[tokio::test]
+async fn e2e_multiplexed_operator_can_type() {
+    let (addr, state) = start_server().await;
+
+    // Explicitly create a Multiplexed session: the new default for
+    // sessions minted via the REST API, and the only mode in which
+    // operator keystrokes should reach the PTY.
+    let owner_token = state.create_test_user("alice").await;
+    let owner = state.auth.validate(&owner_token).await.unwrap();
+    let session = state
+        .sessions
+        .storage()
+        .create_session_with_owner(owner.id, "local-shell", InputMode::Multiplexed)
+        .await
+        .unwrap();
+    let session_id = session.id.clone();
+
+    let (op_token, _) = add_participant(&state, &session_id, "bob", Role::Operator).await;
+
+    let mut ws_owner = join_session(&addr, &session_id, &owner_token).await;
+    let mut ws_op = join_session(&addr, &session_id, &op_token).await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    ws_op
+        .send(term_input_msg("echo MUX_OPERATOR_MARKER\n"))
+        .await
+        .unwrap();
+
+    // Operator input should reach the PTY and be echoed back to *any*
+    // subscriber — read from the owner's stream to avoid intermixing
+    // with the operator's own local echo.
+    let output = expect_binary_containing(&mut ws_owner, b"MUX_OPERATOR_MARKER", 10).await;
+    assert!(
+        output
+            .windows(b"MUX_OPERATOR_MARKER".len())
+            .any(|w| w == b"MUX_OPERATOR_MARKER"),
+        "operator input must flow through in multiplexed mode"
+    );
+
+    let _ = ws_owner.close(None).await;
+    let _ = ws_op.close(None).await;
+}
+
+// ─── Scenario 4c: Scrollback replay for late joiners ────
+
+#[tokio::test]
+async fn e2e_late_joiner_receives_scrollback() {
+    let (addr, state) = start_server().await;
+
+    // Owner starts a Multiplexed session so the operator can type later,
+    // though the operator only joins *after* the scrollback event lands.
+    let owner_token = state.create_test_user("alice").await;
+    let owner = state.auth.validate(&owner_token).await.unwrap();
+    let session = state
+        .sessions
+        .storage()
+        .create_session_with_owner(owner.id, "local-shell", InputMode::Multiplexed)
+        .await
+        .unwrap();
+    let session_id = session.id.clone();
+
+    // Owner joins, types a unique marker, waits for the echo to reach
+    // the PTY (and therefore the scrollback ring). We intentionally do
+    // NOT assert anything on the owner's own stream here — the point of
+    // this test is that a *second* connection, joining later, sees the
+    // replayed bytes even though no new PTY output happens afterwards.
+    let mut ws_owner = join_session(&addr, &session_id, &owner_token).await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    ws_owner
+        .send(term_input_msg("echo SCROLLBACK_REPLAY_TEST\n"))
+        .await
+        .unwrap();
+    // Drain until the marker is visible on the owner's own stream,
+    // which proves it made it into the scrollback ring.
+    let _ = expect_binary_containing(&mut ws_owner, b"SCROLLBACK_REPLAY_TEST", 10).await;
+
+    // Now a late operator joins. They must see the marker in the
+    // replay stream — no fresh PTY writes happen between the owner's
+    // echo and the operator's join.
+    let (op_token, _) = add_participant(&state, &session_id, "bob", Role::Operator).await;
+    let mut ws_op = join_session(&addr, &session_id, &op_token).await;
+
+    let replayed = expect_binary_containing(&mut ws_op, b"SCROLLBACK_REPLAY_TEST", 5).await;
+    assert!(
+        replayed
+            .windows(b"SCROLLBACK_REPLAY_TEST".len())
+            .any(|w| w == b"SCROLLBACK_REPLAY_TEST"),
+        "late joiner must receive recent PTY output replayed from scrollback"
+    );
+
+    let _ = ws_owner.close(None).await;
+    let _ = ws_op.close(None).await;
 }
 
 // ─── Scenario 5: Session close disconnects all ──────────
@@ -579,9 +694,11 @@ async fn e2e_multi_tab_keeps_participant_alive() {
     // see PeerLeft for alice.
     let _ = alice_ws2.close(None).await;
 
-    let left = expect_json(&mut bob_ws, 5, |m| {
-        matches!(m, ServerMessage::PeerLeft { user_id, .. } if *user_id == alice_id)
-    })
+    let left = expect_json(
+        &mut bob_ws,
+        5,
+        |m| matches!(m, ServerMessage::PeerLeft { user_id, .. } if *user_id == alice_id),
+    )
     .await;
     assert!(matches!(left, ServerMessage::PeerLeft { .. }));
 

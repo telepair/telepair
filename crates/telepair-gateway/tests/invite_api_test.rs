@@ -264,6 +264,173 @@ async fn redeem_with_auth_reuses_existing_user() {
 }
 
 #[tokio::test]
+async fn redeem_by_owner_does_not_burn_invite_uses() {
+    // Finding #8: an owner who visits their own invite link (common
+    // smoke-test flow — "does this link work?") used to silently
+    // consume one use of the invite. On a default `max_uses = 1`
+    // invite that drained it to zero before the real guest arrived,
+    // producing a useless link. The fix short-circuits in
+    // `redeem_invite` when the caller is already a participant of
+    // the session; this test pins that behaviour so a future refactor
+    // can't reintroduce the burn.
+    let (state, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/sessions/{session_id}/invite"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"operator","max_uses":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let invite_body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let raw_token = invite_body["token"].as_str().unwrap().to_owned();
+
+    // Owner redeems their own link — should succeed, report their
+    // real `owner` role, and MUST NOT consume the invite use.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/invite/redeem")
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "token": raw_token }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["session_id"], session_id);
+    assert_eq!(
+        body["role"], "owner",
+        "owner self-redeem must report the real role, not the invite's target role"
+    );
+    assert!(
+        body["token"].is_null(),
+        "owner self-redeem must not mint a guest token"
+    );
+
+    // The invite should still be fully redeemable by a fresh guest.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/invite/redeem")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "token": raw_token }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "max_uses=1 invite must still have one use left after owner self-redeem"
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["role"], "operator");
+    let guest_token = body["token"].as_str().expect("real guest gets a token");
+    let guest = state.auth.validate(guest_token).await.unwrap();
+    assert!(!guest.is_admin);
+}
+
+#[tokio::test]
+async fn redeem_by_existing_participant_does_not_burn_invite_uses() {
+    // Same principle as the owner case: once a user is already a
+    // participant, re-clicking the same link should be a no-op instead
+    // of eating another `max_uses`. Exercised with an operator who
+    // previously redeemed the link, then clicks it again from a stale
+    // tab / bookmark.
+    let (state, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/sessions/{session_id}/invite"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"operator","max_uses":2}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let invite_body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let raw_token = invite_body["token"].as_str().unwrap().to_owned();
+
+    // First redemption — consumes 1 of 2 uses and seeds a participant.
+    let invitee_token = state.create_test_user("operator-regular").await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/invite/redeem")
+                .header("Authorization", format!("Bearer {invitee_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "token": raw_token }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Second click from the same authenticated user — no-op, should
+    // leave the remaining use intact.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/invite/redeem")
+                .header("Authorization", format!("Bearer {invitee_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "token": raw_token }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        body["token"].is_null(),
+        "repeat-click redeem for an existing participant must not issue a new token"
+    );
+
+    // Now a fresh guest should still be able to claim the second use.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/invite/redeem")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "token": raw_token }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "second use must still be available after the no-op repeat-click"
+    );
+}
+
+#[tokio::test]
 async fn redeem_issues_distinct_guest_per_redemption() {
     // A multi-use invite should mint a unique guest per redemption.
     // If the handler accidentally reused a single guest account, all
@@ -349,6 +516,102 @@ async fn create_session_rejects_unknown_input_mode() {
                 .body(Body::from(
                     r#"{"target_name":"local-shell","input_mode":"not-a-real-mode"}"#,
                 ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn create_invite_with_expires_in_minutes_populates_expires_at() {
+    // The UI-facing knob is a relative TTL ("expire in 60 minutes") —
+    // easier to reason about than an absolute ISO timestamp. The HTTP
+    // handler resolves it to an absolute `expires_at` before the DB
+    // sees anything, so the response must echo back a concrete
+    // timestamp that clients can show or count down against.
+    let (_state, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    let before = chrono::Utc::now();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/sessions/{session_id}/invite"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    r#"{"role":"viewer","max_uses":2,"expires_in_minutes":60}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let expires_at_raw = body["expires_at"]
+        .as_str()
+        .expect("expires_at must be present and non-null when TTL is supplied");
+    let expires_at = chrono::DateTime::parse_from_rfc3339(expires_at_raw)
+        .expect("expires_at should be a valid RFC3339 timestamp")
+        .with_timezone(&chrono::Utc);
+
+    let delta = expires_at - before;
+    // The handler computes `now + 60 minutes`; give a generous slack
+    // for the test to stay stable on slow runners.
+    assert!(
+        delta >= chrono::Duration::minutes(59) && delta <= chrono::Duration::minutes(61),
+        "expires_at should be ~60 minutes in the future, got delta {delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_invite_rejects_absolute_expires_at_in_the_past() {
+    // A timestamp in the past is always a client bug — the UI either
+    // picked the wrong timezone or the user fat-fingered a date. Better
+    // to 400 loudly than to mint a pre-expired invite that looks fine
+    // in the UI but dies on the first redeem.
+    let (_state, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    let body = serde_json::json!({
+        "role": "viewer",
+        "max_uses": 1,
+        "expires_at": past,
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::post(format!("/api/sessions/{session_id}/invite"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn create_invite_rejects_excessive_max_uses() {
+    // `max_uses = 10_000` is not an invite, it's a public URL. The
+    // server caps at 100 so a typo in the UI can't produce one
+    // accidentally. Anything above the cap is a 400 (not a silent
+    // clamp) so the UI can surface the limit to the user.
+    let (_state, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    let resp = app
+        .oneshot(
+            Request::post(format!("/api/sessions/{session_id}/invite"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"viewer","max_uses":10000}"#))
                 .unwrap(),
         )
         .await

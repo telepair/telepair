@@ -9,10 +9,10 @@ use axum::{
 };
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use telepair_core::permission::Role;
-use telepair_core::protocol::{ClientMessage, ServerMessage, error_codes};
+use telepair_core::protocol::{ClientMessage, ServerMessage, error_codes, input_denied};
 use telepair_core::session::InputMode;
 use telepair_core::storage::Storage;
 
@@ -77,8 +77,12 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                     }) => match state.auth.validate(&token).await {
                         Ok(user) => (user, cols, rows),
                         Err(_) => {
-                            send_error(&mut ws_tx, error_codes::AUTH_FAILED, "invalid token".into())
-                                .await;
+                            send_error(
+                                &mut ws_tx,
+                                error_codes::AUTH_FAILED,
+                                "invalid token".into(),
+                            )
+                            .await;
                             return;
                         }
                     },
@@ -169,7 +173,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
             return;
         }
     };
-    let (cmd_tx, mut output_rx, mut collab_rx, mut shutdown_rx) = match hub
+    let (cmd_tx, mut output_rx, mut collab_rx, mut shutdown_rx, scrollback) = match hub
         .start_or_join(&session_id, &cmd, &args, &env, initial_cols, initial_rows)
         .await
     {
@@ -201,9 +205,30 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         }
     }
 
+    // Replay scrollback BEFORE handing `ws_tx` off to the forwarder. Doing
+    // this here (instead of pushing the scrollback through the forwarder's
+    // personal channel) keeps the ordering airtight: the subscriber's
+    // `output_rx` was constructed atomically with the snapshot, so live
+    // broadcast chunks will arrive strictly after these replay frames.
+    // Without scrollback, a late joiner saw a completely blank screen
+    // until the owner typed something — useless for any session mid-
+    // compile, mid-debugger, or mid-log-tail.
+    for chunk in scrollback {
+        if ws_tx.send(Message::Binary(chunk)).await.is_err() {
+            // Client already bailed — nothing else to do; the main loop
+            // below will exit on the next poll.
+            return;
+        }
+    }
+
     // Spawn a forwarder that pumps PTY output + collab messages to the WS sink.
     // `stop_tx` (oneshot) lets the main loop tell the forwarder to exit.
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    // `personal_tx` is the main loop's private path back to the WS sink:
+    // it lets us push per-connection control messages (e.g. `InputDenied`)
+    // without broadcasting to every other participant. Buffer of 4 is
+    // enough for notice-once latches; a full buffer is a drop signal.
+    let (personal_tx, mut personal_rx) = mpsc::channel::<ServerMessage>(4);
 
     let session_id_for_output = session_id.clone();
     let output_handle = tokio::spawn(async move {
@@ -244,6 +269,19 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
+                // Personal control channel — used by the main loop to send
+                // per-connection notices (e.g. `InputDenied`) without
+                // touching the broadcast channel.
+                personal = personal_rx.recv() => {
+                    let Some(msg) = personal else { continue };
+                    let Ok(json) = serde_json::to_string(&msg) else {
+                        tracing::error!("failed to serialize personal message");
+                        continue;
+                    };
+                    if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
                 _ = &mut stop_rx => {
                     break;
                 }
@@ -265,6 +303,20 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let current_role = my_role;
     let can_forward_input = current_role.can_input()
         && !(input_mode == InputMode::Serialized && current_role != Role::Owner);
+    // Precompute the `InputDenied` reason so the hot path never has to
+    // branch twice for the same answer. `None` means "input is allowed";
+    // `Some(reason)` means every binary frame gets dropped and the first
+    // one triggers a single-shot user notice.
+    let input_denied_reason = if can_forward_input {
+        None
+    } else if current_role == Role::Viewer {
+        Some(input_denied::VIEWER)
+    } else {
+        Some(input_denied::SERIALIZED_NOT_OWNER)
+    };
+    // Latch so we only send the denial notice once per connection —
+    // otherwise every keystroke would spam the client's toast bus.
+    let mut denial_notice_sent = false;
 
     // Track the last accepted CursorMove timestamp per connection so we can
     // drop floods without spinning up a timer task.
@@ -320,10 +372,29 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                         }
                     }
                     Message::Binary(data) => {
-                        if can_forward_input {
-                            // `data` is already a refcounted `Bytes` from
-                            // axum 0.8's WS codec — forward without copy.
-                            let _ = cmd_tx.send(PtyCommand::Input(data)).await;
+                        match input_denied_reason {
+                            None => {
+                                // `data` is already a refcounted `Bytes` from
+                                // axum 0.8's WS codec — forward without copy.
+                                let _ = cmd_tx.send(PtyCommand::Input(data)).await;
+                            }
+                            Some(reason) => {
+                                if !denial_notice_sent {
+                                    denial_notice_sent = true;
+                                    // One-shot denial notice. `try_send`
+                                    // so a momentarily-full personal
+                                    // buffer never blocks the input
+                                    // loop; worst case the notice is
+                                    // dropped and the client stays quiet
+                                    // — far better than stalling input
+                                    // processing on a toast.
+                                    let _ = personal_tx.try_send(
+                                        ServerMessage::InputDenied {
+                                            reason: reason.to_string(),
+                                        },
+                                    );
+                                }
+                            }
                         }
                     }
                     Message::Close(_) => break,
