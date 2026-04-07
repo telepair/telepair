@@ -36,7 +36,6 @@ pub trait Storage: Send + Sync {
     ) -> Result<Session>;
     async fn get_session(&self, id: &str) -> Result<Option<Session>>;
     async fn close_session(&self, id: &str) -> Result<()>;
-    async fn list_active_sessions(&self) -> Result<Vec<Session>>;
     async fn list_sessions_for_user(&self, user_id: Uuid) -> Result<Vec<Session>>;
     async fn close_stale_sessions(&self) -> Result<u64>;
 

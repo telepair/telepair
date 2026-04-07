@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteRow};
 use sqlx::{Pool, Row, Sqlite, SqlitePool};
@@ -55,10 +55,15 @@ fn parse_datetime(s: String) -> Result<chrono::DateTime<Utc>> {
         .map_err(|e| Error::InvalidInput(format!("invalid timestamp: {e}")))
 }
 
-/// RFC3339 timestamp for the current instant — centralizes the format
-/// choice so all write paths agree with the parsers above.
+/// Canonical RFC3339 format used by every timestamp column in the DB.
+/// Centralizes the format choice so a future switch (e.g. sub-second
+/// precision) lands in one place instead of drifting across write sites.
+fn rfc3339(dt: DateTime<Utc>) -> String {
+    dt.to_rfc3339()
+}
+
 fn now_rfc3339() -> String {
-    Utc::now().to_rfc3339()
+    rfc3339(Utc::now())
 }
 
 fn row_to_user(r: &SqliteRow) -> Result<User> {
@@ -221,7 +226,7 @@ impl SqliteStorage {
         let id = Uuid::new_v4();
         let (token, sha256_hex) = generate_token();
         let now = Utc::now();
-        let now_str = now.to_rfc3339();
+        let now_str = rfc3339(now);
 
         sqlx::query(
             "INSERT INTO users \
@@ -289,7 +294,7 @@ impl Storage for SqliteStorage {
     ) -> Result<Session> {
         let id = nanoid::nanoid!(10);
         let now = Utc::now();
-        let now_str = now.to_rfc3339();
+        let now_str = rfc3339(now);
         let owner_str = owner_id.to_string();
 
         // One transaction covers both INSERTs: either the caller gets a
@@ -393,17 +398,6 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
-    async fn list_active_sessions(&self) -> Result<Vec<Session>> {
-        let rows = sqlx::query("SELECT * FROM sessions WHERE status = ?")
-            .bind(SessionStatus::Active.as_str())
-            .fetch_all(&self.pool)
-            .await?;
-
-        rows.into_iter()
-            .map(|r| row_to_session(&r))
-            .collect::<Result<Vec<_>>>()
-    }
-
     async fn list_sessions_for_user(&self, user_id: Uuid) -> Result<Vec<Session>> {
         let uid = user_id.to_string();
         let rows = sqlx::query(
@@ -466,7 +460,7 @@ impl Storage for SqliteStorage {
         .bind(session_id)
         .bind(user_id.to_string())
         .bind(role.as_str())
-        .bind(now.to_rfc3339())
+        .bind(rfc3339(now))
         .execute(&self.pool)
         .await?;
 
@@ -511,7 +505,7 @@ impl Storage for SqliteStorage {
         .bind(session_id)
         .bind(role.as_str())
         .bind(max_uses)
-        .bind(expires_at.map(|t| t.to_rfc3339()))
+        .bind(expires_at.map(rfc3339))
         .execute(&self.pool)
         .await?;
 

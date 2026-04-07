@@ -135,11 +135,13 @@ async fn create_session_with_owner_rolls_back_on_fk_violation() {
         "creating a session for a nonexistent owner must fail"
     );
 
-    // Nothing should be hanging around from the rolled-back tx.
-    let active = store.list_active_sessions().await.unwrap();
+    // Nothing should be hanging around from the rolled-back tx. Query
+    // by the ghost owner — if the FK check rolled back properly, no
+    // sessions should be associated with that owner id.
+    let ghost_sessions = store.list_sessions_for_user(ghost_owner).await.unwrap();
     assert!(
-        active.is_empty(),
-        "rolled-back transaction must not leave session rows: {active:?}"
+        ghost_sessions.is_empty(),
+        "rolled-back transaction must not leave session rows: {ghost_sessions:?}"
     );
 }
 

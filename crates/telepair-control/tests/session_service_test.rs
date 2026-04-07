@@ -45,18 +45,3 @@ async fn close_session_updates_status() {
         telepair_core::session::SessionStatus::Closed
     );
 }
-
-#[tokio::test]
-async fn list_active_sessions() {
-    let (svc, token) = setup().await;
-    let user = svc.storage().validate_token(&token).await.unwrap();
-    svc.create_session(user.id, "s1", InputMode::Serialized)
-        .await
-        .unwrap();
-    svc.create_session(user.id, "s2", InputMode::Multiplexed)
-        .await
-        .unwrap();
-
-    let sessions = svc.list_active_sessions().await.unwrap();
-    assert_eq!(sessions.len(), 2);
-}
