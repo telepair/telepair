@@ -59,6 +59,69 @@ describe('sessionStore.fetchTargets', () => {
     await p;
     expect(sessionStore.loading()).toBe(false);
   });
+
+  it('clears credentials and bounces to /login on 403 (scoped guest reaches dashboard)', async () => {
+    // Regression for the QA-pass finding: a scoped guest token that
+    // somehow reached the dashboard route used to trip the
+    // `/api/targets` 403, fall through to the catch, and silently
+    // render the empty-state — which both stranded the guest AND
+    // leaked the server-side targets.yaml path. The contract: a 403
+    // here clears the cached token and hard-redirects to /login.
+    store['telepair_token'] = 'guest-token';
+    mockFetch.mockResolvedValueOnce(new Response('forbidden', { status: 403 }));
+
+    const assignSpy = vi.fn();
+    const originalLocation = window.location;
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      writable: true,
+      value: { pathname: '/', assign: assignSpy },
+    });
+
+    try {
+      await sessionStore.fetchTargets();
+      // Token must be wiped from storage so a subsequent reload can't
+      // resurrect the rejected session.
+      expect(store['telepair_token']).toBeUndefined();
+      // And we hard-bounce to /login (the API layer's other 401 path
+      // does the same — this matches it for 403 on /targets).
+      expect(assignSpy).toHaveBeenCalledWith('/login');
+    } finally {
+      Object.defineProperty(window, 'location', {
+        configurable: true,
+        writable: true,
+        value: originalLocation,
+      });
+    }
+  });
+
+  it('does not redirect a 403 caller already on /login', async () => {
+    // Edge case: if some code path triggers fetchTargets while the
+    // user is already on /login (e.g. a stale background reactive
+    // watcher), don't trample the page with a redundant assign() —
+    // it would short-circuit any in-progress login attempt.
+    store['telepair_token'] = 'guest-token';
+    mockFetch.mockResolvedValueOnce(new Response('forbidden', { status: 403 }));
+
+    const assignSpy = vi.fn();
+    const originalLocation = window.location;
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      writable: true,
+      value: { pathname: '/login', assign: assignSpy },
+    });
+
+    try {
+      await sessionStore.fetchTargets();
+      expect(assignSpy).not.toHaveBeenCalled();
+    } finally {
+      Object.defineProperty(window, 'location', {
+        configurable: true,
+        writable: true,
+        value: originalLocation,
+      });
+    }
+  });
 });
 
 describe('sessionStore.fetchSessions', () => {
