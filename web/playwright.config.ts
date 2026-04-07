@@ -16,7 +16,12 @@ export default defineConfig({
     locale: 'en-US',
   },
   webServer: {
-    command: 'cargo run -- --web-dir web/dist',
+    // Reuse the release binary produced by `make build-rust` (also the
+    // artifact that `make all` / CI build earlier in the pipeline), so a
+    // full run doesn't pay for a second cargo compile in the dev profile.
+    // Standalone `npm run e2e` invocations therefore expect the release
+    // binary to exist — `make e2e` handles that via its build-rust dep.
+    command: './target/release/telepair --web-dir web/dist',
     port: 7700,
     cwd: path.resolve(import.meta.dirname, '..'),
     reuseExistingServer: true,
