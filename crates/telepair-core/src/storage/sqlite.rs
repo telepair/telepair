@@ -160,7 +160,9 @@ fn check_invite_validity(invite: &InviteToken) -> Result<()> {
         }
     }
     if invite.used_count >= invite.max_uses {
-        return Err(Error::InvalidInput("invite token has been fully used".into()));
+        return Err(Error::InvalidInput(
+            "invite token has been fully used".into(),
+        ));
     }
     Ok(())
 }
@@ -400,14 +402,12 @@ impl Storage for SqliteStorage {
         let now_str = now_rfc3339();
         let mut tx = self.pool.begin().await?;
 
-        let result = sqlx::query(
-            "UPDATE sessions SET status = ?, closed_at = ? WHERE status = ?",
-        )
-        .bind(SessionStatus::Closed.as_str())
-        .bind(&now_str)
-        .bind(SessionStatus::Active.as_str())
-        .execute(&mut *tx)
-        .await?;
+        let result = sqlx::query("UPDATE sessions SET status = ?, closed_at = ? WHERE status = ?")
+            .bind(SessionStatus::Closed.as_str())
+            .bind(&now_str)
+            .bind(SessionStatus::Active.as_str())
+            .execute(&mut *tx)
+            .await?;
 
         sqlx::query(
             "UPDATE participants SET left_at = ? \

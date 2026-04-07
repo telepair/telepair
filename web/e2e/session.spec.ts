@@ -1,12 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { login } from './helpers';
-
-/** Login, create a session, and navigate to the session page. */
-async function gotoSession(page: import('@playwright/test').Page) {
-  await login(page);
-  await page.locator('.target-card').first().click();
-  await page.waitForURL(/\/session\/.+/);
-}
+import { gotoSession } from './helpers';
 
 test.describe('Session page', () => {
   test('shows terminal and connected status', async ({ page }) => {

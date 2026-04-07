@@ -20,8 +20,7 @@ use tower_http::services::{ServeDir, ServeFile};
 /// /api and /ws to :7700). Prod deployments serve the frontend from
 /// the same origin as the API, so CORS is skipped entirely by the
 /// browser — no need to list :7700 here.
-const DEFAULT_LOOPBACK_ORIGINS: &[&str] =
-    &["http://localhost:5173", "http://127.0.0.1:5173"];
+const DEFAULT_LOOPBACK_ORIGINS: &[&str] = &["http://localhost:5173", "http://127.0.0.1:5173"];
 
 /// CORS policy for `build_router_with_options`. A typed enum instead of
 /// a sentinel empty-list so we can't accidentally fall back to "allow
@@ -68,7 +67,10 @@ pub fn build_router_with_options(
                     "CORS: no --allowed-origins specified, defaulting to loopback dev origins ({})",
                     DEFAULT_LOOPBACK_ORIGINS.join(", ")
                 );
-                DEFAULT_LOOPBACK_ORIGINS.iter().map(|s| s.to_string()).collect()
+                DEFAULT_LOOPBACK_ORIGINS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
             } else {
                 list
             };

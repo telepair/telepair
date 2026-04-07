@@ -1,6 +1,6 @@
 // web/src/lib/api.ts
 import type { TargetInfo, Session, InviteInfo, RedeemResult, Role, InputMode } from './protocol';
-import { STORAGE_KEY } from '../stores/auth';
+import { STORAGE_KEY, readCurrentToken } from '../stores/auth';
 
 const BASE = '/api';
 
@@ -33,10 +33,20 @@ const PUBLIC_PATHS = new Set<string>(['/invite/redeem']);
  * touching window.location directly.
  */
 export let handleAuthExpired: () => void = () => {
+  // Clear both storage tiers. The sessionStorage slot is the
+  // authoritative per-tab identity; localStorage is the persistent
+  // admin fallback used to seed new tabs. A stale token that tripped
+  // this handler could live in either slot, so wipe both before
+  // bouncing to /login.
+  try {
+    sessionStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // ignore — private-mode / storage quota is not actionable here
+  }
   try {
     localStorage.removeItem(STORAGE_KEY);
   } catch {
-    // ignore — private-mode / storage quota is not actionable here
+    // ignore
   }
   // Use a hard navigation instead of the router: by the time we
   // notice a stale token the reactive auth store is still
@@ -53,7 +63,12 @@ export function __setAuthExpiredHandler(fn: () => void) {
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const token = localStorage.getItem(STORAGE_KEY);
+  // Always read through the auth store's helper so the sessionStorage
+  // tier wins over the persistent admin fallback. Reading localStorage
+  // directly here is what let finding #10 hide — a tab that had a
+  // guest sessionStorage entry would get the admin token stamped onto
+  // its requests and confuse the rest of the UI.
+  const token = readCurrentToken();
   const headers: Record<string, string> = {
     ...options.headers as Record<string, string>,
   };
@@ -100,10 +115,24 @@ export const api = {
     });
   },
 
-  createInvite(sessionId: string, role: Role, maxUses?: number): Promise<InviteInfo> {
+  /**
+   * Create an invite token. `maxUses` defaults to 1 (one-shot link);
+   * `expiresInMinutes` defaults to undefined (no TTL → only bounded
+   * by `maxUses` and session lifetime). The server enforces hard caps
+   * (`max_uses ≤ 100`, TTL ≤ 7 days) and 400s anything beyond them.
+   */
+  createInvite(
+    sessionId: string,
+    role: Role,
+    opts: { maxUses?: number; expiresInMinutes?: number } = {},
+  ): Promise<InviteInfo> {
     return request(`/sessions/${sessionId}/invite`, {
       method: 'POST',
-      body: JSON.stringify({ role, max_uses: maxUses ?? 1 }),
+      body: JSON.stringify({
+        role,
+        max_uses: opts.maxUses ?? 1,
+        expires_in_minutes: opts.expiresInMinutes,
+      }),
     });
   },
 

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use telepair_core::target::{substitute_env_vars, Target, TargetConfig, TargetKind};
+use telepair_core::target::{Target, TargetConfig, TargetKind, substitute_env_vars};
 
 pub struct TargetEngine {
     targets: Vec<Target>,

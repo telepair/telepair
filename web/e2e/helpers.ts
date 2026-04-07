@@ -22,10 +22,22 @@ export async function login(page: Page): Promise<void> {
   await page.waitForURL('/');
 }
 
-/** Login, create a session via target card, return the session ID. */
+/** Login, create a session via target card, return the session ID.
+ *
+ * Clicking a target card no longer navigates directly — it opens the
+ * `CreateSessionDialog` modal (confirmation + input-mode picker) and
+ * the user has to click "Launch" to actually start the session. The
+ * E2E helper drives that flow end-to-end so every test keeps working
+ * against the new dashboard UX.
+ */
 export async function gotoSession(page: Page): Promise<string> {
   await login(page);
   await page.locator('.target-card').first().click();
+  // Wait for the modal to appear, then click Launch. Targeting by
+  // role="dialog" + accessible name is more robust than a CSS class.
+  const dialog = page.getByRole('dialog', { name: 'Start a session' });
+  await dialog.waitFor({ state: 'visible', timeout: 5_000 });
+  await dialog.getByRole('button', { name: 'Launch' }).click();
   await page.waitForURL(/\/session\/.+/);
   return page.url().split('/session/')[1];
 }

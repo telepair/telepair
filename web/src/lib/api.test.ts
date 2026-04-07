@@ -3,12 +3,24 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
 
-// Stub localStorage since jsdom's may not be fully functional
+// Stub both storage tiers. The auth store reads sessionStorage first
+// (per-tab identity) and falls back to localStorage (persistent admin
+// fallback). api.ts now goes through `readCurrentToken` which honours
+// that lookup order, so the test needs both slots to be controllable.
+// Tests that want the "signed in as admin" state write to `store`
+// (localStorage) because that's where login persists; tests that want
+// tab-scoped state write to `tabStore`.
 const store: Record<string, string> = {};
+const tabStore: Record<string, string> = {};
 vi.stubGlobal('localStorage', {
   getItem: (key: string) => store[key] ?? null,
   setItem: (key: string, value: string) => { store[key] = value; },
   removeItem: (key: string) => { delete store[key]; },
+});
+vi.stubGlobal('sessionStorage', {
+  getItem: (key: string) => tabStore[key] ?? null,
+  setItem: (key: string, value: string) => { tabStore[key] = value; },
+  removeItem: (key: string) => { delete tabStore[key]; },
 });
 
 // Import after stubs are in place
@@ -28,6 +40,7 @@ function errorResponse(body: string, status: number) {
 beforeEach(() => {
   mockFetch.mockReset();
   delete store['telepair_token'];
+  delete tabStore['telepair_token'];
   // Replace the default handler (which tries to navigate via
   // window.location.assign and trips jsdom's "navigation not
   // implemented" noise) with a no-op so each test that cares can

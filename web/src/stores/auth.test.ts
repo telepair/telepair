@@ -3,14 +3,35 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
 
-const store: Record<string, string> = {};
+// Two independent backing stores so the test can assert *which tier*
+// each write lands in. The sessionStorage stub is the per-tab
+// identity slot; the localStorage stub is the persistent admin
+// fallback. Finding #10's fix depends on keeping these distinct, so
+// testing them as a single `store` would mask a regression.
+const tabStore: Record<string, string> = {};
+const persistStore: Record<string, string> = {};
+// Toggled by the storage-failure regression test to simulate private
+// mode / quota exhaustion: when set, every `setItem` throws so the
+// `safeSet` helper takes its swallow-and-continue path.
+let storageWritesThrow = false;
+vi.stubGlobal('sessionStorage', {
+  getItem: (key: string) => tabStore[key] ?? null,
+  setItem: (key: string, value: string) => {
+    if (storageWritesThrow) throw new Error('QuotaExceededError');
+    tabStore[key] = value;
+  },
+  removeItem: (key: string) => { delete tabStore[key]; },
+});
 vi.stubGlobal('localStorage', {
-  getItem: (key: string) => store[key] ?? null,
-  setItem: (key: string, value: string) => { store[key] = value; },
-  removeItem: (key: string) => { delete store[key]; },
+  getItem: (key: string) => persistStore[key] ?? null,
+  setItem: (key: string, value: string) => {
+    if (storageWritesThrow) throw new Error('QuotaExceededError');
+    persistStore[key] = value;
+  },
+  removeItem: (key: string) => { delete persistStore[key]; },
 });
 
-const { auth, STORAGE_KEY } = await import('./auth');
+const { auth, STORAGE_KEY, readCurrentToken } = await import('./auth');
 const { __setAuthExpiredHandler } = await import('../lib/api');
 // Neutralise the stale-token redirect: validateToken intentionally
 // probes with api.listTargets() and a 401 response now fires the
@@ -28,7 +49,9 @@ function jsonResponse(data: unknown, status = 200) {
 
 beforeEach(() => {
   mockFetch.mockReset();
-  delete store[STORAGE_KEY];
+  storageWritesThrow = false;
+  delete tabStore[STORAGE_KEY];
+  delete persistStore[STORAGE_KEY];
   auth.logout();
 });
 
@@ -44,16 +67,25 @@ describe('auth.isAuthenticated', () => {
 });
 
 describe('auth.setToken', () => {
-  it('persists token to localStorage', () => {
+  it('writes to sessionStorage only by default (tab-scoped)', () => {
     auth.setToken('my-token');
-    expect(store[STORAGE_KEY]).toBe('my-token');
+    expect(tabStore[STORAGE_KEY]).toBe('my-token');
+    expect(persistStore[STORAGE_KEY]).toBeUndefined();
     expect(auth.token()).toBe('my-token');
   });
 
-  it('removes from localStorage when empty', () => {
-    auth.setToken('temp');
+  it('writes to both tiers when { persist: true }', () => {
+    auth.setToken('admin-token', { persist: true });
+    expect(tabStore[STORAGE_KEY]).toBe('admin-token');
+    expect(persistStore[STORAGE_KEY]).toBe('admin-token');
+    expect(auth.token()).toBe('admin-token');
+  });
+
+  it('clearing empties both tiers so future tabs do not inherit the token', () => {
+    auth.setToken('admin-token', { persist: true });
     auth.setToken('');
-    expect(store[STORAGE_KEY]).toBeUndefined();
+    expect(tabStore[STORAGE_KEY]).toBeUndefined();
+    expect(persistStore[STORAGE_KEY]).toBeUndefined();
     expect(auth.token()).toBe('');
   });
 
@@ -68,12 +100,15 @@ describe('auth.setToken', () => {
 });
 
 describe('auth.validateToken', () => {
-  it('returns true and persists on valid token', async () => {
+  it('returns true and persists admin token to both tiers on success', async () => {
     mockFetch.mockResolvedValueOnce(jsonResponse([]));
     const result = await auth.validateToken('good-token');
     expect(result).toBe(true);
     expect(auth.token()).toBe('good-token');
-    expect(store[STORAGE_KEY]).toBe('good-token');
+    // Login hits the persistent tier so future tabs inherit the admin
+    // identity without re-pasting the token.
+    expect(tabStore[STORAGE_KEY]).toBe('good-token');
+    expect(persistStore[STORAGE_KEY]).toBe('good-token');
     expect(auth.error()).toBe('');
     expect(auth.validating()).toBe(false);
   });
@@ -94,19 +129,68 @@ describe('auth.validateToken', () => {
     expect(auth.error()).toBe('Connection failed');
   });
 
-  it('removes token from localStorage on failure', async () => {
+  it('removes token from both tiers on failure', async () => {
     mockFetch.mockResolvedValueOnce(new Response('Unauthorized', { status: 401 }));
     await auth.validateToken('will-fail');
-    expect(store[STORAGE_KEY]).toBeUndefined();
+    expect(tabStore[STORAGE_KEY]).toBeUndefined();
+    expect(persistStore[STORAGE_KEY]).toBeUndefined();
   });
 });
 
 describe('auth.logout', () => {
-  it('clears token and localStorage', () => {
-    auth.setToken('active-token');
+  it('clears token and both storage tiers', () => {
+    auth.setToken('active-token', { persist: true });
     auth.logout();
     expect(auth.token()).toBe('');
     expect(auth.isAuthenticated()).toBe(false);
-    expect(store[STORAGE_KEY]).toBeUndefined();
+    expect(tabStore[STORAGE_KEY]).toBeUndefined();
+    expect(persistStore[STORAGE_KEY]).toBeUndefined();
+  });
+});
+
+describe('cross-tab isolation (regression for finding #10)', () => {
+  it('guest redeem in one "tab" does not clobber the admin token in another', async () => {
+    // Simulate: admin logged in elsewhere — the persistent tier holds
+    // their token. This tab has no sessionStorage entry yet, so any
+    // subsequent guest setToken here MUST NOT overwrite the persistent
+    // admin token.
+    persistStore[STORAGE_KEY] = 'admin-token';
+
+    auth.setToken('guest-token'); // invite-redeem path, tab-scoped only
+    expect(tabStore[STORAGE_KEY]).toBe('guest-token');
+    expect(persistStore[STORAGE_KEY]).toBe('admin-token');
+  });
+});
+
+describe('readCurrentToken in storage-restricted environments', () => {
+  // Regression for the storage-failure path Codex flagged: in private
+  // browsing / sandboxed iframes / quota-exhausted contexts, `setItem`
+  // throws and `safeSet` swallows the error. The signal still gets the
+  // new token, so the UI thinks login succeeded — but if
+  // `readCurrentToken` only reads storage, the API layer drops the
+  // `Authorization` header on every follow-up request and the user
+  // sees an inexplicable wall of 401s. The fallback below makes the
+  // signal authoritative when storage is unwritable.
+  it('falls back to the in-memory signal when storage writes silently fail', () => {
+    storageWritesThrow = true;
+
+    auth.setToken('memory-only-token');
+
+    // Both stores stayed empty — `setItem` always threw — but the
+    // signal captured the new token, and `readCurrentToken` should
+    // surface it instead of returning ''.
+    expect(tabStore[STORAGE_KEY]).toBeUndefined();
+    expect(persistStore[STORAGE_KEY]).toBeUndefined();
+    expect(auth.token()).toBe('memory-only-token');
+    expect(readCurrentToken()).toBe('memory-only-token');
+  });
+
+  it('still prefers sessionStorage when both storage and signal hold a value', () => {
+    // Sanity check: the fallback must not regress the existing
+    // sessionStorage-first ordering, which is load-bearing for the
+    // cross-tab isolation fix in finding #10.
+    auth.setToken('signal-token');
+    tabStore[STORAGE_KEY] = 'tab-token';
+    expect(readCurrentToken()).toBe('tab-token');
   });
 });

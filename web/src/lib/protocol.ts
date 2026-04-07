@@ -63,7 +63,18 @@ export type ServerMessage =
   | { type: 'PeerLeft'; user_id: string }
   | { type: 'PeerCursor'; user_id: string; x: number; y: number }
   | { type: 'PeerChat'; user_id: string; name: string; text: string; ts: string }
+  | { type: 'InputDenied'; reason: InputDeniedReason }
   | { type: 'Error'; code: string; message: string };
+
+// Reason codes mirroring `crates/telepair-core/src/protocol.rs::input_denied`.
+// The server only sends these strings; any unknown value should be rendered
+// as a generic "input not allowed" so a protocol upgrade doesn't silently
+// swallow the notice.
+export const InputDeniedReason = {
+  VIEWER: 'VIEWER',
+  SERIALIZED_NOT_OWNER: 'SERIALIZED_NOT_OWNER',
+} as const;
+export type InputDeniedReason = (typeof InputDeniedReason)[keyof typeof InputDeniedReason];
 
 // --- Helpers ---
 
@@ -73,14 +84,31 @@ export function encodeInput(text: string): Uint8Array {
   return textEncoder.encode(text);
 }
 
-export function canInput(role: Role): boolean {
-  return role === 'owner' || role === 'operator';
+/**
+ * Returns whether the given (role, inputMode) combo may forward
+ * keystrokes to the PTY. The old 1-arg signature silently let operators
+ * type in serialized sessions — the server then dropped those bytes,
+ * producing a dead-keyboard UX. Callers MUST pass `inputMode` so the
+ * client and server enforcement agree.
+ */
+export function canInput(role: Role, inputMode: InputMode): boolean {
+  if (role === 'owner') return true;
+  if (role === 'operator') return inputMode === 'multiplexed';
+  return false;
 }
 
 export interface InviteInfo {
   token: string;
   role: Role;
   max_uses: number;
+  /**
+   * Absolute expiry resolved server-side. `null` means the invite
+   * never expires on its own (it will still die when `max_uses` runs
+   * out or the session closes). The frontend should render a humanised
+   * countdown when this is set so the owner can see at a glance how
+   * long the link will stay live.
+   */
+  expires_at: string | null;
   session_id: string;
 }
 

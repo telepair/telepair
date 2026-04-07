@@ -4,8 +4,8 @@ import { useParams, useNavigate } from '@solidjs/router';
 import { auth } from '../stores/auth';
 import { TelepairSocket } from '../lib/ws';
 import type { ConnectionStatus, ReconnectInfo } from '../lib/ws';
-import { encodeInput, canInput, ErrorCode } from '../lib/protocol';
-import type { ServerMessage, Role, ParticipantInfo } from '../lib/protocol';
+import { encodeInput, canInput, ErrorCode, InputDeniedReason } from '../lib/protocol';
+import type { ServerMessage, Role, ParticipantInfo, InputMode } from '../lib/protocol';
 import type { TerminalHandle } from '../components/Terminal';
 import type { ChatMessage } from '../components/ChatPanel';
 import Terminal from '../components/Terminal';
@@ -24,6 +24,11 @@ export default function SessionPage() {
   const [status, setStatus] = createSignal<ConnectionStatus>('connecting');
   const [reconnectInfo, setReconnectInfo] = createSignal<ReconnectInfo | null>(null);
   const [role, setRole] = createSignal<Role>('viewer');
+  // Input mode is captured from the first `SessionState` frame and is
+  // read by `canInput` on every keystroke. Default `serialized` is the
+  // safer preclusion: if SessionState ever fails to arrive, we'd rather
+  // block input than silently spam a dead channel.
+  const [inputMode, setInputMode] = createSignal<InputMode>('serialized');
   const [errorMsg, setErrorMsg] = createSignal('');
   const [endedReason, setEndedReason] = createSignal<string | null>(null);
   const [participants, setParticipants] = createSignal<ParticipantInfo[]>([]);
@@ -48,6 +53,7 @@ export default function SessionPage() {
     switch (msg.type) {
       case 'SessionState':
         setRole(msg.your_role);
+        setInputMode(msg.session.input_mode);
         setParticipants(msg.participants);
         break;
       case 'PeerJoined':
@@ -67,9 +73,38 @@ export default function SessionPage() {
         break;
       case 'PeerCursor':
         break;
+      case 'InputDenied':
+        handleInputDenied(msg.reason);
+        break;
       case 'Error':
         handleServerError(msg.code, msg.message);
         break;
+    }
+  };
+
+  // De-dupe toast id: we only want one "input blocked" toast active at a
+  // time even if the server sends multiple `InputDenied` frames across
+  // reconnects.
+  const INPUT_DENIED_TOAST_ID = 'input-denied';
+  const handleInputDenied = (reason: string) => {
+    switch (reason) {
+      case InputDeniedReason.VIEWER:
+        toast.info('View-only session — your keystrokes are not sent.', {
+          id: INPUT_DENIED_TOAST_ID,
+          duration: 5000,
+        });
+        break;
+      case InputDeniedReason.SERIALIZED_NOT_OWNER:
+        toast.info('Solo mode — only the session owner can type here.', {
+          id: INPUT_DENIED_TOAST_ID,
+          duration: 5000,
+        });
+        break;
+      default:
+        toast.info('Typing is not allowed in this session.', {
+          id: INPUT_DENIED_TOAST_ID,
+          duration: 5000,
+        });
     }
   };
 
@@ -114,12 +149,29 @@ export default function SessionPage() {
   };
 
   const handleData = (data: string) => {
-    if (!canInput(role())) return;
+    if (!canInput(role(), inputMode())) {
+      // Client-side pre-filter: if we don't send the bytes at all, the
+      // server will never reply with `InputDenied` — so the denial
+      // toast would never fire and the user sees a dead keyboard with
+      // zero feedback. Reuse the exact same denial handler the server
+      // path uses so both code paths share copy, de-dupe id, and
+      // duration. Reason picked to match the server's categorisation.
+      const reason =
+        role() === 'viewer'
+          ? InputDeniedReason.VIEWER
+          : InputDeniedReason.SERIALIZED_NOT_OWNER;
+      handleInputDenied(reason);
+      return;
+    }
     socket?.sendInput(encodeInput(data));
   };
 
   const handleResize = (cols: number, rows: number) => {
-    if (!canInput(role())) return;
+    // Resize follows its own permission gate server-side: operators may
+    // resize even in solo (`serialized`) mode. Mirror that here so we
+    // don't block a legitimate resize with the stricter `canInput`
+    // check — which would prevent the terminal from fitting its pane.
+    if (role() === 'viewer') return;
     socket?.sendResize(cols, rows);
   };
 
@@ -226,6 +278,7 @@ export default function SessionPage() {
 
       <InviteDialog
         sessionId={params.id}
+        inputMode={inputMode()}
         open={showInvite()}
         onClose={() => setShowInvite(false)}
       />

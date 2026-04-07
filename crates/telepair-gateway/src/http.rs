@@ -4,6 +4,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use telepair_core::error::Error;
@@ -98,7 +99,10 @@ pub struct CreateSessionRequest {
     pub target_name: String,
     /// Strict parse: unknown values are rejected by axum's JSON extractor
     /// with a 400 so typos are loud. Omitted field defaults to
-    /// `InputMode::Serialized` below.
+    /// `InputMode::Multiplexed` below — the collaborative default so
+    /// invited operators can actually type, which is the whole point of
+    /// "Google Docs for terminals". Owners who want a solo shell with
+    /// shoulder-surfing viewers can still opt into `serialized`.
     #[serde(default)]
     pub input_mode: Option<InputMode>,
 }
@@ -127,7 +131,7 @@ pub async fn create_session(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let mode = body.input_mode.unwrap_or(InputMode::Serialized);
+    let mode = body.input_mode.unwrap_or(InputMode::Multiplexed);
 
     let session = state
         .sessions
@@ -159,31 +163,84 @@ pub struct CreateInviteRequest {
     pub role: Role,
     #[serde(default = "default_max_uses")]
     pub max_uses: i32,
+    /// Optional TTL in minutes — mutually exclusive with `expires_at`.
+    /// The UI uses this because it's easier than picking an absolute
+    /// wall-clock time in a form; the backend resolves it to an absolute
+    /// `DateTime<Utc>` before hitting storage so the DB only ever sees
+    /// concrete timestamps.
+    #[serde(default)]
+    pub expires_in_minutes: Option<i64>,
+    /// Optional absolute expiry. If both `expires_in_minutes` and
+    /// `expires_at` are set, this wins — callers shouldn't pass both
+    /// but if they do we prefer the one with less ambiguity.
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 fn default_max_uses() -> i32 {
     1
 }
 
+/// Hard cap on invite `max_uses`. An invite that can be redeemed 10k
+/// times is not an invite, it's a public URL — reject those at the
+/// HTTP layer so a typo in the UI can't produce one by accident.
+const MAX_INVITE_USES: i32 = 100;
+
+/// Hard cap on invite TTL. Week-long invites are already pushing it;
+/// month-long invites are a credential-handling mistake waiting to
+/// happen. Any request asking for longer is clamped to this value.
+const MAX_INVITE_TTL_MINUTES: i64 = 7 * 24 * 60;
+
 pub async fn create_invite(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(session_id): Path<String>,
-    Json(body): Json<CreateInviteRequest>,
+    body: Result<Json<CreateInviteRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, StatusCode> {
     extract_user_and_owned_session(&state, &headers, &session_id).await?;
+
+    // Axum's default JSON rejection is 422; every other handler in this
+    // file remaps to 400 so clients get a consistent "you sent garbage"
+    // signal regardless of which field was wrong.
+    let Json(body) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Only operator and viewer roles can be invited
     if body.role == Role::Owner {
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    if body.max_uses < 1 || body.max_uses > MAX_INVITE_USES {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Resolve expiry: absolute timestamp wins over TTL, both are
+    // optional, negative/huge TTLs are clamped rather than rejected so
+    // a slider or number-field overshoot produces a useful invite.
+    let expires_at = match (body.expires_at, body.expires_in_minutes) {
+        (Some(at), _) => {
+            if at <= Utc::now() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            Some(at)
+        }
+        (None, Some(minutes)) if minutes > 0 => {
+            let clamped = minutes.min(MAX_INVITE_TTL_MINUTES);
+            Some(Utc::now() + Duration::minutes(clamped))
+        }
+        (None, Some(_)) => {
+            // Zero or negative TTL is not a thing — reject loudly rather
+            // than silently creating a "never-expires" invite.
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        (None, None) => None,
+    };
+
     let role = body.role;
 
     let (invite, raw_token) = state
         .sessions
         .storage()
-        .create_invite(&session_id, role, body.max_uses, None)
+        .create_invite(&session_id, role, body.max_uses, expires_at)
         .await
         .map_err(|e| status_for(&e))?;
 
@@ -193,6 +250,7 @@ pub async fn create_invite(
             "token": raw_token,
             "role": invite.role,
             "max_uses": invite.max_uses,
+            "expires_at": invite.expires_at,
             "session_id": session_id,
         })),
     ))
@@ -235,7 +293,7 @@ pub async fn close_session(
 pub async fn redeem_invite(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<RedeemInviteRequest>,
+    body: Result<Json<RedeemInviteRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, StatusCode> {
     // Best-effort auth: a bearer token is no longer required. We try
     // to validate it so a logged-in user reuses their identity, but
@@ -246,6 +304,13 @@ pub async fn redeem_invite(
         Err(StatusCode::UNAUTHORIZED) => None,
         Err(status) => return Err(status),
     };
+
+    // Keep the JSON rejection semantics consistent across the handlers:
+    // a malformed body is a 400, not a 422. This matters for the
+    // frontend's error-handling code which branches on "bad request"
+    // (show form error) vs "server error" (show toast + retry) — the
+    // old 422 made bogus redeems look like a server crash.
+    let Json(body) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Look up the invite first (no state change) so we can validate
     // the session is still alive before burning a use on a closed
@@ -266,6 +331,26 @@ pub async fn redeem_invite(
         // Gone / closed — fail without consuming the invite so the
         // operator can still retract it or reuse uses on a new session.
         return Err(StatusCode::GONE);
+    }
+
+    // Finding #8: if the authenticated caller is already a member of
+    // this session (owner or any role), treat the redeem as a no-op
+    // that **does not** consume the invite. Before this check, an
+    // owner clicking their own share link to sanity-check it would
+    // silently burn one of the `max_uses` and often drop the invite
+    // to zero remaining uses before any guest saw it.
+    if let Some(ref user) = existing_user {
+        let participants = storage
+            .list_participants(&preview.session_id)
+            .await
+            .map_err(|e| status_for(&e))?;
+        if let Some(existing) = participants.iter().find(|p| p.user_id == user.id) {
+            return Ok(Json(serde_json::json!({
+                "session_id": preview.session_id,
+                "role": existing.role,
+                "token": serde_json::Value::Null,
+            })));
+        }
     }
 
     // Now consume atomically. This validates expiry, max_uses, and
