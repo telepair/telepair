@@ -108,6 +108,26 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
             }
         };
 
+    // Scoped-guest session pinning: a guest's bearer token is only
+    // valid for the session it was minted for. The DB's participants
+    // row + the `NOT_PARTICIPANT` check below *also* catches most
+    // cross-session attempts, but this explicit comparison is the
+    // guarantee — it trips before we even touch the participants
+    // table and gives the client a clear refusal instead of the
+    // generic "not a participant" message. Real accounts skip this
+    // entirely (their `scoped_session_id` is None).
+    if let Some(ref scope) = user.scoped_session_id
+        && *scope != session_id
+    {
+        send_error(
+            &mut ws_tx,
+            error_codes::NOT_PARTICIPANT,
+            "guest token is not valid for this session".into(),
+        )
+        .await;
+        return;
+    }
+
     // Run session lookup and participant listing concurrently — both depend
     // only on session_id and account for ~half the handshake DB time.
     let storage = state.sessions.storage();

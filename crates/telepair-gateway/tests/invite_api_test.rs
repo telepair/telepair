@@ -34,6 +34,54 @@ async fn create_session(app: &axum::Router, token: &str) -> String {
     body["id"].as_str().unwrap().to_owned()
 }
 
+/// Mint a fresh viewer invite for `session_id` as `owner_token` and
+/// return just the raw token string — the test bodies that use this
+/// don't care about the rest of the response.
+async fn mint_invite(app: &axum::Router, owner_token: &str, session_id: &str) -> String {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/sessions/{session_id}/invite"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"viewer","max_uses":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// Redeem an invite without credentials and return the minted guest
+/// bearer token. Panics if the response didn't include a token; any
+/// non-200 or missing token is a bug in the production code or the
+/// test setup that the test should fail loudly on, not retry.
+async fn anonymous_redeem(app: &axum::Router, raw_invite_token: &str) -> String {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/invite/redeem")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "token": raw_invite_token }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["token"]
+        .as_str()
+        .expect("anonymous redeem must return a fresh guest token")
+        .to_owned()
+}
+
 #[tokio::test]
 async fn create_and_redeem_invite() {
     let (state, app, owner_token) = setup().await;
@@ -427,6 +475,232 @@ async fn redeem_by_existing_participant_does_not_burn_invite_uses() {
         resp.status(),
         StatusCode::OK,
         "second use must still be available after the no-op repeat-click"
+    );
+}
+
+#[tokio::test]
+async fn guest_token_cannot_list_targets() {
+    // The entire point of `scoped_session_id`: a guest bearer token
+    // must not be accepted on account-level routes. Before this
+    // fix, `redeem_invite` minted a plain non-admin user whose
+    // token was indistinguishable from a normal account — the
+    // holder could leave their invited session and call
+    // `GET /api/targets` to enumerate everything on the box. 403
+    // (not 401) because the token is valid, it just doesn't have
+    // the scope for this route.
+    let (_state, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    // Owner mints an invite; a fresh browser redeems anonymously
+    // and we pull the guest token out of the response.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/sessions/{session_id}/invite"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"viewer","max_uses":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let raw_token = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/invite/redeem")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"token": raw_token}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let guest_token = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Guest hits the dashboard endpoint — must be 403 Forbidden.
+    let resp = app
+        .oneshot(
+            Request::get("/api/targets")
+                .header("Authorization", format!("Bearer {guest_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "scoped guest must not be able to list targets"
+    );
+}
+
+#[tokio::test]
+async fn guest_token_cannot_create_session() {
+    // Teeth of the invite privilege-escalation fix: even with a
+    // valid guest token, `POST /api/sessions` must refuse. Before
+    // the scope check, a redeemed viewer invite could be used to
+    // spawn a brand-new shell session behind the scenes — the
+    // holder was effectively a full non-admin account. This test
+    // fails if a future refactor drops `require_unscoped` from
+    // `create_session`.
+    let (_state, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/sessions/{session_id}/invite"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"operator","max_uses":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let raw_token = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/invite/redeem")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"token": raw_token}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let guest_token = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/sessions")
+                .header("Authorization", format!("Bearer {guest_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"target_name":"local-shell"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "scoped guest must not be able to create a new session"
+    );
+}
+
+#[tokio::test]
+async fn guest_token_is_scoped_to_redeemed_session() {
+    // Directly asserts the scope binding made by `redeem_invite`.
+    // The explicit field check is cheap insurance against the
+    // whole-class of future bugs where somebody "simplifies"
+    // `create_guest(&invite.session_id)` back to `create_guest()`.
+    let (state, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/sessions/{session_id}/invite"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"viewer","max_uses":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let raw_token = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/invite/redeem")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"token": raw_token}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let guest_token = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let guest = state.auth.validate(&guest_token).await.unwrap();
+    assert_eq!(
+        guest.scoped_session_id.as_deref(),
+        Some(session_id.as_str()),
+        "anonymous redeem must scope the guest to the invite's session"
+    );
+    assert!(guest.is_guest(), "is_guest helper must report true");
+}
+
+#[tokio::test]
+async fn scoped_guest_cannot_redeem_other_session_invite() {
+    // Cross-session pivot attempt: a guest already bound to session
+    // A tries to redeem an invite targeted at session B while
+    // carrying their existing token. Must be 403 — otherwise a
+    // guest in any live session could collect invite URLs from
+    // other sessions and use their existing identity to pivot,
+    // which partially undoes the scope.
+    //
+    // (The guest can still open the new session the *correct* way
+    // — fresh tab, no credentials — and get a second, correctly-
+    // scoped guest identity.)
+    let (_state, app, owner_token) = setup().await;
+    let session_a = create_session(&app, &owner_token).await;
+    let session_b = create_session(&app, &owner_token).await;
+
+    // Guest redeems session A anonymously.
+    let invite_a = mint_invite(&app, &owner_token, &session_a).await;
+    let guest_token = anonymous_redeem(&app, &invite_a).await;
+
+    // Owner mints an invite for session B.
+    let invite_b = mint_invite(&app, &owner_token, &session_b).await;
+
+    // Guest (scoped to A) tries to redeem B with their token.
+    let resp = app
+        .oneshot(
+            Request::post("/api/invite/redeem")
+                .header("Authorization", format!("Bearer {guest_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"token": invite_b}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "scoped guest must not pivot to another session's invite"
     );
 }
 

@@ -39,7 +39,7 @@ async fn setup_initial_admin() {
 async fn create_guest_returns_validatable_token() {
     let store = Arc::new(SqliteStorage::new_memory().await.unwrap());
     let auth = TokenAuthProvider::new(store);
-    let (user, token) = auth.create_guest().await.unwrap();
+    let (user, token) = auth.create_guest("sess-abc").await.unwrap();
 
     assert!(!user.is_admin, "guests must never have admin rights");
     assert!(
@@ -47,12 +47,26 @@ async fn create_guest_returns_validatable_token() {
         "guest name should use guest- prefix, got {}",
         user.name
     );
+    // The scoped_session_id is the load-bearing bit that closes the
+    // invite privilege-escalation hole — losing it would silently
+    // re-open the bug, so the guest contract pins it explicitly.
+    assert_eq!(
+        user.scoped_session_id.as_deref(),
+        Some("sess-abc"),
+        "guest must be bound to the session id passed to create_guest"
+    );
+    assert!(user.is_guest(), "guest helper must agree with the field");
 
     // The freshly issued token should authenticate as the same user —
     // this is the contract the redeem handler relies on to make
     // invite links "just work" without any prior registration.
     let validated = auth.validate(&token).await.unwrap();
     assert_eq!(validated.id, user.id);
+    assert_eq!(
+        validated.scoped_session_id.as_deref(),
+        Some("sess-abc"),
+        "scope must round-trip through token validation"
+    );
 }
 
 #[tokio::test]
@@ -65,8 +79,24 @@ async fn create_guest_issues_unique_names() {
     let store = Arc::new(SqliteStorage::new_memory().await.unwrap());
     let auth = TokenAuthProvider::new(store);
 
-    let (a, _) = auth.create_guest().await.unwrap();
-    let (b, _) = auth.create_guest().await.unwrap();
+    let (a, _) = auth.create_guest("sess-1").await.unwrap();
+    let (b, _) = auth.create_guest("sess-2").await.unwrap();
     assert_ne!(a.id, b.id);
     assert_ne!(a.name, b.name);
+}
+
+#[tokio::test]
+async fn create_user_is_never_scoped() {
+    // Admin/CLI path creates real accounts that must have full
+    // (role-gated) access to account-level routes. The `scoped_`
+    // column must stay NULL on this path; a regression here would
+    // silently lock legitimate users out of the dashboard.
+    let store = Arc::new(SqliteStorage::new_memory().await.unwrap());
+    let (admin, _) = store.create_user("admin", true).await.unwrap();
+    assert!(admin.scoped_session_id.is_none());
+    assert!(!admin.is_guest());
+
+    let (regular, _) = store.create_user("regular", false).await.unwrap();
+    assert!(regular.scoped_session_id.is_none());
+    assert!(!regular.is_guest());
 }
