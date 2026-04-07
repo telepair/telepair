@@ -229,7 +229,19 @@ pub async fn create_invite(
     Path(session_id): Path<String>,
     body: Result<Json<CreateInviteRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    extract_user_and_owned_session(&state, &headers, &session_id).await?;
+    let (_user, session) = extract_user_and_owned_session(&state, &headers, &session_id).await?;
+
+    // State-machine gate: a closed session must not grow new
+    // invites. Without this check the handler happily mints a token
+    // that `redeem_invite` will reject with 410 (see
+    // `redeem_invite`'s status check below) — i.e. the API returns
+    // `201 Created` for an object that is guaranteed to be useless,
+    // leaving zombie invite rows in the DB and a broken share-link
+    // in the owner's hands. Mirror the redeem-side gate so the two
+    // halves of the lifecycle agree on what "alive" means.
+    if session.status != telepair_core::session::SessionStatus::Active {
+        return Err(StatusCode::GONE);
+    }
 
     // Axum's default JSON rejection is 422; every other handler in this
     // file remaps to 400 so clients get a consistent "you sent garbage"

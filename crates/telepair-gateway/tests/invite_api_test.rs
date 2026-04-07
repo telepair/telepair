@@ -1155,3 +1155,56 @@ async fn redeem_invite_on_closed_session_rejected() {
         "no ghost operator participant should exist after rejected redeem"
     );
 }
+
+#[tokio::test]
+async fn create_invite_on_closed_session_returns_gone() {
+    // Symmetric to `redeem_invite_on_closed_session_rejected`: the
+    // *creation* side of the invite lifecycle must also reject a
+    // closed session. Before this gate, an owner who closed a
+    // session and then opened the invite dialog (or hit the API
+    // directly) would get `201 Created` with a fresh token —
+    // `redeem_invite` then bounced that token with 410 because the
+    // status check on the redeem path *is* there. Net result: zombie
+    // invite rows in the DB and a guaranteed-broken share link in
+    // the owner's clipboard. The two halves of the lifecycle must
+    // agree on what "alive" means.
+    let (state, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    // Close the session out-of-band so the next request hits a
+    // genuinely closed row, same path the DELETE handler uses.
+    state.sessions.close_session(&session_id).await.unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/sessions/{session_id}/invite"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"viewer","max_uses":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::GONE,
+        "creating an invite on a closed session must report 410 Gone — otherwise the owner gets \
+         a 201 with a token that redeem will reject, leaving zombie invite rows in the DB"
+    );
+
+    // Belt-and-braces: confirm the response body did NOT include a
+    // token field. If a future refactor moves the gate to *after*
+    // `create_invite` runs, the storage write would already be
+    // visible and the response shape would silently leak it back.
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    if !bytes.is_empty() {
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("error response body must be valid JSON");
+        assert!(
+            body.get("token").is_none(),
+            "rejected create_invite must not return a token field, got: {body}"
+        );
+    }
+}
