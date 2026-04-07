@@ -184,6 +184,28 @@ export default function SessionPage() {
     socket?.reconnectNow();
   };
 
+  // Owners have a real dashboard to return to. Non-owners — guests
+  // and invited operators/viewers — do not: a scoped-guest token
+  // 403s on every dashboard route (`require_unscoped` in
+  // `crates/telepair-gateway/src/http.rs::list_targets`), and even
+  // a regular invited user has no business on the owner's
+  // dashboard. Before this fix, both the topbar "← Back" button and
+  // the session-ended banner action navigated to `/`, which left
+  // guests stranded on a broken empty-state page that also leaked
+  // the server-side config path. Route them through logout instead
+  // so they land cleanly on /login and can re-redeem their invite
+  // (or be done).
+  const goHomeOrLogout = () => {
+    if (role() === 'owner') {
+      navigate('/');
+      return;
+    }
+    auth.logout();
+    if (typeof window !== 'undefined') {
+      window.location.assign('/login');
+    }
+  };
+
   // Connect WebSocket
   socket = new TelepairSocket(handleMessage, handleBinary, handleStatus);
   socket.onReconnectInfo = setReconnectInfo;
@@ -199,7 +221,9 @@ export default function SessionPage() {
   return (
     <div class="session-page">
       <header class="session-topbar">
-        <button class="back-btn" onClick={() => navigate('/')}>← Back</button>
+        <button class="back-btn" onClick={goHomeOrLogout}>
+          {role() === 'owner' ? '← Back' : 'Log out'}
+        </button>
         <span class="session-label">Session: <code>{params.id}</code></span>
         <span class="role-badge" data-role={role()}>{role()}</span>
         <span class="status-dot" data-status={status()} />
@@ -223,7 +247,10 @@ export default function SessionPage() {
         <Banner
           variant="info"
           role="status"
-          action={{ label: 'Back to Dashboard', onClick: () => navigate('/') }}
+          action={{
+            label: role() === 'owner' ? 'Back to Dashboard' : 'Log out',
+            onClick: goHomeOrLogout,
+          }}
         >
           {endedReason()}
         </Banner>

@@ -102,10 +102,9 @@ export default function Dashboard() {
                 <div class="empty-state">
                   <p class="empty-title">No targets available</p>
                   <p class="empty-body">
-                    Define named commands in <code>~/.telepair/targets.yaml</code>.
-                    A default <code>local-shell</code> target should always be
-                    present — if you don't see it, check the server logs for
-                    config errors.
+                    No targets are configured for this account. If you expected
+                    to see one here, contact your administrator or check the
+                    server logs.
                   </p>
                 </div>
               }
