@@ -1,14 +1,15 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
 use telepair_agent::pty::PtyManager;
+use telepair_core::error::Result;
 use telepair_core::permission::Role;
 use telepair_core::protocol::{ParticipantInfo, ServerMessage};
 use telepair_core::storage::{SqliteStorage, Storage};
@@ -34,6 +35,12 @@ const SCROLLBACK_CAP_BYTES: usize = 64 * 1024;
 /// can produce a slightly truncated first line on replay but never truncates
 /// in the middle of a keystroke-sized chunk, which is what matters for
 /// terminal escape-sequence coherence.
+///
+/// Guarded by `std::sync::Mutex` (not `tokio::sync::Mutex`) because the
+/// critical section is pure CPU — `push`, `snapshot`, and the broadcast
+/// `send` that runs alongside it never `.await`. A tokio async mutex
+/// would force every PTY chunk through the async scheduler for no
+/// reason; the std mutex is ~10× cheaper on the uncontended path.
 struct Scrollback {
     chunks: VecDeque<Bytes>,
     total: usize,
@@ -71,6 +78,21 @@ fn assign_color(index: usize) -> String {
 pub enum PtyCommand {
     Input(Bytes),
     Resize(u16, u16),
+}
+
+/// Subscription bundle handed back to a WS handler attaching to a live
+/// session. Named fields (not a 5-tuple) so adding a new channel
+/// doesn't force every call site to re-position its destructuring and
+/// the invariant of "every returned receiver lines up with `scrollback`"
+/// lives in one type instead of scattered across call sites.
+pub struct SessionAttachment {
+    pub cmd_tx: mpsc::Sender<PtyCommand>,
+    pub output_rx: broadcast::Receiver<Bytes>,
+    pub collab_rx: broadcast::Receiver<ServerMessage>,
+    pub shutdown_rx: broadcast::Receiver<()>,
+    /// Scrollback chunks to replay before the live broadcast starts.
+    /// Empty for a freshly-spawned session.
+    pub scrollback: Vec<Bytes>,
 }
 
 /// Configuration for the background idle-session reaper.
@@ -159,38 +181,21 @@ impl SessionHub {
         env: &HashMap<String, String>,
         cols: u16,
         rows: u16,
-    ) -> Result<
-        (
-            mpsc::Sender<PtyCommand>,
-            broadcast::Receiver<Bytes>,
-            broadcast::Receiver<ServerMessage>,
-            broadcast::Receiver<()>,
-            Vec<Bytes>,
-        ),
-        String,
-    > {
+    ) -> Result<SessionAttachment> {
         // Fast path: session already running — subscribe under read lock.
-        // `subscribe_existing` grabs the scrollback lock, calls
+        // `attach_to` grabs the scrollback lock, calls
         // `output_tx.subscribe()` inside it, and only then snapshots, so the
         // returned receiver and snapshot line up without gap or duplication.
         {
             let sessions = self.sessions.read().await;
             if let Some(live) = sessions.get(session_id) {
-                let (output_rx, scrollback) = Self::subscribe_existing(live).await;
-                return Ok((
-                    live.cmd_tx.clone(),
-                    output_rx,
-                    live.collab_tx.subscribe(),
-                    live.shutdown_tx.subscribe(),
-                    scrollback,
-                ));
+                return Ok(Self::attach_to(live));
             }
         }
 
         // Spawn PTY without holding any lock (fork/exec can be slow)
         let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let mut pty = PtyManager::spawn_command(command, &args_ref, cols, rows, env)
-            .map_err(|e| e.to_string())?;
+        let mut pty = PtyManager::spawn_command(command, &args_ref, cols, rows, env)?;
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<PtyCommand>(256);
         let (output_tx, output_rx) = broadcast::channel::<Bytes>(256);
@@ -204,14 +209,7 @@ impl SessionHub {
             // Another task spawned the session while we were spawning — use theirs,
             // our PTY will be dropped and the child process cleaned up
             drop(pty);
-            let (output_rx, snapshot) = Self::subscribe_existing(live).await;
-            return Ok((
-                live.cmd_tx.clone(),
-                output_rx,
-                live.collab_tx.subscribe(),
-                live.shutdown_tx.subscribe(),
-                snapshot,
-            ));
+            return Ok(Self::attach_to(live));
         }
 
         let output_tx_clone = output_tx.clone();
@@ -259,11 +257,19 @@ impl SessionHub {
                         // broadcast, a subscriber could slip in and
                         // snapshot the chunk *and* subscribe before the
                         // broadcast fires, causing a duplicate.
-                        let mut sb = scrollback_for_pty.lock().await;
+                        // std::sync::Mutex: push + send are both CPU-only
+                        // and never .await. Holding the lock across
+                        // `send` is what gives attach_to's snapshot the
+                        // "every chunk is in the snapshot OR delivered,
+                        // never both" invariant (see attach_to's doc).
+                        let mut sb = scrollback_for_pty
+                            .lock()
+                            .expect("scrollback mutex poisoned");
                         sb.push(bytes.clone());
                         // Already a refcounted Bytes from the PTY reader;
                         // every subscriber clone is an Arc bump, not a copy.
                         let _ = output_tx_clone.send(bytes);
+                        drop(sb);
                     }
                     Action::Output(None) => {
                         tracing::info!(session = %session_id_owned, "PTY process exited");
@@ -328,18 +334,21 @@ impl SessionHub {
         sessions.insert(session_id.to_string(), live);
 
         // Brand-new session: no scrollback yet, and nothing can have been
-        // broadcast on `output_rx` since we just created it.
-        Ok((cmd_tx, output_rx, collab_rx, shutdown_rx, Vec::new()))
+        // broadcast on `output_rx` since we just created it — reuse the
+        // original channels instead of re-subscribing.
+        Ok(SessionAttachment {
+            cmd_tx,
+            output_rx,
+            collab_rx,
+            shutdown_rx,
+            scrollback: Vec::new(),
+        })
     }
 
-    /// Atomically subscribe to PTY output AND snapshot scrollback for a
-    /// subscriber that's joining an already-live session.
-    ///
-    /// The PTY writer takes the same `scrollback` lock around its
-    /// `push` + `output_tx.send` pair, so holding it across both
-    /// `output_tx.subscribe()` and `sb.snapshot()` here gives us the
-    /// "every chunk is in the snapshot OR delivered via the receiver,
-    /// never both, never neither" invariant:
+    /// Build a `SessionAttachment` for a subscriber that's joining an
+    /// already-live session. Atomically subscribes to PTY output AND
+    /// snapshots scrollback under the scrollback lock so the two line up
+    /// without gap or duplication:
     ///
     ///   - Any chunk pushed before we acquired the lock is in the
     ///     snapshot. We were not subscribed when it was broadcast, so
@@ -348,15 +357,27 @@ impl SessionHub {
     ///     via the receiver, because we already subscribed before the
     ///     writer could acquire the lock again.
     ///
-    /// If we called `subscribe()` after releasing the lock (the old
-    /// behavior), a chunk could slip in during that gap and be lost
-    /// entirely: not in the snapshot, and broadcast before the receiver
-    /// existed.
-    async fn subscribe_existing(live: &LiveSession) -> (broadcast::Receiver<Bytes>, Vec<Bytes>) {
-        let sb = live.scrollback.lock().await;
-        let output_rx = live.output_tx.subscribe();
-        let snapshot = sb.snapshot();
-        (output_rx, snapshot)
+    /// If we called `subscribe()` after releasing the lock, a chunk
+    /// could slip in during that gap and be lost entirely — not in the
+    /// snapshot, and broadcast before the receiver existed. The `cmd_tx`,
+    /// `collab_tx`, and `shutdown_tx` clones don't need the lock and are
+    /// taken after releasing it to keep the critical section tight.
+    fn attach_to(live: &LiveSession) -> SessionAttachment {
+        // std::sync::Mutex — critical section is purely CPU (subscribe
+        // + snapshot) so no async lock needed. Never held across .await.
+        let (output_rx, scrollback) = {
+            let sb = live.scrollback.lock().expect("scrollback mutex poisoned");
+            let output_rx = live.output_tx.subscribe();
+            let scrollback = sb.snapshot();
+            (output_rx, scrollback)
+        };
+        SessionAttachment {
+            cmd_tx: live.cmd_tx.clone(),
+            output_rx,
+            collab_rx: live.collab_tx.subscribe(),
+            shutdown_rx: live.shutdown_tx.subscribe(),
+            scrollback,
+        }
     }
 
     /// Force-stop a live session by signalling all connected WS handlers,
@@ -369,22 +390,23 @@ impl SessionHub {
         sessions.remove(session_id);
     }
 
-    /// Register a WS connection for a participant. The first connection for
-    /// a given `user_id` broadcasts `PeerJoined` and assigns a color;
-    /// subsequent connections (e.g. a second tab) just bump the refcount and
-    /// reuse the existing participant record. Returns `true` when the
-    /// session exists and the connection was registered.
-    pub async fn add_participant(
+    /// Register a WS connection for a participant AND return the full
+    /// participant snapshot under the same write lock, so the caller can
+    /// deliver a `SessionState` containing the joining user without a
+    /// second round-trip through `get_participants`. The first connection
+    /// for a given `user_id` broadcasts `PeerJoined` and assigns a color;
+    /// subsequent connections (e.g. a second tab) just bump the refcount
+    /// and reuse the existing participant record. Returns `None` if the
+    /// session isn't in the hub.
+    pub async fn add_participant_and_snapshot(
         &self,
         session_id: &str,
         user_id: Uuid,
         name: String,
         role: Role,
-    ) -> bool {
+    ) -> Option<Vec<ParticipantInfo>> {
         let mut sessions = self.sessions.write().await;
-        let Some(live) = sessions.get_mut(session_id) else {
-            return false;
-        };
+        let live = sessions.get_mut(session_id)?;
 
         // Any successful attach clears the idle clock. Do this before the
         // refcount bump so a reconnect during the reaper's grace period
@@ -393,35 +415,35 @@ impl SessionHub {
 
         let count = live.connections.entry(user_id).or_insert(0);
         *count += 1;
-        if *count > 1 {
-            // Additional connection from an already-joined user. Don't
-            // re-broadcast PeerJoined or reassign a color — the existing
-            // participant record stays authoritative.
-            return true;
-        }
+        let first_connection = *count == 1;
 
-        let color = assign_color(live.color_counter);
-        live.color_counter += 1;
+        if first_connection {
+            let color = assign_color(live.color_counter);
+            live.color_counter += 1;
 
-        live.participants.insert(
-            user_id,
-            ParticipantInfo {
+            live.participants.insert(
                 user_id,
-                name: name.clone(),
+                ParticipantInfo {
+                    user_id,
+                    name: name.clone(),
+                    role,
+                    color: color.clone(),
+                },
+            );
+
+            // Broadcast PeerJoined to all collab subscribers
+            let _ = live.collab_tx.send(ServerMessage::PeerJoined {
+                user_id,
+                name,
                 role,
-                color: color.clone(),
-            },
-        );
+                color,
+            });
+        }
+        // Else: additional connection from an already-joined user — don't
+        // re-broadcast PeerJoined or reassign a color; the existing
+        // participant record stays authoritative.
 
-        // Broadcast PeerJoined to all collab subscribers
-        let _ = live.collab_tx.send(ServerMessage::PeerJoined {
-            user_id,
-            name,
-            role,
-            color,
-        });
-
-        true
+        Some(live.participants.values().cloned().collect())
     }
 
     /// Unregister a WS connection. Only the final connection for a `user_id`
@@ -457,15 +479,6 @@ impl SessionHub {
         }
 
         true
-    }
-
-    /// Get a snapshot of all participants in a session.
-    pub async fn get_participants(&self, session_id: &str) -> Vec<ParticipantInfo> {
-        let sessions = self.sessions.read().await;
-        sessions
-            .get(session_id)
-            .map(|live| live.participants.values().cloned().collect())
-            .unwrap_or_default()
     }
 
     /// Broadcast an arbitrary collaboration message to all subscribers in a session.
