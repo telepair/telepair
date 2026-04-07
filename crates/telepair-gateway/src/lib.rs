@@ -7,7 +7,6 @@ pub mod ws;
 
 use std::convert::Infallible;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use axum::{
     Router,
@@ -15,6 +14,7 @@ use axum::{
     http::{HeaderValue, Request, Response, StatusCode, header},
     routing::{delete, get, post},
 };
+use bytes::Bytes;
 use state::AppState;
 use tower::service_fn;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -142,12 +142,13 @@ pub fn build_router_with_options(
             // Correct behaviour: the SPA shell should answer with
             // `200 OK` for any non-asset request so the client-side
             // router can take over. We read `index.html` once at
-            // boot, wrap it in an `Arc<Vec<u8>>`, and hand
+            // boot, wrap it in a refcounted `Bytes`, and hand
             // `ServeDir` a `service_fn` fallback that returns the
-            // bytes with an explicit 200 for every path. Reading
-            // once avoids a disk hit on every deep-link request;
-            // if `index.html` can't be read at startup we fail
-            // loudly rather than silently serving an empty body.
+            // bytes with an explicit 200 for every path. `Bytes`
+            // lets every request share the same buffer via an Arc
+            // bump — no memcpy per deep link. If `index.html` can't
+            // be read at startup we fail loudly rather than
+            // silently serving an empty body.
             let index_path: PathBuf = PathBuf::from(dir).join("index.html");
             let index_bytes = std::fs::read(&index_path).map_err(|e| {
                 format!(
@@ -156,7 +157,7 @@ pub fn build_router_with_options(
                     index_path.display()
                 )
             })?;
-            let index_body: Arc<Vec<u8>> = Arc::new(index_bytes);
+            let index_body: Bytes = Bytes::from(index_bytes);
             let spa_fallback = service_fn(move |req: Request<Body>| {
                 let body = index_body.clone();
                 async move {
@@ -195,7 +196,7 @@ pub fn build_router_with_options(
                         // navigation. Hashed asset files keep their
                         // own caching via `ServeDir`.
                         .header(header::CACHE_CONTROL, "no-cache")
-                        .body(Body::from(body.as_ref().clone()))
+                        .body(Body::from(body))
                         .expect("static SPA shell response is always well-formed");
                     Ok::<_, Infallible>(response)
                 }
