@@ -42,6 +42,20 @@ cargo clippy --workspace                     # Rust linting
 
 All crates use `#![deny(unsafe_code)]`.
 
+## Pre-push Gate
+
+**`make all` must pass before any `git push`.** No exceptions. This is the single
+source of truth for "ready to push": it runs `fmt-check`, `lint` (clippy + tsc),
+`test` (cargo + vitest), and `build` (release binary + web bundle) in one shot.
+
+```bash
+make all                                     # required before every push
+```
+
+If `make all` fails, fix the issue at its root — do not bypass with `--no-verify`,
+`fmt`-only partial runs, or skipping a subcommand. E2E (`make e2e`) is not part of
+the gate but should be run before shipping user-facing changes.
+
 ## Architecture
 
 Telepair is a web-based terminal collaboration tool — "Google Docs for your terminal." It's a Cargo workspace with 5 crates following a composable role architecture:
