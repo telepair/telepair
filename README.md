@@ -1,3 +1,5 @@
+English | [简体中文](README.zh-CN.md)
+
 # telepair
 
 **Google Docs for your terminal.** Share terminal sessions with collaborators in real time, right from the browser.
@@ -11,7 +13,7 @@ telepair is an open-source web terminal collaboration tool. Run it on any machin
 - **Invite links** — share a link to let others join your session with a specific role
 - **Virtual targets** — define named commands (SSH, psql, htop, etc.) as launchable targets via YAML config
 - **Built-in chat** — sidebar chat alongside the terminal for coordination
-- **Single binary** — one binary with composable roles for flexible deployment
+- **Single binary** — one executable runs agent, control, and gateway in one process; clustering is planned future work
 - **Web UI** — SolidJS frontend with xterm.js, no client install required
 
 ## Quick Start

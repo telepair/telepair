@@ -1,3 +1,5 @@
+English | [简体中文](architecture.zh-CN.md)
+
 # Architecture
 
 telepair is built as a Cargo workspace with five crates, each owning a distinct layer. A single binary (`telepair`) composes these layers via role flags.

@@ -1,3 +1,5 @@
+English | [简体中文](deployment.zh-CN.md)
+
 # Deployment Guide
 
 ## Single-Machine Deployment
