@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use telepair_agent::virtual_target::TargetEngine;
 use telepair_control::session_service::SessionService;
-use telepair_control::target_service::TargetService;
 use telepair_core::auth::TokenAuthProvider;
 use telepair_core::storage::{SqliteStorage, Storage};
 
@@ -12,7 +11,7 @@ use crate::session_hub::{ReaperConfig, SessionHub};
 pub struct AppState {
     pub auth: Arc<TokenAuthProvider>,
     pub sessions: Arc<SessionService>,
-    pub targets: Arc<TargetService>,
+    pub targets: Arc<TargetEngine>,
     pub hub: Arc<SessionHub>,
 }
 
@@ -20,7 +19,7 @@ impl AppState {
     pub async fn new(storage: Arc<SqliteStorage>, engine: TargetEngine) -> Self {
         let auth = Arc::new(TokenAuthProvider::new(storage.clone()));
         let sessions = Arc::new(SessionService::new(storage.clone()));
-        let targets = Arc::new(TargetService::new(engine));
+        let targets = Arc::new(engine);
         let hub = Arc::new(SessionHub::new(storage.clone()));
         // Production: start the idle-session reaper so orphaned PTYs
         // don't leak when all clients disconnect. The JoinHandle is
@@ -47,7 +46,7 @@ impl AppState {
         // reaper spawn it explicitly.
         let auth = Arc::new(TokenAuthProvider::new(storage.clone()));
         let sessions = Arc::new(SessionService::new(storage.clone()));
-        let targets = Arc::new(TargetService::new(engine));
+        let targets = Arc::new(engine);
         let hub = Arc::new(SessionHub::new(storage.clone()));
         Self {
             auth,
