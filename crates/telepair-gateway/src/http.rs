@@ -2,7 +2,7 @@ use axum::{
     Json,
     extract::{Path, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -14,29 +14,41 @@ use telepair_core::storage::Storage;
 
 use crate::state::AppState;
 
-/// Lift a `core::Error` into the right HTTP status. Handlers should use
-/// this instead of hand-written `map_err(|_| StatusCode::X)` so that
-/// `InvalidInput` never leaks out as 500 and authorization failures
-/// always come back as 401 / 403, even when the underlying call site
-/// only knows it got "some error".
-fn status_for(err: &Error) -> StatusCode {
-    StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+/// Handler-level error wrapper. `?` on any `Result<_, core::Error>`
+/// lifts via `From`, so `InvalidInput` never leaks out as 500 and auth
+/// failures always surface as 401/403. `StatusCode` also lifts in, for
+/// the handful of sites that short-circuit with a hard-coded status
+/// (e.g. `return Err(StatusCode::BAD_REQUEST.into())` on body validation).
+pub struct ApiError(StatusCode);
+
+impl From<Error> for ApiError {
+    fn from(e: Error) -> Self {
+        Self(StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+    }
+}
+
+impl From<StatusCode> for ApiError {
+    fn from(s: StatusCode) -> Self {
+        Self(s)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        self.0.into_response()
+    }
 }
 
 // --- Auth extraction ---
 
-pub async fn extract_user(state: &AppState, headers: &HeaderMap) -> Result<User, StatusCode> {
+pub async fn extract_user(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
     let token = headers
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+        .ok_or(ApiError(StatusCode::UNAUTHORIZED))?;
 
-    state
-        .auth
-        .validate(token)
-        .await
-        .map_err(|_| StatusCode::UNAUTHORIZED)
+    Ok(state.auth.validate(token).await?)
 }
 
 /// Reject invite-minted guests on account-level routes. A scoped
@@ -44,9 +56,9 @@ pub async fn extract_user(state: &AppState, headers: &HeaderMap) -> Result<User,
 /// usable to enumerate targets, spin up new sessions, or otherwise
 /// behave like a real account. 403 (not 401) because the caller is
 /// authenticated, they just don't have the scope for this route.
-fn require_unscoped(user: &User) -> Result<(), StatusCode> {
+fn require_unscoped(user: &User) -> Result<(), ApiError> {
     if user.is_guest() {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(ApiError(StatusCode::FORBIDDEN));
     }
     Ok(())
 }
@@ -54,23 +66,21 @@ fn require_unscoped(user: &User) -> Result<(), StatusCode> {
 /// Run auth extraction and session lookup concurrently, then verify the
 /// authenticated user owns the session. Shaves one DB-query latency off
 /// each authenticated single-session endpoint.
-async fn extract_user_and_owned_session(
+async fn extract_owned_session(
     state: &AppState,
     headers: &HeaderMap,
     session_id: &str,
-) -> Result<(User, Session), StatusCode> {
+) -> Result<Session, ApiError> {
     let (user_res, session_res) = tokio::join!(
         extract_user(state, headers),
         state.sessions.storage().get_session(session_id),
     );
     let user = user_res?;
-    let session = session_res
-        .map_err(|e| status_for(&e))?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let session = session_res?.ok_or(ApiError(StatusCode::NOT_FOUND))?;
     if session.owner_id != user.id {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(ApiError(StatusCode::FORBIDDEN));
     }
-    Ok((user, session))
+    Ok(session)
 }
 
 // --- Handlers ---
@@ -82,7 +92,7 @@ pub async fn health() -> impl IntoResponse {
 pub async fn list_targets(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, ApiError> {
     let user = extract_user(&state, &headers).await?;
     // Guests are scoped to a single session and have no dashboard —
     // they must never see a target list at all. (Separate finding
@@ -139,7 +149,7 @@ pub async fn create_session(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Result<Json<CreateSessionRequest>, JsonRejection>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, ApiError> {
     // Auth first so unauthenticated callers get 401 instead of 400,
     // matching the other handlers in this file.
     let user = extract_user(&state, &headers).await?;
@@ -151,16 +161,16 @@ pub async fn create_session(
     // Axum's default JSON rejection is 422; we want 400 so an unknown
     // `input_mode` value reads as "client sent garbage" instead of
     // "server doesn't know what to do with it".
-    let Json(body) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
+    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
 
     // Verify target exists and enforce admin-only restriction
     let target = state
         .targets
         .find(&body.target_name)
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or(ApiError(StatusCode::NOT_FOUND))?;
 
     if target.admin_only && !user.is_admin {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(ApiError(StatusCode::FORBIDDEN));
     }
 
     let mode = body.input_mode.unwrap_or(InputMode::Multiplexed);
@@ -168,8 +178,7 @@ pub async fn create_session(
     let session = state
         .sessions
         .create_session(user.id, &body.target_name, mode)
-        .await
-        .map_err(|e| status_for(&e))?;
+        .await?;
 
     Ok((StatusCode::CREATED, Json(session)))
 }
@@ -177,13 +186,9 @@ pub async fn create_session(
 pub async fn list_sessions(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, ApiError> {
     let user = extract_user(&state, &headers).await?;
-    let visible = state
-        .sessions
-        .list_sessions_for_user(user.id)
-        .await
-        .map_err(|e| status_for(&e))?;
+    let visible = state.sessions.list_sessions_for_user(user.id).await?;
 
     Ok(Json(visible))
 }
@@ -228,8 +233,8 @@ pub async fn create_invite(
     headers: HeaderMap,
     Path(session_id): Path<String>,
     body: Result<Json<CreateInviteRequest>, JsonRejection>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let (_user, session) = extract_user_and_owned_session(&state, &headers, &session_id).await?;
+) -> Result<impl IntoResponse, ApiError> {
+    let session = extract_owned_session(&state, &headers, &session_id).await?;
 
     // State-machine gate: a closed session must not grow new
     // invites. Without this check the handler happily mints a token
@@ -240,21 +245,21 @@ pub async fn create_invite(
     // in the owner's hands. Mirror the redeem-side gate so the two
     // halves of the lifecycle agree on what "alive" means.
     if session.status != telepair_core::session::SessionStatus::Active {
-        return Err(StatusCode::GONE);
+        return Err(ApiError(StatusCode::GONE));
     }
 
     // Axum's default JSON rejection is 422; every other handler in this
     // file remaps to 400 so clients get a consistent "you sent garbage"
     // signal regardless of which field was wrong.
-    let Json(body) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
+    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
 
     // Only operator and viewer roles can be invited
     if body.role == Role::Owner {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(ApiError(StatusCode::BAD_REQUEST));
     }
 
     if body.max_uses < 1 || body.max_uses > MAX_INVITE_USES {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(ApiError(StatusCode::BAD_REQUEST));
     }
 
     // Resolve expiry: absolute timestamp wins over TTL, both are
@@ -263,7 +268,7 @@ pub async fn create_invite(
     let expires_at = match (body.expires_at, body.expires_in_minutes) {
         (Some(at), _) => {
             if at <= Utc::now() {
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(ApiError(StatusCode::BAD_REQUEST));
             }
             Some(at)
         }
@@ -274,7 +279,7 @@ pub async fn create_invite(
         (None, Some(_)) => {
             // Zero or negative TTL is not a thing — reject loudly rather
             // than silently creating a "never-expires" invite.
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(ApiError(StatusCode::BAD_REQUEST));
         }
         (None, None) => None,
     };
@@ -285,8 +290,7 @@ pub async fn create_invite(
         .sessions
         .storage()
         .create_invite(&session_id, role, body.max_uses, expires_at)
-        .await
-        .map_err(|e| status_for(&e))?;
+        .await?;
 
     Ok((
         StatusCode::CREATED,
@@ -309,13 +313,9 @@ pub async fn close_session(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(session_id): Path<String>,
-) -> Result<impl IntoResponse, StatusCode> {
-    extract_user_and_owned_session(&state, &headers, &session_id).await?;
-    state
-        .sessions
-        .close_session(&session_id)
-        .await
-        .map_err(|e| status_for(&e))?;
+) -> Result<impl IntoResponse, ApiError> {
+    extract_owned_session(&state, &headers, &session_id).await?;
+    state.sessions.close_session(&session_id).await?;
     state.hub.stop_session(&session_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -338,15 +338,17 @@ pub async fn redeem_invite(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Result<Json<RedeemInviteRequest>, JsonRejection>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, ApiError> {
     // Best-effort auth: a bearer token is no longer required. We try
     // to validate it so a logged-in user reuses their identity, but
     // a missing/invalid token falls through to the guest path instead
-    // of failing the whole request.
+    // of failing the whole request. Only `UNAUTHORIZED` is swallowed —
+    // any other status (e.g. 500 from a DB outage) still propagates so
+    // the caller gets a real error instead of a spurious guest mint.
     let existing_user = match extract_user(&state, &headers).await {
         Ok(u) => Some(u),
-        Err(StatusCode::UNAUTHORIZED) => None,
-        Err(status) => return Err(status),
+        Err(ApiError(StatusCode::UNAUTHORIZED)) => None,
+        Err(other) => return Err(other),
     };
 
     // Keep the JSON rejection semantics consistent across the handlers:
@@ -354,7 +356,7 @@ pub async fn redeem_invite(
     // frontend's error-handling code which branches on "bad request"
     // (show form error) vs "server error" (show toast + retry) — the
     // old 422 made bogus redeems look like a server crash.
-    let Json(body) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
+    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
 
     // Look up the invite first (no state change) so we can validate
     // the session is still alive before burning a use on a closed
@@ -362,10 +364,7 @@ pub async fn redeem_invite(
     // would decrement `max_uses` and insert a ghost participant — the
     // invite counter drains and nothing useful happens.
     let storage = state.sessions.storage();
-    let preview = storage
-        .find_invite(&body.token)
-        .await
-        .map_err(|e| status_for(&e))?;
+    let preview = storage.find_invite(&body.token).await?;
 
     // Scoped-guest cross-session redeem: a guest whose token was
     // issued for session A must not be able to redeem an invite for
@@ -380,30 +379,26 @@ pub async fn redeem_invite(
         && let Some(ref scope) = user.scoped_session_id
         && preview.session_id != *scope
     {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(ApiError(StatusCode::FORBIDDEN));
     }
     let session = storage
         .get_session(&preview.session_id)
-        .await
-        .map_err(|e| status_for(&e))?
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .await?
+        .ok_or(ApiError(StatusCode::NOT_FOUND))?;
     if session.status != telepair_core::session::SessionStatus::Active {
         // Gone / closed — fail without consuming the invite so the
         // operator can still retract it or reuse uses on a new session.
-        return Err(StatusCode::GONE);
+        return Err(ApiError(StatusCode::GONE));
     }
 
-    // Finding #8: if the authenticated caller is already a member of
-    // this session (owner or any role), treat the redeem as a no-op
-    // that **does not** consume the invite. Before this check, an
-    // owner clicking their own share link to sanity-check it would
-    // silently burn one of the `max_uses` and often drop the invite
-    // to zero remaining uses before any guest saw it.
+    // If the authenticated caller is already a member of this session
+    // (owner or any role), treat the redeem as a no-op that **does
+    // not** consume the invite. Before this check, an owner clicking
+    // their own share link to sanity-check it would silently burn one
+    // of the `max_uses` and often drop the invite to zero remaining
+    // uses before any guest saw it.
     if let Some(ref user) = existing_user {
-        let participants = storage
-            .list_participants(&preview.session_id)
-            .await
-            .map_err(|e| status_for(&e))?;
+        let participants = storage.list_participants(&preview.session_id).await?;
         if let Some(existing) = participants.iter().find(|p| p.user_id == user.id) {
             return Ok(Json(serde_json::json!({
                 "session_id": preview.session_id,
@@ -418,10 +413,7 @@ pub async fn redeem_invite(
     // races in between the check above and this call is possible but
     // harmless — the participant insert below just won't be visible
     // because the stopped session's in-memory hub entry is gone.
-    let invite = storage
-        .consume_invite(&body.token)
-        .await
-        .map_err(|e| status_for(&e))?;
+    let invite = storage.consume_invite(&body.token).await?;
 
     // Decide which user joins: reuse the authenticated caller, or
     // mint a fresh guest. Guests are only created **after** the
@@ -433,19 +425,14 @@ pub async fn redeem_invite(
     let (user, issued_token) = match existing_user {
         Some(u) => (u, None),
         None => {
-            let (guest, raw_token) = state
-                .auth
-                .create_guest(&invite.session_id)
-                .await
-                .map_err(|e| status_for(&e))?;
+            let (guest, raw_token) = state.auth.create_guest(&invite.session_id).await?;
             (guest, Some(raw_token))
         }
     };
 
     storage
         .upsert_participant(&invite.session_id, user.id, invite.role)
-        .await
-        .map_err(|e| status_for(&e))?;
+        .await?;
 
     Ok(Json(serde_json::json!({
         "session_id": invite.session_id,
