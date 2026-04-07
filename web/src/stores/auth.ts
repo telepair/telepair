@@ -109,9 +109,23 @@ export function readCurrentToken(): string {
   return token();
 }
 
+/**
+ * Auth error states are stored as **i18n keys**, not pre-translated
+ * strings, so locale switches re-render the error live. The Login page
+ * resolves the key through `useI18n().t()` at render time. `null` means
+ * "no error". Adding a new error case requires:
+ *   1. Add the key here
+ *   2. Add the translation in `i18n/locales/en.ts` and `zh.ts`
+ *   3. Use `setErrorKey('auth.error.<name>')` from this module
+ */
+export type AuthErrorKey =
+  | 'auth.error_invalid_token'
+  | 'auth.error_connection_failed'
+  | null;
+
 const [token, setTokenSignal] = createSignal(readInitialToken());
 const [validating, setValidating] = createSignal(false);
-const [error, setError] = createSignal('');
+const [errorKey, setErrorKey] = createSignal<AuthErrorKey>(null);
 
 export interface SetTokenOptions {
   /**
@@ -137,7 +151,7 @@ function setToken(value: string, options: SetTokenOptions = {}) {
     safeRemove(localStore(), STORAGE_KEY);
   }
   setTokenSignal(value);
-  setError('');
+  setErrorKey(null);
 }
 
 async function validateToken(t: string): Promise<boolean> {
@@ -152,9 +166,9 @@ async function validateToken(t: string): Promise<boolean> {
   } catch (e) {
     setToken('');
     if (e instanceof ApiError && e.status === 401) {
-      setError('Invalid token');
+      setErrorKey('auth.error_invalid_token');
     } else {
-      setError('Connection failed');
+      setErrorKey('auth.error_connection_failed');
     }
     return false;
   } finally {
@@ -173,7 +187,7 @@ function isAuthenticated(): boolean {
 export const auth = {
   token,
   validating,
-  error,
+  errorKey,
   setToken,
   validateToken,
   logout,

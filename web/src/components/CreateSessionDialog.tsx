@@ -1,5 +1,6 @@
 import { createEffect, createSignal, Show, For } from 'solid-js';
 import type { TargetInfo, InputMode } from '../lib/protocol';
+import { useI18n } from '../i18n';
 
 interface CreateSessionDialogProps {
   /** Target the user clicked; `null` means dialog is closed. Keeping this
@@ -33,6 +34,7 @@ interface CreateSessionDialogProps {
  *     remote hosts, etc.).
  */
 export default function CreateSessionDialog(props: CreateSessionDialogProps) {
+  const { t } = useI18n();
   const [mode, setMode] = createSignal<InputMode>(props.defaultMode);
 
   // Reset the local mode every time a new target is opened — otherwise
@@ -59,7 +61,7 @@ export default function CreateSessionDialog(props: CreateSessionDialogProps) {
             aria-labelledby="create-session-title"
             onClick={(e) => e.stopPropagation()}
           >
-            <h3 id="create-session-title">Start a session</h3>
+            <h3 id="create-session-title">{t('create_session.title')}</h3>
             <div class="target-summary">
               <div class="target-display">{target().display}</div>
               <div class="target-id">{target().name}</div>
@@ -72,8 +74,8 @@ export default function CreateSessionDialog(props: CreateSessionDialogProps) {
               </Show>
             </div>
 
-            <label class="mode-label">Input mode</label>
-            <div class="mode-options" role="radiogroup" aria-label="Input mode">
+            <label class="mode-label">{t('create_session.mode_label')}</label>
+            <div class="mode-options" role="radiogroup" aria-label={t('create_session.mode_label_aria')}>
               <button
                 type="button"
                 role="radio"
@@ -82,8 +84,8 @@ export default function CreateSessionDialog(props: CreateSessionDialogProps) {
                 disabled={props.busy}
                 onClick={() => setMode('multiplexed')}
               >
-                <span class="mode-title">Collaborative</span>
-                <span class="mode-desc">Invited operators can type, resize, and chat.</span>
+                <span class="mode-title">{t('create_session.mode_collaborative')}</span>
+                <span class="mode-desc">{t('create_session.mode_collaborative_desc')}</span>
               </button>
               <button
                 type="button"
@@ -93,14 +95,14 @@ export default function CreateSessionDialog(props: CreateSessionDialogProps) {
                 disabled={props.busy}
                 onClick={() => setMode('serialized')}
               >
-                <span class="mode-title">Solo</span>
-                <span class="mode-desc">Only you can type — guests watch and chat.</span>
+                <span class="mode-title">{t('create_session.mode_solo')}</span>
+                <span class="mode-desc">{t('create_session.mode_solo_desc')}</span>
               </button>
             </div>
 
             <div class="dialog-actions">
               <button type="button" onClick={props.onCancel} disabled={props.busy}>
-                Cancel
+                {t('common.cancel')}
               </button>
               <button
                 type="button"
@@ -108,7 +110,7 @@ export default function CreateSessionDialog(props: CreateSessionDialogProps) {
                 disabled={props.busy}
                 onClick={() => props.onLaunch(mode())}
               >
-                {props.busy ? 'Launching…' : 'Launch'}
+                {props.busy ? t('create_session.launching') : t('create_session.launch')}
               </button>
             </div>
 

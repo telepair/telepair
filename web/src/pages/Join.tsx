@@ -2,12 +2,26 @@ import { onMount, createSignal, Show } from 'solid-js';
 import { useParams, useNavigate } from '@solidjs/router';
 import { auth } from '../stores/auth';
 import { api, ApiError } from '../lib/api';
+import { useI18n, type TranslationKey } from '../i18n';
+import LocaleSwitcher from '../components/LocaleSwitcher';
 
 export default function Join() {
+  const { t } = useI18n();
   const params = useParams<{ token: string }>();
   const navigate = useNavigate();
-  const [error, setError] = createSignal('');
+  // Mirrors the `auth.errorKey` / `Session.errorKey` pattern: store the
+  // i18n key for our own messages so a locale switch re-renders them
+  // live, and store the raw server message in a parallel signal for
+  // pass-through cases that have no translation.
+  const [errorKey, setErrorKey] = createSignal<TranslationKey | null>(null);
+  const [errorText, setErrorText] = createSignal('');
   const [redeeming, setRedeeming] = createSignal(true);
+
+  const errorMessage = (): string => {
+    const k = errorKey();
+    if (k) return t(k);
+    return errorText();
+  };
 
   onMount(async () => {
     // The redeem endpoint accepts anonymous callers: if the visitor
@@ -27,14 +41,15 @@ export default function Join() {
       setRedeeming(false);
       if (e instanceof ApiError) {
         if (e.status === 400) {
-          setError('Invalid or expired invite link');
+          setErrorKey('join.error_invalid');
         } else if (e.status === 410) {
-          setError('This session has been closed');
+          setErrorKey('join.error_closed');
         } else {
-          setError(e.message);
+          // Server-provided error message — already in English by design.
+          setErrorText(e.message);
         }
       } else {
-        setError('Failed to join session');
+        setErrorKey('join.error_failed');
       }
     }
   });
@@ -45,12 +60,13 @@ export default function Join() {
         <h1>telepair</h1>
         <Show when={redeeming()} fallback={
           <div>
-            <p class="error-msg">{error()}</p>
-            <button class="primary" onClick={() => navigate('/')}>Go to Dashboard</button>
+            <p class="error-msg">{errorMessage()}</p>
+            <button class="primary" onClick={() => navigate('/')}>{t('join.go_dashboard')}</button>
           </div>
         }>
-          <p class="muted">Joining session...</p>
+          <p class="muted">{t('join.joining')}</p>
         </Show>
+        <LocaleSwitcher variant="card" />
       </div>
       <style>{`
         .join-page { display: flex; align-items: center; justify-content: center; min-height: 100vh; }

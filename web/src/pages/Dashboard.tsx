@@ -7,8 +7,11 @@ import type { InputMode, TargetInfo } from '../lib/protocol';
 import Banner from '../components/Banner';
 import { TargetCardSkeleton } from '../components/Skeleton';
 import CreateSessionDialog from '../components/CreateSessionDialog';
+import LocaleSwitcher from '../components/LocaleSwitcher';
+import { inputModeLabel, useI18n } from '../i18n';
 
 export default function Dashboard() {
+  const { t } = useI18n();
   const navigate = useNavigate();
   const [launchError, setLaunchError] = createSignal('');
   // Remember the last mode the user picked so the next dialog opens on
@@ -43,7 +46,9 @@ export default function Dashboard() {
       setPendingTarget(null);
       navigate(`/session/${session.id}`);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Failed to create session';
+      // Server errors come back in English from the API; only the
+      // local fallback (non-Error throws) needs translating.
+      const msg = e instanceof Error ? e.message : t('create_session.error_failed');
       setLaunchError(msg);
       setPendingTarget(null);
     } finally {
@@ -61,16 +66,17 @@ export default function Dashboard() {
       <header class="topbar">
         <h1>telepair</h1>
         <div class="topbar-actions">
+          <LocaleSwitcher variant="topbar" />
           <button
             class="refresh-btn"
             onClick={handleRefresh}
             disabled={sessionStore.loading()}
-            aria-label="Refresh targets and sessions"
-            title="Refresh"
+            aria-label={t('dashboard.refresh_aria')}
+            title={t('common.refresh')}
           >
-            {sessionStore.loading() ? 'Refreshing…' : 'Refresh'}
+            {sessionStore.loading() ? t('common.refreshing') : t('common.refresh')}
           </button>
-          <button onClick={() => auth.logout()}>Logout</button>
+          <button onClick={() => auth.logout()}>{t('common.logout')}</button>
         </div>
       </header>
 
@@ -83,8 +89,8 @@ export default function Dashboard() {
       <main class="content">
         <section>
           <div class="section-header">
-            <h2>Targets</h2>
-            <p class="section-hint">Click a target to configure mode and launch.</p>
+            <h2>{t('dashboard.targets_heading')}</h2>
+            <p class="section-hint">{t('dashboard.targets_hint')}</p>
           </div>
           <Show
             when={!sessionStore.loading()}
@@ -100,12 +106,8 @@ export default function Dashboard() {
               when={sessionStore.targets().length > 0}
               fallback={
                 <div class="empty-state">
-                  <p class="empty-title">No targets available</p>
-                  <p class="empty-body">
-                    No targets are configured for this account. If you expected
-                    to see one here, contact your administrator or check the
-                    server logs.
-                  </p>
+                  <p class="empty-title">{t('dashboard.targets_empty_title')}</p>
+                  <p class="empty-body">{t('dashboard.targets_empty_body')}</p>
                 </div>
               }
             >
@@ -135,15 +137,15 @@ export default function Dashboard() {
         </section>
 
         <section>
-          <h2>Active Sessions</h2>
-          <Show when={sessionStore.sessions().length > 0} fallback={<p class="muted">No active sessions</p>}>
+          <h2>{t('dashboard.sessions_heading')}</h2>
+          <Show when={sessionStore.sessions().length > 0} fallback={<p class="muted">{t('dashboard.sessions_empty')}</p>}>
             <div class="session-list">
               <For each={sessionStore.sessions()}>
                 {(session) => (
                   <div class="session-row" onClick={() => navigate(`/session/${session.id}`)}>
                     <span class="session-id">{session.id}</span>
                     <span class="session-target">{session.target_name}</span>
-                    <span class="session-mode">{session.input_mode}</span>
+                    <span class="session-mode">{inputModeLabel(t, session.input_mode)}</span>
                   </div>
                 )}
               </For>

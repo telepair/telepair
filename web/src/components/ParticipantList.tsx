@@ -1,21 +1,23 @@
 import { For } from 'solid-js';
 import type { ParticipantInfo } from '../lib/protocol';
+import { roleLabel, useI18n } from '../i18n';
 
 interface ParticipantListProps {
   participants: ParticipantInfo[];
 }
 
 export default function ParticipantList(props: ParticipantListProps) {
+  const { t } = useI18n();
   return (
     <div class="participant-list">
-      <h4>Participants ({props.participants.length})</h4>
+      <h4>{t('participants.heading', { count: String(props.participants.length) })}</h4>
       <div class="participants">
         <For each={props.participants}>
           {(p) => (
             <div class="participant-row">
               <span class="participant-color" style={{ background: p.color }} />
               <span class="participant-name">{p.name}</span>
-              <span class="participant-role" data-role={p.role}>{p.role}</span>
+              <span class="participant-role" data-role={p.role}>{roleLabel(t, p.role)}</span>
             </div>
           )}
         </For>

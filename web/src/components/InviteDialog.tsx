@@ -2,6 +2,7 @@ import { createSignal, Show } from 'solid-js';
 import { api } from '../lib/api';
 import type { Role, InputMode } from '../lib/protocol';
 import { toast } from '../stores/toast';
+import { useI18n, type Translator, type TranslationKey } from '../i18n';
 
 interface InviteDialogProps {
   sessionId: string;
@@ -15,13 +16,13 @@ interface InviteDialogProps {
 /** Preset TTL choices surfaced in the UI. Matches the server's hard
  *  cap of 7 days; anything longer would 400 anyway. A `null` value
  *  means "never expire on its own" (still bounded by max_uses and
- *  session lifetime). */
-const TTL_PRESETS: Array<{ label: string; minutes: number | null }> = [
-  { label: '15 min', minutes: 15 },
-  { label: '1 hour', minutes: 60 },
-  { label: '24 hours', minutes: 24 * 60 },
-  { label: '7 days', minutes: 7 * 24 * 60 },
-  { label: 'No expiry', minutes: null },
+ *  session lifetime). The label is an i18n key resolved at render. */
+const TTL_PRESETS: Array<{ key: TranslationKey; minutes: number | null }> = [
+  { key: 'invite.expires_15min', minutes: 15 },
+  { key: 'invite.expires_1hour', minutes: 60 },
+  { key: 'invite.expires_24hours', minutes: 24 * 60 },
+  { key: 'invite.expires_7days', minutes: 7 * 24 * 60 },
+  { key: 'invite.expires_no_expiry', minutes: null },
 ];
 
 /** `max_uses` presets. The server caps at 100 so higher values round-
@@ -29,21 +30,27 @@ const TTL_PRESETS: Array<{ label: string; minutes: number | null }> = [
  *  number field that invites typos. */
 const MAX_USES_PRESETS: number[] = [1, 3, 5, 10, 25];
 
-function formatExpiry(iso: string | null): string {
-  if (!iso) return 'Never (until session closes)';
+/** Format an ISO expiry timestamp into a human phrase. Takes the
+ *  translator so the output is locale-aware; called from the render
+ *  body so it re-runs (and re-translates) on every locale change. */
+function formatExpiry(t: Translator, iso: string | null): string {
+  if (!iso) return t('invite.expiry_never');
   const when = new Date(iso);
-  if (Number.isNaN(when.getTime())) return 'unknown';
+  if (Number.isNaN(when.getTime())) return t('invite.expiry_unknown');
   const diffMs = when.getTime() - Date.now();
-  if (diffMs <= 0) return 'expired';
+  if (diffMs <= 0) return t('invite.expiry_expired');
   const minutes = Math.round(diffMs / 60_000);
-  if (minutes < 60) return `in ~${minutes} min`;
+  if (minutes < 60) return t('invite.expiry_in_min', { n: String(minutes) });
   const hours = Math.round(minutes / 60);
-  if (hours < 48) return `in ~${hours} hr`;
+  if (hours < 48) return t('invite.expiry_in_hours', { n: String(hours) });
   const days = Math.round(hours / 24);
-  return `in ~${days} day${days === 1 ? '' : 's'}`;
+  return days === 1
+    ? t('invite.expiry_in_days_singular', { n: String(days) })
+    : t('invite.expiry_in_days_plural', { n: String(days) });
 }
 
 export default function InviteDialog(props: InviteDialogProps) {
+  const { t } = useI18n();
   const [role, setRole] = createSignal<Role>('operator');
   const [maxUses, setMaxUses] = createSignal<number>(1);
   // `null` means "no TTL" — distinct from `undefined` so we don't
@@ -70,7 +77,7 @@ export default function InviteDialog(props: InviteDialogProps) {
       setInviteMaxUses(invite.max_uses);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      toast.error(`Failed to create invite: ${msg}`);
+      toast.error(t('invite.failed', { msg }));
     } finally {
       setCreating(false);
     }
@@ -93,48 +100,51 @@ export default function InviteDialog(props: InviteDialogProps) {
     <Show when={props.open}>
       <div class="dialog-backdrop" onClick={handleClose}>
         <div class="dialog" onClick={(e) => e.stopPropagation()}>
-          <h3>Invite to Session</h3>
+          <h3>{t('invite.title')}</h3>
           <Show when={!inviteUrl()} fallback={
             <div class="invite-result">
-              <label>Invite Link</label>
+              <label>{t('invite.link_label')}</label>
               <div class="invite-url-row">
                 <input type="text" value={inviteUrl()} readonly />
                 <button class="primary" onClick={handleCopy}>
-                  {copied() ? 'Copied!' : 'Copy'}
+                  {copied() ? t('common.copied') : t('common.copy')}
                 </button>
               </div>
               <p class="hint">
-                Usable <strong>{inviteMaxUses()}</strong> time{inviteMaxUses() === 1 ? '' : 's'} · expires <strong>{formatExpiry(inviteExpiresAt())}</strong>.
+                {t(
+                  inviteMaxUses() === 1 ? 'invite.usable_singular' : 'invite.usable_plural',
+                  { n: String(inviteMaxUses()), when: formatExpiry(t, inviteExpiresAt()) },
+                )}
               </p>
-              <p class="hint">Share this link with the person you want to invite.</p>
-              <button onClick={handleClose} style={{ 'margin-top': '12px', width: '100%' }}>Done</button>
+              <p class="hint">{t('invite.share_hint')}</p>
+              <button onClick={handleClose} style={{ 'margin-top': '12px', width: '100%' }}>{t('common.done')}</button>
             </div>
           }>
             <div class="invite-form">
-              <label>Role</label>
+              <label>{t('invite.role_label')}</label>
               <div class="role-options">
                 <button
                   class={role() === 'operator' ? 'role-btn active' : 'role-btn'}
                   onClick={() => setRole('operator')}
                 >
-                  Operator
+                  {t('invite.role_operator')}
                   <span class="role-desc">
                     {props.inputMode === 'multiplexed'
-                      ? 'Can type, resize, and chat'
-                      : 'Can resize and chat (solo mode — only the owner types)'}
+                      ? t('invite.role_operator_desc_multiplexed')
+                      : t('invite.role_operator_desc_solo')}
                   </span>
                 </button>
                 <button
                   class={role() === 'viewer' ? 'role-btn active' : 'role-btn'}
                   onClick={() => setRole('viewer')}
                 >
-                  Viewer
-                  <span class="role-desc">Can only watch and chat</span>
+                  {t('invite.role_viewer')}
+                  <span class="role-desc">{t('invite.role_viewer_desc')}</span>
                 </button>
               </div>
 
-              <label>Max uses</label>
-              <div class="chip-row" role="radiogroup" aria-label="Maximum number of redemptions">
+              <label>{t('invite.max_uses_label')}</label>
+              <div class="chip-row" role="radiogroup" aria-label={t('invite.max_uses_aria')}>
                 {MAX_USES_PRESETS.map((n) => (
                   <button
                     type="button"
@@ -143,13 +153,13 @@ export default function InviteDialog(props: InviteDialogProps) {
                     class={maxUses() === n ? 'chip active' : 'chip'}
                     onClick={() => setMaxUses(n)}
                   >
-                    {n === 1 ? 'One-shot' : `${n}`}
+                    {n === 1 ? t('invite.max_uses_one_shot') : `${n}`}
                   </button>
                 ))}
               </div>
 
-              <label>Expires</label>
-              <div class="chip-row" role="radiogroup" aria-label="Expiry time">
+              <label>{t('invite.expires_label')}</label>
+              <div class="chip-row" role="radiogroup" aria-label={t('invite.expires_aria')}>
                 {TTL_PRESETS.map((preset) => (
                   <button
                     type="button"
@@ -158,13 +168,13 @@ export default function InviteDialog(props: InviteDialogProps) {
                     class={ttlMinutes() === preset.minutes ? 'chip active' : 'chip'}
                     onClick={() => setTtlMinutes(preset.minutes)}
                   >
-                    {preset.label}
+                    {t(preset.key)}
                   </button>
                 ))}
               </div>
 
               <button class="primary" onClick={handleCreate} disabled={creating()} style={{ width: '100%', 'margin-top': '16px' }}>
-                {creating() ? 'Creating...' : 'Create Invite Link'}
+                {creating() ? t('invite.creating') : t('invite.create')}
               </button>
             </div>
           </Show>

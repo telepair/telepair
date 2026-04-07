@@ -1,4 +1,5 @@
 import { createSignal, createEffect, on, For } from 'solid-js';
+import { useI18n } from '../i18n';
 
 export interface ChatMessage {
   user_id: string;
@@ -13,6 +14,7 @@ interface ChatPanelProps {
 }
 
 export default function ChatPanel(props: ChatPanelProps) {
+  const { t } = useI18n();
   const [input, setInput] = createSignal('');
   let messagesEnd: HTMLDivElement | undefined;
 
@@ -51,7 +53,7 @@ export default function ChatPanel(props: ChatPanelProps) {
 
   return (
     <div class="chat-panel">
-      <h4>Chat</h4>
+      <h4>{t('chat.heading')}</h4>
       <div class="chat-messages">
         <For each={props.messages}>
           {(msg) => (
@@ -67,12 +69,12 @@ export default function ChatPanel(props: ChatPanelProps) {
       <div class="chat-input-row">
         <input
           type="text"
-          placeholder="Type a message..."
+          placeholder={t('chat.placeholder')}
           value={input()}
           onInput={(e) => setInput(e.currentTarget.value)}
           onKeyDown={handleKeyDown}
         />
-        <button onClick={handleSend} disabled={!input().trim()}>Send</button>
+        <button onClick={handleSend} disabled={!input().trim()}>{t('chat.send')}</button>
       </div>
       <style>{`
         .chat-panel { display: flex; flex-direction: column; height: 100%; }
