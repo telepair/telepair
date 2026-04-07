@@ -144,7 +144,10 @@ async fn main() -> anyhow::Result<()> {
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
     let storage = Arc::new(SqliteStorage::new(&db_url).await?);
 
-    // Initialize target engine (needed by agent)
+    // Initialize target engine. Missing default `~/.telepair/targets.yaml`
+    // is the fresh-install norm and stays silent; any other failure (parse
+    // error, permission denied, explicit `--targets` path) warns so the
+    // operator can see why their targets didn't load.
     let engine = match &cli.targets {
         Some(path) => TargetEngine::from_file(path).unwrap_or_else(|e| {
             tracing::warn!(
@@ -153,8 +156,21 @@ async fn main() -> anyhow::Result<()> {
             );
             TargetEngine::empty()
         }),
-        None => TargetEngine::from_file(&data_dir.join("targets.yaml"))
-            .unwrap_or_else(|_| TargetEngine::empty()),
+        None => {
+            let default_path = data_dir.join("targets.yaml");
+            TargetEngine::from_file(&default_path).unwrap_or_else(|e| {
+                let is_missing = e
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
+                if !is_missing {
+                    tracing::warn!(
+                        "failed to load targets from {}: {e}, using defaults",
+                        default_path.display()
+                    );
+                }
+                TargetEngine::empty()
+            })
+        }
     };
 
     // Close any sessions left "active" from a previous unclean shutdown
