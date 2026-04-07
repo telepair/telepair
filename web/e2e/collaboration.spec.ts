@@ -95,7 +95,7 @@ test.describe('Collaboration', () => {
     await pageB.goto(joinPath);
     await pageB.waitForURL(/\/session\/.+/);
     await waitForTerminal(pageB);
-    await expect(pageB.locator('.role-badge')).toHaveText('operator');
+    await expect(pageB.locator('.role-badge')).toHaveText('Operator');
 
     // Guest types. The keystroke should be blocked AND a toast should
     // appear explaining why. This is the load-bearing assertion: before
