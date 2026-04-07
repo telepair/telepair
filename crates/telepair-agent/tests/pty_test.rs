@@ -1,13 +1,21 @@
+use bytes::Bytes;
 use std::collections::HashMap;
 use telepair_agent::pty::PtyManager;
 use tokio::time::{Duration, timeout};
 
+fn spawn_test_shell(cols: u16, rows: u16) -> PtyManager {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    PtyManager::spawn_command(&shell, &[], cols, rows, &HashMap::new()).unwrap()
+}
+
 #[tokio::test]
 async fn spawn_shell_and_read_output() {
-    let mut pty = PtyManager::spawn_shell(80, 24).unwrap();
+    let mut pty = spawn_test_shell(80, 24);
 
     // Write a command
-    pty.write(b"echo HELLO_TELEPAIR\n").await.unwrap();
+    pty.write(Bytes::from_static(b"echo HELLO_TELEPAIR\n"))
+        .await
+        .unwrap();
 
     // Read output until we see our marker
     let output = timeout(Duration::from_secs(5), async {
@@ -57,7 +65,7 @@ async fn spawn_command() {
 
 #[tokio::test]
 async fn resize_pty() {
-    let mut pty = PtyManager::spawn_shell(80, 24).unwrap();
+    let mut pty = spawn_test_shell(80, 24);
     // Should not panic
     pty.resize(120, 40).unwrap();
     pty.shutdown();

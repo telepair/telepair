@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
@@ -52,7 +52,7 @@ async fn extract_user_and_owned_session(
     );
     let user = user_res?;
     let session = session_res
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|e| status_for(&e))?
         .ok_or(StatusCode::NOT_FOUND)?;
     if session.owner_id != user.id {
         return Err(StatusCode::FORBIDDEN);
@@ -96,16 +96,26 @@ pub async fn list_targets(
 #[derive(Deserialize)]
 pub struct CreateSessionRequest {
     pub target_name: String,
+    /// Strict parse: unknown values are rejected by axum's JSON extractor
+    /// with a 400 so typos are loud. Omitted field defaults to
+    /// `InputMode::Serialized` below.
     #[serde(default)]
-    pub input_mode: Option<String>,
+    pub input_mode: Option<InputMode>,
 }
 
 pub async fn create_session(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<CreateSessionRequest>,
+    body: Result<Json<CreateSessionRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, StatusCode> {
+    // Auth first so unauthenticated callers get 401 instead of 400,
+    // matching the other handlers in this file.
     let user = extract_user(&state, &headers).await?;
+
+    // Axum's default JSON rejection is 422; we want 400 so an unknown
+    // `input_mode` value reads as "client sent garbage" instead of
+    // "server doesn't know what to do with it".
+    let Json(body) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
 
     // Verify target exists and enforce admin-only restriction
     let target = state
@@ -117,16 +127,7 @@ pub async fn create_session(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    // Strict parse: unknown values used to silently collapse to
-    // Serialized, which masked client bugs and could surprise the
-    // caller with the wrong input semantics. Return 400 instead so
-    // typos are loud.
-    let mode = match body.input_mode.as_deref() {
-        None => InputMode::Serialized,
-        Some(raw) => raw
-            .parse::<InputMode>()
-            .map_err(|_| StatusCode::BAD_REQUEST)?,
-    };
+    let mode = body.input_mode.unwrap_or(InputMode::Serialized);
 
     let session = state
         .sessions
@@ -190,7 +191,7 @@ pub async fn create_invite(
         StatusCode::CREATED,
         Json(serde_json::json!({
             "token": raw_token,
-            "role": invite.role.as_str(),
+            "role": invite.role,
             "max_uses": invite.max_uses,
             "session_id": session_id,
         })),
@@ -255,7 +256,7 @@ pub async fn redeem_invite(
     let preview = storage
         .find_invite(&body.token)
         .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|e| status_for(&e))?;
     let session = storage
         .get_session(&preview.session_id)
         .await
@@ -275,7 +276,7 @@ pub async fn redeem_invite(
     let invite = storage
         .consume_invite(&body.token)
         .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|e| status_for(&e))?;
 
     // Decide which user joins: reuse the authenticated caller, or
     // mint a fresh guest. Guests are only created **after** the
@@ -300,7 +301,7 @@ pub async fn redeem_invite(
 
     Ok(Json(serde_json::json!({
         "session_id": invite.session_id,
-        "role": invite.role.as_str(),
+        "role": invite.role,
         "token": issued_token,
     })))
 }

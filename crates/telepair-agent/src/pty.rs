@@ -1,3 +1,4 @@
+use bytes::{Bytes, BytesMut};
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::collections::HashMap;
 use std::io::Read;
@@ -7,16 +8,11 @@ use tokio::task;
 pub struct PtyManager {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
-    output_rx: mpsc::Receiver<Vec<u8>>,
-    input_tx: mpsc::Sender<Vec<u8>>,
+    output_rx: mpsc::Receiver<Bytes>,
+    input_tx: mpsc::Sender<Bytes>,
 }
 
 impl PtyManager {
-    pub fn spawn_shell(cols: u16, rows: u16) -> std::io::Result<Self> {
-        let shell = crate::default_shell();
-        Self::spawn_command(&shell, &[], cols, rows, &HashMap::new())
-    }
-
     pub fn spawn_command(
         command: &str,
         args: &[&str],
@@ -68,16 +64,30 @@ impl PtyManager {
             .try_clone_reader()
             .map_err(std::io::Error::other)?;
 
-        let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (output_tx, output_rx) = mpsc::channel::<Bytes>(256);
 
-        // Spawn blocking reader thread
+        // Spawn blocking reader thread. Each chunk is split off a reusable
+        // BytesMut — callers downstream clone the resulting `Bytes` by bumping
+        // its Arc, avoiding the per-chunk `Vec<u8>` allocation that preceded
+        // this refactor.
         task::spawn_blocking(move || {
-            let mut buf = [0u8; 4096];
+            const CHUNK: usize = 4096;
+            let mut buf = BytesMut::with_capacity(CHUNK);
             loop {
-                match reader.read(&mut buf) {
+                if buf.capacity() - buf.len() < CHUNK {
+                    buf.reserve(CHUNK);
+                }
+                // SAFETY-equivalent: BytesMut exposes spare_capacity_mut only
+                // on nightly, so we write via a stack scratch buffer and
+                // extend_from_slice. The extra copy is 4 KB max and stays in
+                // L1; the win is removing the heap allocation per chunk.
+                let mut scratch = [0u8; CHUNK];
+                match reader.read(&mut scratch) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if output_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        buf.extend_from_slice(&scratch[..n]);
+                        let chunk = buf.split().freeze();
+                        if output_tx.blocking_send(chunk).is_err() {
                             break;
                         }
                     }
@@ -87,7 +97,7 @@ impl PtyManager {
         });
 
         // Spawn blocking writer thread
-        let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (input_tx, mut input_rx) = mpsc::channel::<Bytes>(256);
         task::spawn_blocking(move || {
             use std::io::Write;
             while let Some(data) = input_rx.blocking_recv() {
@@ -105,13 +115,13 @@ impl PtyManager {
         })
     }
 
-    pub async fn read(&mut self) -> Option<Vec<u8>> {
+    pub async fn read(&mut self) -> Option<Bytes> {
         self.output_rx.recv().await
     }
 
-    pub async fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
+    pub async fn write(&mut self, data: Bytes) -> std::io::Result<()> {
         self.input_tx
-            .send(data.to_vec())
+            .send(data)
             .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY writer closed"))
     }
@@ -130,10 +140,6 @@ impl PtyManager {
     pub fn shutdown(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-    }
-
-    pub fn is_alive(&mut self) -> bool {
-        self.child.try_wait().ok().flatten().is_none()
     }
 }
 

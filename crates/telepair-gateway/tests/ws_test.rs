@@ -12,21 +12,16 @@ use telepair_core::session::{InputMode, Session};
 use telepair_core::storage::Storage;
 use telepair_gateway::state::AppState;
 
-/// Create a user, a session they own, and the owner participant row.
-/// Returns `(token, user_id, session)` so tests can skip 4 lines of setup.
+/// Create a user and a session they own (owner participant row inserted
+/// atomically). Returns `(token, user_id, session)` so tests can skip
+/// a few lines of setup.
 async fn owned_session(state: &AppState, username: &str) -> (String, Uuid, Session) {
     let token = state.create_test_user(username).await;
     let user = state.auth.validate(&token).await.unwrap();
     let session = state
         .sessions
         .storage()
-        .create_session(user.id, "local-shell", InputMode::Serialized)
-        .await
-        .unwrap();
-    state
-        .sessions
-        .storage()
-        .upsert_participant(&session.id, user.id, Role::Owner)
+        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized)
         .await
         .unwrap();
     (token, user.id, session)

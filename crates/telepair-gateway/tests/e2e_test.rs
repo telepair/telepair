@@ -157,20 +157,15 @@ where
     .unwrap_or(false)
 }
 
-/// Common setup: create a user, session, and add the user as owner participant.
+/// Common setup: create a user and a session they own. The owner
+/// participant row is inserted atomically by the storage layer.
 async fn create_owned_session(state: &AppState, username: &str) -> (String, String, uuid::Uuid) {
     let token = state.create_test_user(username).await;
     let user = state.auth.validate(&token).await.unwrap();
     let session = state
         .sessions
         .storage()
-        .create_session(user.id, "local-shell", InputMode::Serialized)
-        .await
-        .unwrap();
-    state
-        .sessions
-        .storage()
-        .upsert_participant(&session.id, user.id, Role::Owner)
+        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized)
         .await
         .unwrap();
     (session.id, token, user.id)

@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use telepair_agent::pty::PtyManager;
 use telepair_core::permission::Role;
-use telepair_core::protocol::ServerMessage;
+use telepair_core::protocol::{ParticipantInfo, ServerMessage};
 use telepair_core::storage::{SqliteStorage, Storage};
 
 /// Color palette for participant cursors / identifiers.
@@ -24,7 +24,7 @@ fn assign_color(index: usize) -> String {
 
 /// Commands sent to the PTY I/O loop.
 pub enum PtyCommand {
-    Input(Vec<u8>),
+    Input(Bytes),
     Resize(u16, u16),
 }
 
@@ -53,15 +53,6 @@ impl Default for ReaperConfig {
     }
 }
 
-/// A participant currently connected to a session.
-#[derive(Debug, Clone)]
-pub struct ConnectedParticipant {
-    pub user_id: Uuid,
-    pub name: String,
-    pub role: Role,
-    pub color: String,
-}
-
 /// A running terminal session with PTY, broadcast channels, and participant tracking.
 struct LiveSession {
     /// Send terminal input (or resize) to PTY via command channel
@@ -76,7 +67,7 @@ struct LiveSession {
     /// Currently connected participants, keyed by user_id. A single user may
     /// open multiple tabs/devices; the map stores one canonical record and
     /// `connections` below counts how many live WS handlers are attached.
-    participants: HashMap<Uuid, ConnectedParticipant>,
+    participants: HashMap<Uuid, ParticipantInfo>,
     /// WS-handler reference count per user_id. Invariant: a `user_id` is in
     /// `participants` iff `connections[user_id] > 0`. Without this counter a
     /// user's second tab closing would broadcast `PeerLeft` and wipe the
@@ -172,7 +163,7 @@ impl SessionHub {
         tokio::spawn(async move {
             loop {
                 enum Action {
-                    Output(Option<Vec<u8>>),
+                    Output(Option<Bytes>),
                     Command(Option<PtyCommand>),
                 }
 
@@ -183,16 +174,16 @@ impl SessionHub {
 
                 match action {
                     Action::Output(Some(bytes)) => {
-                        // Wrap once into refcounted Bytes; every subscriber
-                        // clone is an Arc bump, not a byte copy.
-                        let _ = output_tx_clone.send(Bytes::from(bytes));
+                        // Already a refcounted Bytes from the PTY reader;
+                        // every subscriber clone is an Arc bump, not a copy.
+                        let _ = output_tx_clone.send(bytes);
                     }
                     Action::Output(None) => {
                         tracing::info!(session = %session_id_owned, "PTY process exited");
                         break;
                     }
                     Action::Command(Some(PtyCommand::Input(data))) => {
-                        if pty.write(&data).await.is_err() {
+                        if pty.write(data).await.is_err() {
                             break;
                         }
                     }
@@ -278,7 +269,7 @@ impl SessionHub {
 
         live.participants.insert(
             user_id,
-            ConnectedParticipant {
+            ParticipantInfo {
                 user_id,
                 name: name.clone(),
                 role,
@@ -333,7 +324,7 @@ impl SessionHub {
     }
 
     /// Get a snapshot of all participants in a session.
-    pub async fn get_participants(&self, session_id: &str) -> Vec<ConnectedParticipant> {
+    pub async fn get_participants(&self, session_id: &str) -> Vec<ParticipantInfo> {
         let sessions = self.sessions.read().await;
         sessions
             .get(session_id)
