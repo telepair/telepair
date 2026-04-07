@@ -4,7 +4,7 @@ import { useParams, useNavigate } from '@solidjs/router';
 import { auth } from '../stores/auth';
 import { TelepairSocket } from '../lib/ws';
 import type { ConnectionStatus, ReconnectInfo } from '../lib/ws';
-import { encodeInput, canInput } from '../lib/protocol';
+import { encodeInput, canInput, ErrorCode } from '../lib/protocol';
 import type { ServerMessage, Role, ParticipantInfo } from '../lib/protocol';
 import type { TerminalHandle } from '../components/Terminal';
 import type { ChatMessage } from '../components/ChatPanel';
@@ -14,6 +14,8 @@ import ChatPanel from '../components/ChatPanel';
 import InviteDialog from '../components/InviteDialog';
 import Banner from '../components/Banner';
 import { toast } from '../stores/toast';
+
+const MAX_CHAT_HISTORY = 500;
 
 export default function SessionPage() {
   const params = useParams<{ id: string }>();
@@ -59,7 +61,7 @@ export default function SessionPage() {
         break;
       case 'PeerChat':
         setChatMessages((prev) => [
-          ...prev.slice(-(500 - 1)),
+          ...prev.slice(-(MAX_CHAT_HISTORY - 1)),
           { user_id: msg.user_id, name: msg.name, text: msg.text, ts: msg.ts },
         ]);
         break;
@@ -73,18 +75,18 @@ export default function SessionPage() {
 
   const handleServerError = (code: string, message: string) => {
     switch (code) {
-      case 'SESSION_CLOSED':
+      case ErrorCode.SESSION_CLOSED:
         setEndedReason('This session has ended.');
         toast.info('Session has ended', { duration: 4000 });
         break;
-      case 'SESSION_NOT_FOUND':
+      case ErrorCode.SESSION_NOT_FOUND:
         setEndedReason('Session not found — it may have been deleted.');
         break;
-      case 'NOT_PARTICIPANT':
+      case ErrorCode.NOT_PARTICIPANT:
         setErrorMsg('You are not a participant of this session.');
         break;
-      case 'AUTH_FAILED':
-      case 'AUTH_TIMEOUT':
+      case ErrorCode.AUTH_FAILED:
+      case ErrorCode.AUTH_TIMEOUT:
         // Token is invalid/expired — clear auth state so AuthGuard redirects
         // to /login. A banner would be invisible since this page is about to
         // unmount, so surface the reason via a global toast instead.
