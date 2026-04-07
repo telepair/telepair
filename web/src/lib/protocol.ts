@@ -1,5 +1,20 @@
 // TypeScript types mirroring crates/telepair-core/src/protocol.rs
 
+// Stable error codes carried by ServerMessage.Error. Keep in sync with
+// `pub mod error_codes` in crates/telepair-core/src/protocol.rs — a typo
+// on either side silently degrades UX.
+export const ErrorCode = {
+  AUTH_FAILED: 'AUTH_FAILED',
+  AUTH_TIMEOUT: 'AUTH_TIMEOUT',
+  EXPECTED_JOIN: 'EXPECTED_JOIN',
+  SESSION_NOT_FOUND: 'SESSION_NOT_FOUND',
+  SESSION_CLOSED: 'SESSION_CLOSED',
+  NOT_PARTICIPANT: 'NOT_PARTICIPANT',
+  TARGET_NOT_FOUND: 'TARGET_NOT_FOUND',
+  PTY_ERROR: 'PTY_ERROR',
+} as const;
+export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
+
 export type Role = 'owner' | 'operator' | 'viewer';
 
 export type InputMode = 'serialized' | 'multiplexed';

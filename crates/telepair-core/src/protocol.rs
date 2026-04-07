@@ -4,6 +4,22 @@ use uuid::Uuid;
 use crate::permission::Role;
 use crate::session::Session;
 
+/// Stable error codes carried by `ServerMessage::Error`. The frontend
+/// switches on these strings to render localized messages and decide
+/// whether to force re-login — a typo on either side silently degrades
+/// UX, so the Rust and TS sides MUST stay in sync via constants, not
+/// scattered string literals. Mirror table lives in `web/src/lib/protocol.ts`.
+pub mod error_codes {
+    pub const AUTH_FAILED: &str = "AUTH_FAILED";
+    pub const AUTH_TIMEOUT: &str = "AUTH_TIMEOUT";
+    pub const EXPECTED_JOIN: &str = "EXPECTED_JOIN";
+    pub const SESSION_NOT_FOUND: &str = "SESSION_NOT_FOUND";
+    pub const SESSION_CLOSED: &str = "SESSION_CLOSED";
+    pub const NOT_PARTICIPANT: &str = "NOT_PARTICIPANT";
+    pub const TARGET_NOT_FOUND: &str = "TARGET_NOT_FOUND";
+    pub const PTY_ERROR: &str = "PTY_ERROR";
+}
+
 // --- Client -> Server ---
 //
 // Terminal input (`TermInput`) is NOT a JSON message — it is sent as a binary
