@@ -8,7 +8,7 @@ WEB := web
 .PHONY: help install fmt fmt-check lint lint-rust lint-web \
         test test-rust test-web e2e \
         build build-rust build-web \
-        check dev clean
+        all check dev clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*?## "; printf "Usage: make <target>\n\nTargets:\n"} \
@@ -63,6 +63,8 @@ build: build-rust build-web ## Build everything (release)
 # ---------- aggregate / misc ----------
 
 check: fmt-check lint test ## Run all CI gates locally (fmt + lint + test)
+
+all: check build ## Full pipeline: verify (fmt + lint + test) then build release artifacts
 
 dev: ## Run backend in dev mode on :7700
 	cargo run
