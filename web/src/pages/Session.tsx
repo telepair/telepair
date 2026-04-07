@@ -248,10 +248,7 @@ export default function SessionPage() {
       navigate('/');
       return;
     }
-    auth.logout();
-    if (typeof window !== 'undefined') {
-      window.location.assign('/login');
-    }
+    auth.logoutAndRedirect();
   };
 
   // Connect WebSocket

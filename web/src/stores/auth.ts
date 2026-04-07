@@ -7,15 +7,11 @@ export const STORAGE_KEY = 'telepair_token';
 /**
  * Auth identity is scoped to a single browser tab.
  *
- * Finding #10 in the QA sweep:
- * The original implementation stored the bearer token in a single
- * `localStorage[telepair_token]` slot shared across every tab of the
- * same origin. That made it trivial to hijack identity: tab A is the
- * admin, tab B opens a guest invite link, tab B's redeem flow writes
- * the guest token into the shared slot, and tab A — on its very next
- * request — quietly downgrades to that guest.
- *
- * The fix below splits the storage into two tiers:
+ * A single shared `localStorage` slot would make identity hijack
+ * trivial: tab A is the admin, tab B opens a guest invite link, tab
+ * B's redeem flow writes the guest token into the shared slot, and
+ * tab A — on its very next request — quietly downgrades to that
+ * guest. Splitting into two tiers fixes that:
  *   - `sessionStorage[STORAGE_KEY]` is the **authoritative** slot for
  *     this tab. Every read and write in this module goes through it.
  *     Browsers isolate sessionStorage per-tab, so tab B's guest token
@@ -180,6 +176,24 @@ function logout() {
   setToken('');
 }
 
+/**
+ * Single source of truth for "drop credentials and bounce to /login".
+ * Three call sites used to inline the same `auth.logout(); window
+ * .location.assign('/login')` pattern (the api 401 interceptor, the
+ * dashboard 403 path in `stores/session.ts`, and the non-owner exit in
+ * `Session.tsx`). They drifted on the path-already-/login guard, which
+ * meant the api interceptor would re-assign while already on /login
+ * and pollute the back stack. Funnel everything here so the guard and
+ * the order (clear token THEN navigate, so AuthGuard sees the empty
+ * signal on the next route eval) stay consistent.
+ */
+function logoutAndRedirect() {
+  setToken('');
+  if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
+    window.location.assign('/login');
+  }
+}
+
 function isAuthenticated(): boolean {
   return token().length > 0;
 }
@@ -191,5 +205,6 @@ export const auth = {
   setToken,
   validateToken,
   logout,
+  logoutAndRedirect,
   isAuthenticated,
 };
