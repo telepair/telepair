@@ -7,7 +7,7 @@ COPY migrations/ migrations/
 RUN cargo build --release
 
 # Stage 2: Build frontend
-FROM node:18-bookworm-slim AS frontend
+FROM node:22-bookworm-slim AS frontend
 WORKDIR /build/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
