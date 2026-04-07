@@ -1,4 +1,5 @@
 // web/src/lib/ws.ts
+import { CloseCode } from './protocol';
 import type { ClientMessage, ServerMessage } from './protocol';
 
 export type ConnectionStatus =
@@ -117,7 +118,14 @@ export class TelepairSocket {
         this.onStatus('disconnected');
         return;
       }
-      if (event.code === 1008 || event.code === 4001) {
+      // Only permanent-refusal close codes should short-circuit
+      // reconnection. `CloseCode.TERMINAL` (4001) is what the gateway
+      // uses for auth/permission/not-found; `1008` is the RFC 6455
+      // policy-violation code the server may emit in the same class.
+      // Everything else — including `CloseCode.TRANSIENT` (4503) from a
+      // transient storage hiccup — falls through to the retry loop so
+      // we honour the protocol's "retry me" contract.
+      if (event.code === 1008 || event.code === CloseCode.TERMINAL) {
         this.onStatus('error');
         this.onReconnectInfo?.(null);
         return;

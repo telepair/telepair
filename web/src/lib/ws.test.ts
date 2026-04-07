@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { CloseCode } from './protocol';
 import type { ServerMessage } from './protocol';
 
 // Mock WebSocket
@@ -219,11 +220,37 @@ describe('TelepairSocket', () => {
     await new Promise((r) => setTimeout(r, 10));
 
     const ws = (sock as any).ws as MockWebSocket;
-    ws.onclose?.({ code: 4001, reason: 'Unauthorized' });
+    ws.onclose?.({ code: CloseCode.TERMINAL, reason: 'Unauthorized' });
 
     const statusCalls = onStatus.mock.calls.map((c: any[]) => c[0]);
     expect(statusCalls).toContain('error');
     expect((sock as any).reconnectTimer).toBeNull();
+  });
+
+  // The whole point of the STORAGE_ERROR fix: a transient storage
+  // hiccup on the server must NOT strand us with an `error` status.
+  // The close code (CloseCode.TRANSIENT) is in the private-use 4xxx
+  // range but must fall through to the retry loop exactly like any
+  // other unexpected close. A regression here brings back the "SQLite
+  // blip => dead page until you hit refresh" UX that Codex flagged.
+  it('reconnects on transient storage close (code CloseCode.TRANSIENT)', async () => {
+    vi.useFakeTimers();
+    const onStatus = vi.fn();
+    const sock = new TelepairSocket(vi.fn(), vi.fn(), onStatus);
+    sock.connect('s', 't');
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const ws = (sock as any).ws as MockWebSocket;
+    ws.onclose?.({ code: CloseCode.TRANSIENT, reason: 'temporary storage failure' });
+
+    const statusCalls = onStatus.mock.calls.map((c: any[]) => c[0]);
+    expect(statusCalls).not.toContain('error');
+    expect(statusCalls).toContain('connecting');
+    expect((sock as any).reconnectAttempts).toBe(1);
+    expect((sock as any).reconnectTimer).not.toBeNull();
+
+    vi.useRealTimers();
   });
 
   it('schedules reconnect on unexpected close', async () => {

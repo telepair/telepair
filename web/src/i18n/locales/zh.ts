@@ -63,6 +63,7 @@ export const zh: Dict = {
     banner_ended: '此会话已结束。',
     banner_not_found: '会话不存在 — 可能已被删除。',
     banner_not_participant: '你不是此会话的参与者。',
+    banner_storage_error: '临时存储错误 — 请稍后重试。',
     banner_connection_lost: '连接已断开,自动重试已放弃。',
     banner_reconnecting:
       '连接已断开 — 正在重试 {{ attempt }}/{{ max }}({{ seconds }} 秒后)',

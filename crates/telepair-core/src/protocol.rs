@@ -18,6 +18,45 @@ pub mod error_codes {
     pub const NOT_PARTICIPANT: &str = "NOT_PARTICIPANT";
     pub const TARGET_NOT_FOUND: &str = "TARGET_NOT_FOUND";
     pub const PTY_ERROR: &str = "PTY_ERROR";
+    /// Transient storage failure during the WS handshake. Clients
+    /// should retry — this is NOT a permission or invite problem.
+    /// Pairs with [`crate::protocol::CLOSE_CODE_TRANSIENT`] so the
+    /// close frame actually conveys "retry me".
+    pub const STORAGE_ERROR: &str = "STORAGE_ERROR";
+}
+
+/// Terminal WebSocket close code — the client treats this as a
+/// permanent refusal and surfaces an error state without reconnecting.
+/// Auth / permission / not-found / target-missing all use this.
+/// `web/src/lib/ws.ts` switches on `event.code` and MUST stay in sync.
+pub const CLOSE_CODE_TERMINAL: u16 = 4001;
+
+/// Transient WebSocket close code — the client is expected to retry
+/// (e.g. a one-off storage hiccup during the handshake). Distinct from
+/// `CLOSE_CODE_TERMINAL` so the frontend can actually tell the two
+/// apart via `event.code`: the preceding `ServerMessage::Error` JSON
+/// frame can get dropped if the socket tears down mid-write, so the
+/// close code must stand on its own as the retry signal.
+///
+/// Value sits inside the private-use range (4000-4999) reserved for
+/// applications, chosen to be visually distinct from 4001 rather than
+/// for any IANA meaning.
+pub const CLOSE_CODE_TRANSIENT: u16 = 4503;
+
+/// Map a protocol-level error code to the WebSocket close code that
+/// accompanies it. The close code is the ONLY signal the client has
+/// for deciding "retry vs give up" — the preceding JSON error frame
+/// may be dropped if the socket dies mid-write, so this mapping is
+/// the protocol's single source of truth.
+///
+/// Default is terminal; transient codes must be opted into explicitly
+/// so a new error code never silently becomes "silently retry" (which
+/// would invite reconnect storms from revoked tokens, etc.).
+pub fn close_code_for(error_code: &str) -> u16 {
+    match error_code {
+        error_codes::STORAGE_ERROR => CLOSE_CODE_TRANSIENT,
+        _ => CLOSE_CODE_TERMINAL,
+    }
 }
 
 /// Stable `reason` codes carried by `ServerMessage::InputDenied`. The
@@ -95,8 +134,7 @@ pub enum ServerMessage {
     /// Sent **only to the originating connection** (never broadcast) the
     /// first time a binary input frame is rejected for this session. The
     /// frontend uses this to surface a toast instead of leaving the user
-    /// wondering why typing silently does nothing — the previous
-    /// behavior that cost us finding #2/#4 in the QA sweep.
+    /// wondering why typing silently does nothing.
     InputDenied {
         /// Machine-readable reason code — see `input_denied` module.
         reason: String,

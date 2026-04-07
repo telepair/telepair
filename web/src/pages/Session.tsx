@@ -121,7 +121,10 @@ export default function SessionPage() {
   // time even if the server sends multiple `InputDenied` frames across
   // reconnects.
   const INPUT_DENIED_TOAST_ID = 'input-denied';
-  const handleInputDenied = (reason: string) => {
+  // `string & {}` keeps the autocomplete from the literal union while
+  // still accepting any string the server might send in a future
+  // protocol revision — the `default` branch is the forward-compat path.
+  const handleInputDenied = (reason: InputDeniedReason | (string & {})) => {
     switch (reason) {
       case InputDeniedReason.VIEWER:
         toast.info(t('session.toast_input_denied_viewer'), {
@@ -154,6 +157,12 @@ export default function SessionPage() {
         break;
       case ErrorCode.NOT_PARTICIPANT:
         setErrorKey('session.banner_not_participant');
+        setErrorText('');
+        break;
+      case ErrorCode.STORAGE_ERROR:
+        // Transient DB hiccup, not a permission problem — the banner
+        // prompts a retry and the reconnect loop handles the rest.
+        setErrorKey('session.banner_storage_error');
         setErrorText('');
         break;
       case ErrorCode.AUTH_FAILED:
