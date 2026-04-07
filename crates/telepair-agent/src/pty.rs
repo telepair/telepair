@@ -136,15 +136,14 @@ impl PtyManager {
             })
             .map_err(std::io::Error::other)
     }
-
-    pub fn shutdown(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 impl Drop for PtyManager {
     fn drop(&mut self) {
-        self.shutdown();
+        // Reap the child when the manager is dropped. Keeping this in
+        // Drop (and only in Drop) means callers can't "shutdown then
+        // keep using" a half-dead manager.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
