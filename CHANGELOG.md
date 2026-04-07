@@ -114,6 +114,21 @@ real-time chat.
 - Per-message permission enforcement on WebSocket input and resize.
 - Frontend persists the auth token only after successful validation.
 - WebSocket auth timeout and graceful shutdown.
+- **Scoped invite guests** — guest users minted via `POST /api/invite/redeem`
+  are now pinned to the redeemed `session_id` via a new
+  `users.scoped_session_id` column. A dedicated `require_unscoped` check
+  blocks scoped guests from `GET /api/targets` and `POST /api/sessions`
+  with 403, `POST /api/invite/redeem` rejects cross-session redemption
+  attempts, and the WebSocket handshake enforces the pin a second time so
+  a guest cannot open `/ws/session/{other}` even if a future bug adds a
+  stray participant row. Closes an invite-time privilege-escalation path
+  where any redeemed invite produced a fully privileged non-admin account
+  that could enumerate targets and create new sessions of its own.
+- `GET /api/targets` now filters out `admin_only` targets for non-admin
+  callers. Previously the REST list leaked admin-only target names to
+  every authenticated user even though `POST /api/sessions` correctly
+  refused to create a session on them, turning the list endpoint into a
+  free enumeration oracle for reconnaissance.
 
 ### Performance
 

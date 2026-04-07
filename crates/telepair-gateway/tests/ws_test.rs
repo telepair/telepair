@@ -259,6 +259,110 @@ async fn ws_successful_join_receives_session_state() {
 }
 
 // --------------------------------------------------------------------------
+// Scoped-guest session pinning: a guest bound to session A must not be
+// allowed to open a WebSocket to session B even if they're technically a
+// participant of both (which they can't normally be, but a future bug
+// could put them there — the WS check is belt-and-braces on top of the
+// participant row). The live prod attack is simpler: a guest's bearer
+// token must not be reusable against any session other than its scope.
+// --------------------------------------------------------------------------
+#[tokio::test]
+async fn ws_scoped_guest_rejected_from_other_session() {
+    use telepair_core::permission::Role;
+
+    let (addr, state) = start_server().await;
+
+    // Session A and Session B exist with real owners.
+    let (_owner_a_token, _owner_a_id, session_a) = owned_session(&state, "alice").await;
+    let (_owner_b_token, _owner_b_id, session_b) = owned_session(&state, "bob").await;
+
+    // Mint a guest scoped to A and force them into the participants
+    // table for B as well. In production `redeem_invite` would never
+    // let this happen (the cross-session check in http.rs 403s), but
+    // we're asserting the WS layer is an independent line of defence
+    // — if a future refactor loosens the HTTP check, the WS handshake
+    // must still catch it.
+    let (guest_a, guest_a_token) = state.auth.create_guest(&session_a.id).await.unwrap();
+    state
+        .sessions
+        .storage()
+        .upsert_participant(&session_b.id, guest_a.id, Role::Viewer)
+        .await
+        .unwrap();
+
+    // Guest-A tries to connect to session B's WS endpoint.
+    let (mut ws, _) = connect_async(ws_url(&addr, &session_b.id))
+        .await
+        .expect("failed to connect");
+
+    ws.send(session_join_msg(&session_b.id, &guest_a_token))
+        .await
+        .unwrap();
+
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(3), recv_json(&mut ws))
+        .await
+        .expect("timed out waiting for error");
+
+    match msg {
+        Some(ServerMessage::Error { code, message }) => {
+            assert_eq!(
+                code, "NOT_PARTICIPANT",
+                "scoped guest must be rejected with NOT_PARTICIPANT on cross-session WS join"
+            );
+            assert!(
+                message.to_lowercase().contains("guest"),
+                "error message should mention the guest scope, got: {message}"
+            );
+        }
+        other => panic!("expected NOT_PARTICIPANT error, got: {other:?}"),
+    }
+}
+
+// --------------------------------------------------------------------------
+// Companion to the above: the same guest DOES get through for their own
+// session, so the scope check isn't a blanket "all guests rejected".
+// --------------------------------------------------------------------------
+#[tokio::test]
+async fn ws_scoped_guest_accepted_for_own_session() {
+    use telepair_core::permission::Role;
+
+    let (addr, state) = start_server().await;
+    let (_owner_token, _owner_id, session) = owned_session(&state, "owner").await;
+
+    let (guest, guest_token) = state.auth.create_guest(&session.id).await.unwrap();
+    state
+        .sessions
+        .storage()
+        .upsert_participant(&session.id, guest.id, Role::Viewer)
+        .await
+        .unwrap();
+
+    let (mut ws, _) = connect_async(ws_url(&addr, &session.id))
+        .await
+        .expect("failed to connect");
+    ws.send(session_join_msg(&session.id, &guest_token))
+        .await
+        .unwrap();
+
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), recv_json(&mut ws))
+        .await
+        .expect("timed out waiting for SessionState");
+
+    match msg {
+        Some(ServerMessage::SessionState { your_role, .. }) => {
+            assert_eq!(
+                your_role,
+                Role::Viewer,
+                "guest should join as their assigned role"
+            );
+        }
+        other => panic!("expected SessionState, got: {other:?}"),
+    }
+
+    let _ = ws.close(None).await;
+}
+
+// --------------------------------------------------------------------------
 // Test 6: WS disconnects after session is force-stopped via the hub
 // --------------------------------------------------------------------------
 #[tokio::test]

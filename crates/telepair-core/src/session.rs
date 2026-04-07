@@ -84,8 +84,31 @@ pub struct User {
     pub id: Uuid,
     pub name: String,
     pub is_admin: bool,
+    /// `Some(session_id)` → this user is an invite-minted guest whose
+    /// credentials are scoped to exactly one session. The HTTP layer
+    /// rejects every account-level route for scoped users, and the
+    /// WebSocket handshake rejects connections whose path does not
+    /// match. `None` → a real account created through the admin
+    /// path; full access subject to the usual role checks.
+    ///
+    /// This is the load-bearing fix for the "invite link grants a
+    /// full non-admin account" authorization bug — without it, a
+    /// redeemed viewer invite would let the holder list targets and
+    /// spawn new sessions behind the scenes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped_session_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl User {
+    /// `true` iff the user's credentials are scoped to a single
+    /// session (i.e. an invite-minted guest). Route handlers use this
+    /// to gate account-level endpoints; WS uses it to match the
+    /// path session id.
+    pub fn is_guest(&self) -> bool {
+        self.scoped_session_id.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

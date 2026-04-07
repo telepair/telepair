@@ -3,12 +3,21 @@
 -- and let the server recreate it on startup.
 
 CREATE TABLE IF NOT EXISTS users (
-    id           TEXT PRIMARY KEY,
-    name         TEXT NOT NULL UNIQUE,
-    token_sha256 TEXT NOT NULL UNIQUE,
-    is_admin     BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL
+    id                 TEXT PRIMARY KEY,
+    name               TEXT NOT NULL UNIQUE,
+    token_sha256       TEXT NOT NULL UNIQUE,
+    is_admin           BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Non-null for invite-minted guests: their bearer token is valid
+    -- ONLY for this one session. Every account-level route
+    -- (list targets, create session, redeem a *different* invite)
+    -- rejects scoped users; WS connections must target this exact
+    -- session id. Null for real accounts (admins, CLI-minted users).
+    -- Cannot be a real FK with ON DELETE CASCADE because sessions are
+    -- soft-closed (status='closed'), never deleted — the string here
+    -- is compared by equality at request time.
+    scoped_session_id  TEXT,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sessions (

@@ -66,6 +66,7 @@ fn row_to_user(r: &SqliteRow) -> Result<User> {
         id: parse_uuid(r.get("id"))?,
         name: r.get("name"),
         is_admin: r.get("is_admin"),
+        scoped_session_id: r.get("scoped_session_id"),
         created_at: parse_datetime(r.get("created_at"))?,
         updated_at: parse_datetime(r.get("updated_at"))?,
     })
@@ -196,7 +197,8 @@ impl SqliteStorage {
     /// assertions can verify inserts landed.
     pub async fn get_user(&self, id: Uuid) -> Result<Option<User>> {
         let row = sqlx::query(
-            "SELECT id, name, is_admin, created_at, updated_at FROM users WHERE id = ?",
+            "SELECT id, name, is_admin, scoped_session_id, created_at, updated_at \
+             FROM users WHERE id = ?",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -204,23 +206,33 @@ impl SqliteStorage {
 
         row.map(|r| row_to_user(&r)).transpose()
     }
-}
 
-impl Storage for SqliteStorage {
-    async fn create_user(&self, name: &str, is_admin: bool) -> Result<(User, String)> {
+    /// Shared implementation of account creation, parameterised over
+    /// `is_admin` and the optional `scoped_session_id`. `create_user`
+    /// always passes `None`; `create_scoped_guest` passes
+    /// `Some(session_id)`. Keeping one INSERT statement means every
+    /// path agrees on column ordering and default handling.
+    async fn insert_user(
+        &self,
+        name: &str,
+        is_admin: bool,
+        scoped_session_id: Option<&str>,
+    ) -> Result<(User, String)> {
         let id = Uuid::new_v4();
         let (token, sha256_hex) = generate_token();
         let now = Utc::now();
         let now_str = now.to_rfc3339();
 
         sqlx::query(
-            "INSERT INTO users (id, name, token_sha256, is_admin, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO users \
+               (id, name, token_sha256, is_admin, scoped_session_id, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id.to_string())
         .bind(name)
         .bind(&sha256_hex)
         .bind(is_admin)
+        .bind(scoped_session_id)
         .bind(&now_str)
         .bind(&now_str)
         .execute(&self.pool)
@@ -230,15 +242,35 @@ impl Storage for SqliteStorage {
             id,
             name: name.into(),
             is_admin,
+            scoped_session_id: scoped_session_id.map(|s| s.to_owned()),
             created_at: now,
             updated_at: now,
         };
         Ok((user, token))
     }
+}
+
+impl Storage for SqliteStorage {
+    async fn create_user(&self, name: &str, is_admin: bool) -> Result<(User, String)> {
+        // Unscoped path: real account, full route access (subject to
+        // `is_admin`). `scoped_session_id` stays NULL.
+        self.insert_user(name, is_admin, None).await
+    }
+
+    async fn create_scoped_guest(
+        &self,
+        name: &str,
+        session_id: &str,
+    ) -> Result<(User, String)> {
+        // Scoped path: guest bound to this one session, never an admin.
+        // The HTTP and WS layers enforce the scope at request time.
+        self.insert_user(name, false, Some(session_id)).await
+    }
 
     async fn get_user_by_name(&self, name: &str) -> Result<Option<User>> {
         let row = sqlx::query(
-            "SELECT id, name, is_admin, created_at, updated_at FROM users WHERE name = ?",
+            "SELECT id, name, is_admin, scoped_session_id, created_at, updated_at \
+             FROM users WHERE name = ?",
         )
         .bind(name)
         .fetch_optional(&self.pool)

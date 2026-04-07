@@ -13,6 +13,16 @@ pub use sqlite::SqliteStorage;
 pub trait Storage: Send + Sync {
     // Users
     async fn create_user(&self, name: &str, is_admin: bool) -> Result<(User, String)>;
+    /// Create a non-admin user whose credentials are bound to a single
+    /// session. The resulting `User.scoped_session_id` will be
+    /// `Some(session_id)`, which the HTTP and WS layers use to reject
+    /// account-level access and cross-session WS joins. Backs the
+    /// invite-redeem guest flow.
+    async fn create_scoped_guest(
+        &self,
+        name: &str,
+        session_id: &str,
+    ) -> Result<(User, String)>;
     async fn get_user_by_name(&self, name: &str) -> Result<Option<User>>;
     async fn validate_token(&self, token: &str) -> Result<User>;
 

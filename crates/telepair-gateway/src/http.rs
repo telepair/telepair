@@ -39,6 +39,18 @@ pub async fn extract_user(state: &AppState, headers: &HeaderMap) -> Result<User,
         .map_err(|_| StatusCode::UNAUTHORIZED)
 }
 
+/// Reject invite-minted guests on account-level routes. A scoped
+/// guest token is only valid for its bound session — it must not be
+/// usable to enumerate targets, spin up new sessions, or otherwise
+/// behave like a real account. 403 (not 401) because the caller is
+/// authenticated, they just don't have the scope for this route.
+fn require_unscoped(user: &User) -> Result<(), StatusCode> {
+    if user.is_guest() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
+}
+
 /// Run auth extraction and session lookup concurrently, then verify the
 /// authenticated user owns the session. Shaves one DB-query latency off
 /// each authenticated single-session endpoint.
@@ -71,7 +83,12 @@ pub async fn list_targets(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let _user = extract_user(&state, &headers).await?;
+    let user = extract_user(&state, &headers).await?;
+    // Guests are scoped to a single session and have no dashboard —
+    // they must never see a target list at all. (Separate finding
+    // from the info-leak fix below: before this the handler didn't
+    // even check authentication scope.)
+    require_unscoped(&user)?;
 
     #[derive(Serialize)]
     struct TargetInfo {
@@ -80,10 +97,21 @@ pub async fn list_targets(
         tags: Vec<String>,
     }
 
+    // Info-leak fix: `admin_only` targets must not be enumerable by
+    // non-admin callers. Before this filter, a regular user could
+    // still `GET /api/targets` and read the full set of admin-only
+    // target names / display strings / tags — names in the wild
+    // often encode environment info (e.g. `prod-payments-db`), so
+    // leaking the list is itself the problem, not just "users see a
+    // button they can't click". `create_session` still enforces the
+    // same rule, so this is a defence-in-depth narrowing of the
+    // response, not the sole gate.
+    let is_admin = user.is_admin;
     let targets: Vec<TargetInfo> = state
         .targets
         .list_targets()
         .iter()
+        .filter(|t| is_admin || !t.admin_only)
         .map(|t| TargetInfo {
             name: t.name.clone(),
             display: t.display.clone(),
@@ -115,6 +143,10 @@ pub async fn create_session(
     // Auth first so unauthenticated callers get 401 instead of 400,
     // matching the other handlers in this file.
     let user = extract_user(&state, &headers).await?;
+    // Scoped guests never create sessions — that's the entire point
+    // of scoping. This 403 is the teeth of the invite fix: even if a
+    // guest token is valid, this path is closed.
+    require_unscoped(&user)?;
 
     // Axum's default JSON rejection is 422; we want 400 so an unknown
     // `input_mode` value reads as "client sent garbage" instead of
@@ -322,6 +354,22 @@ pub async fn redeem_invite(
         .find_invite(&body.token)
         .await
         .map_err(|e| status_for(&e))?;
+
+    // Scoped-guest cross-session redeem: a guest whose token was
+    // issued for session A must not be able to redeem an invite for
+    // session B and pivot their identity. If the authenticated caller
+    // is scoped, the invite's target session must match their scope
+    // — otherwise reject outright with 403. (They can still reach the
+    // intended session by opening the invite link in a fresh tab
+    // without credentials, which mints a new, correctly-scoped
+    // guest.) Must fire before `consume_invite` so we don't burn a
+    // use on a rejected attempt.
+    if let Some(ref user) = existing_user
+        && let Some(ref scope) = user.scoped_session_id
+        && preview.session_id != *scope
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let session = storage
         .get_session(&preview.session_id)
         .await
@@ -366,13 +414,16 @@ pub async fn redeem_invite(
     // Decide which user joins: reuse the authenticated caller, or
     // mint a fresh guest. Guests are only created **after** the
     // invite was successfully consumed, so a rejected invite can
-    // never leave an orphan user behind.
+    // never leave an orphan user behind. The guest's credentials are
+    // scoped to `invite.session_id` so the resulting bearer token
+    // cannot be used to hit account-level routes or connect to any
+    // other session's WS endpoint.
     let (user, issued_token) = match existing_user {
         Some(u) => (u, None),
         None => {
             let (guest, raw_token) = state
                 .auth
-                .create_guest()
+                .create_guest(&invite.session_id)
                 .await
                 .map_err(|e| status_for(&e))?;
             (guest, Some(raw_token))
