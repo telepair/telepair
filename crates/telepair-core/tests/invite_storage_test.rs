@@ -7,7 +7,7 @@ async fn setup() -> (SqliteStorage, String) {
     let store = SqliteStorage::new_memory().await.unwrap();
     let (user, _) = store.create_user("host", false).await.unwrap();
     let session = store
-        .create_session(user.id, "shell", InputMode::Serialized)
+        .create_session_with_owner(user.id, "shell", InputMode::Serialized)
         .await
         .unwrap();
     (store, session.id)

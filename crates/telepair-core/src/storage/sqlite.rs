@@ -55,6 +55,12 @@ fn parse_datetime(s: String) -> Result<chrono::DateTime<Utc>> {
         .map_err(|e| Error::InvalidInput(format!("invalid timestamp: {e}")))
 }
 
+/// RFC3339 timestamp for the current instant — centralizes the format
+/// choice so all write paths agree with the parsers above.
+fn now_rfc3339() -> String {
+    Utc::now().to_rfc3339()
+}
+
 fn row_to_user(r: &SqliteRow) -> Result<User> {
     Ok(User {
         id: parse_uuid(r.get("id"))?,
@@ -93,11 +99,11 @@ fn row_to_session(r: &SqliteRow) -> Result<Session> {
         input_mode: r
             .get::<String, _>("input_mode")
             .parse()
-            .map_err(|e: String| Error::InvalidInput(e))?,
+            .map_err(Error::InvalidInput)?,
         status: r
             .get::<String, _>("status")
             .parse()
-            .map_err(|e: String| Error::InvalidInput(e))?,
+            .map_err(Error::InvalidInput)?,
         created_at: parse_datetime(r.get("created_at"))?,
         closed_at: parse_optional_datetime(r.get("closed_at"), "closed_at")?,
     })
@@ -110,7 +116,7 @@ fn row_to_participant(r: &SqliteRow) -> Result<Participant> {
         role: r
             .get::<String, _>("role")
             .parse()
-            .map_err(|e: String| Error::InvalidInput(e))?,
+            .map_err(Error::InvalidInput)?,
         joined_at: parse_datetime(r.get("joined_at"))?,
         left_at: parse_optional_datetime(r.get("left_at"), "left_at")?,
     })
@@ -123,7 +129,7 @@ fn row_to_invite(r: &SqliteRow) -> Result<InviteToken> {
         role: r
             .get::<String, _>("role")
             .parse()
-            .map_err(|e: String| Error::InvalidInput(e))?,
+            .map_err(Error::InvalidInput)?,
         max_uses: r.get("max_uses"),
         used_count: r.get("used_count"),
         expires_at: parse_optional_datetime(r.get("expires_at"), "expires_at")?,
@@ -150,17 +156,19 @@ fn generate_token() -> (String, String) {
 fn check_invite_validity(invite: &InviteToken) -> Result<()> {
     if let Some(expires_at) = invite.expires_at {
         if expires_at < Utc::now() {
-            return Err(Error::Auth("invite token has expired".into()));
+            return Err(Error::InvalidInput("invite token has expired".into()));
         }
     }
     if invite.used_count >= invite.max_uses {
-        return Err(Error::Auth("invite token has been fully used".into()));
+        return Err(Error::InvalidInput("invite token has been fully used".into()));
     }
     Ok(())
 }
 
 impl SqliteStorage {
-    /// Resolve a raw token via SHA-256 indexed lookup.
+    /// Resolve a raw token via SHA-256 indexed lookup. Returns `None` on
+    /// miss so callers pick the right error variant (user tokens → 401,
+    /// invite tokens → 400).
     ///
     /// `table` is interpolated into SQL — it MUST be a hardcoded constant,
     /// never user input.
@@ -169,20 +177,31 @@ impl SqliteStorage {
         table: &str,
         raw_token: &str,
         map_row: impl Fn(&SqliteRow) -> Result<T>,
-        not_found_error: &'static str,
-    ) -> Result<T> {
+    ) -> Result<Option<T>> {
         let sha256_hex = token_sha256(raw_token);
         let query = format!("SELECT * FROM {table} WHERE token_sha256 = ?");
-        match sqlx::query(&query)
+        sqlx::query(&query)
             .bind(&sha256_hex)
             .fetch_optional(&self.pool)
             .await?
-        {
-            Some(row) => map_row(&row),
-            None => Err(Error::Auth(not_found_error.into())),
-        }
+            .map(|row| map_row(&row))
+            .transpose()
     }
 
+    /// Fetch a user by id. Test-only: production auth always validates by
+    /// token, so there is no production caller for this lookup — it lives
+    /// here as an inherent method (not on the `Storage` trait) so test
+    /// assertions can verify inserts landed.
+    pub async fn get_user(&self, id: Uuid) -> Result<Option<User>> {
+        let row = sqlx::query(
+            "SELECT id, name, is_admin, created_at, updated_at FROM users WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|r| row_to_user(&r)).transpose()
+    }
 }
 
 impl Storage for SqliteStorage {
@@ -190,6 +209,7 @@ impl Storage for SqliteStorage {
         let id = Uuid::new_v4();
         let (token, sha256_hex) = generate_token();
         let now = Utc::now();
+        let now_str = now.to_rfc3339();
 
         sqlx::query(
             "INSERT INTO users (id, name, token_sha256, is_admin, created_at, updated_at) \
@@ -199,8 +219,8 @@ impl Storage for SqliteStorage {
         .bind(name)
         .bind(&sha256_hex)
         .bind(is_admin)
-        .bind(now.to_rfc3339())
-        .bind(now.to_rfc3339())
+        .bind(&now_str)
+        .bind(&now_str)
         .execute(&self.pool)
         .await?;
 
@@ -212,17 +232,6 @@ impl Storage for SqliteStorage {
             updated_at: now,
         };
         Ok((user, token))
-    }
-
-    async fn get_user(&self, id: Uuid) -> Result<Option<User>> {
-        let row = sqlx::query(
-            "SELECT id, name, is_admin, created_at, updated_at FROM users WHERE id = ?",
-        )
-        .bind(id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(|r| row_to_user(&r)).transpose()
     }
 
     async fn get_user_by_name(&self, name: &str) -> Result<Option<User>> {
@@ -237,39 +246,9 @@ impl Storage for SqliteStorage {
     }
 
     async fn validate_token(&self, token: &str) -> Result<User> {
-        self.lookup_by_token("users", token, row_to_user, "invalid token")
-            .await
-    }
-
-    async fn create_session(
-        &self,
-        owner_id: Uuid,
-        target_name: &str,
-        input_mode: InputMode,
-    ) -> Result<Session> {
-        let id = nanoid::nanoid!(10);
-        let now = Utc::now();
-
-        sqlx::query(
-            "INSERT INTO sessions (id, owner_id, target_name, input_mode, status, created_at) VALUES (?, ?, ?, ?, 'active', ?)",
-        )
-        .bind(&id)
-        .bind(owner_id.to_string())
-        .bind(target_name)
-        .bind(input_mode.as_str())
-        .bind(now.to_rfc3339())
-        .execute(&self.pool)
-        .await?;
-
-        Ok(Session {
-            id,
-            owner_id,
-            target_name: target_name.into(),
-            input_mode,
-            status: SessionStatus::Active,
-            created_at: now,
-            closed_at: None,
-        })
+        self.lookup_by_token("users", token, row_to_user)
+            .await?
+            .ok_or_else(|| Error::Auth("invalid token".into()))
     }
 
     async fn create_session_with_owner(
@@ -293,12 +272,13 @@ impl Storage for SqliteStorage {
 
         sqlx::query(
             "INSERT INTO sessions (id, owner_id, target_name, input_mode, status, created_at) \
-             VALUES (?, ?, ?, ?, 'active', ?)",
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&owner_str)
         .bind(target_name)
         .bind(input_mode.as_str())
+        .bind(SessionStatus::Active.as_str())
         .bind(&now_str)
         .execute(&mut *tx)
         .await?;
@@ -349,16 +329,17 @@ impl Storage for SqliteStorage {
         // into the single close path keeps both sides in sync: while
         // the session is alive, participants stay rejoinable; once
         // it's closed, everybody is consistently marked gone.
-        let now = Utc::now();
-        let now_str = now.to_rfc3339();
+        let now_str = now_rfc3339();
         let mut tx = self.pool.begin().await?;
 
         let result = sqlx::query(
-            "UPDATE sessions SET status = 'closed', closed_at = ? \
-             WHERE id = ? AND status = 'active'",
+            "UPDATE sessions SET status = ?, closed_at = ? \
+             WHERE id = ? AND status = ?",
         )
+        .bind(SessionStatus::Closed.as_str())
         .bind(&now_str)
         .bind(id)
+        .bind(SessionStatus::Active.as_str())
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
@@ -383,7 +364,8 @@ impl Storage for SqliteStorage {
     }
 
     async fn list_active_sessions(&self) -> Result<Vec<Session>> {
-        let rows = sqlx::query("SELECT * FROM sessions WHERE status = 'active'")
+        let rows = sqlx::query("SELECT * FROM sessions WHERE status = ?")
+            .bind(SessionStatus::Active.as_str())
             .fetch_all(&self.pool)
             .await?;
 
@@ -397,9 +379,10 @@ impl Storage for SqliteStorage {
         let rows = sqlx::query(
             "SELECT DISTINCT s.* FROM sessions s \
              LEFT JOIN participants p ON p.session_id = s.id AND p.user_id = ? AND p.left_at IS NULL \
-             WHERE s.status = 'active' AND (s.owner_id = ? OR p.user_id IS NOT NULL)",
+             WHERE s.status = ? AND (s.owner_id = ? OR p.user_id IS NOT NULL)",
         )
         .bind(&uid)
+        .bind(SessionStatus::Active.as_str())
         .bind(&uid)
         .fetch_all(&self.pool)
         .await?;
@@ -414,23 +397,25 @@ impl Storage for SqliteStorage {
         // sessions in the DB that no longer map to any running PTY.
         // Close them AND settle their participants in the same tx
         // so `left_at` stays consistent with the sessions row.
-        let now = Utc::now();
-        let now_str = now.to_rfc3339();
+        let now_str = now_rfc3339();
         let mut tx = self.pool.begin().await?;
 
         let result = sqlx::query(
-            "UPDATE sessions SET status = 'closed', closed_at = ? WHERE status = 'active'",
+            "UPDATE sessions SET status = ?, closed_at = ? WHERE status = ?",
         )
+        .bind(SessionStatus::Closed.as_str())
         .bind(&now_str)
+        .bind(SessionStatus::Active.as_str())
         .execute(&mut *tx)
         .await?;
 
         sqlx::query(
             "UPDATE participants SET left_at = ? \
              WHERE left_at IS NULL AND session_id IN \
-               (SELECT id FROM sessions WHERE status = 'closed' AND closed_at = ?)",
+               (SELECT id FROM sessions WHERE status = ? AND closed_at = ?)",
         )
         .bind(&now_str)
+        .bind(SessionStatus::Closed.as_str())
         .bind(&now_str)
         .execute(&mut *tx)
         .await?;
@@ -514,13 +499,9 @@ impl Storage for SqliteStorage {
     }
 
     async fn find_invite(&self, token: &str) -> Result<InviteToken> {
-        self.lookup_by_token(
-            "invite_tokens",
-            token,
-            row_to_invite,
-            "invalid invite token",
-        )
-        .await
+        self.lookup_by_token("invite_tokens", token, row_to_invite)
+            .await?
+            .ok_or_else(|| Error::InvalidInput("invalid invite token".into()))
     }
 
     async fn consume_invite(&self, token: &str) -> Result<InviteToken> {
@@ -533,7 +514,7 @@ impl Storage for SqliteStorage {
              AND (expires_at IS NULL OR expires_at > ?)",
         )
         .bind(&invite.token_sha256)
-        .bind(Utc::now().to_rfc3339())
+        .bind(now_rfc3339())
         .execute(&self.pool)
         .await?;
 
@@ -541,7 +522,9 @@ impl Storage for SqliteStorage {
             // Determine why: expired or fully used
             check_invite_validity(&invite)?;
             // Race condition: another request consumed the last use between our lookup and UPDATE
-            return Err(Error::Auth("invite token has been fully used".into()));
+            return Err(Error::InvalidInput(
+                "invite token has been fully used".into(),
+            ));
         }
 
         Ok(InviteToken {

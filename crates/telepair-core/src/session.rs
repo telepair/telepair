@@ -38,6 +38,15 @@ pub enum SessionStatus {
     Closed,
 }
 
+impl SessionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Closed => "closed",
+        }
+    }
+}
+
 impl std::str::FromStr for SessionStatus {
     type Err = String;
 
