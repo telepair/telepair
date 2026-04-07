@@ -44,6 +44,19 @@ pub async fn ws_handler(
         .on_upgrade(move |socket| handle_socket(socket, session_id, state))
 }
 
+/// Close a session row whose WS-phase launch failed so it doesn't
+/// linger as "active" on the owner's dashboard with no hub entry for
+/// the idle reaper to find.
+async fn cleanup_orphan_session(state: &AppState, session_id: &str) {
+    if let Err(err) = state.sessions.close_session(session_id).await {
+        tracing::error!(
+            session = %session_id,
+            error = %err,
+            "failed to close orphan session after launch failure"
+        );
+    }
+}
+
 async fn send_error(
     ws_tx: &mut futures::stream::SplitSink<WebSocket, Message>,
     code: &str,
@@ -185,6 +198,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let (cmd, args, env) = match state.targets.resolve(&session.target_name) {
         Some(resolved) => resolved,
         None => {
+            cleanup_orphan_session(&state, &session_id).await;
             send_error(
                 &mut ws_tx,
                 error_codes::TARGET_NOT_FOUND,
@@ -206,6 +220,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     {
         Ok(attachment) => attachment,
         Err(e) => {
+            cleanup_orphan_session(&state, &session_id).await;
             send_error(&mut ws_tx, error_codes::PTY_ERROR, e.to_string()).await;
             return;
         }
@@ -270,7 +285,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let (personal_tx, mut personal_rx) = mpsc::channel::<ServerMessage>(4);
 
     let session_id_for_output = session_id.clone();
-    let output_handle = tokio::spawn(async move {
+    let mut output_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 result = output_rx.recv() => {
@@ -445,12 +460,18 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     }
 
     let _ = stop_tx.send(());
-    // Give the output handler time to flush pending sends before force-aborting
-    if tokio::time::timeout(std::time::Duration::from_secs(2), output_handle)
+    // Give the forwarder a bounded grace window to flush pending sends.
+    // Passing `&mut output_handle` keeps ownership locally so we can
+    // call `.abort()` if it doesn't shut down — the previous code moved
+    // the handle into `timeout`, which on elapse just dropped the
+    // handle and silently leaked the task (it kept running, blocked on
+    // a backpressured TCP send, until the runtime tore it down).
+    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut output_handle)
         .await
         .is_err()
     {
-        tracing::warn!(session = %session_id, "output handler did not stop within 2s");
+        tracing::warn!(session = %session_id, "output handler did not stop within 2s, aborting");
+        output_handle.abort();
     }
     // Drop the in-memory connection record so the reaper's idle clock
     // can start counting, but **do not** touch the DB `left_at` here.
