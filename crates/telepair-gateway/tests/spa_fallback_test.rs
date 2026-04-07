@@ -22,8 +22,7 @@ use telepair_gateway::{CorsMode, build_router_with_options};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-const FAKE_SPA_HTML: &str =
-    "<!doctype html><html><head><title>telepair-spa</title></head>\
+const FAKE_SPA_HTML: &str = "<!doctype html><html><head><title>telepair-spa</title></head>\
      <body><div id=\"app\">marker-42</div></body></html>";
 
 /// Spin up a temp directory that looks like a built SPA: a single
@@ -31,8 +30,7 @@ const FAKE_SPA_HTML: &str =
 /// alive for the duration of the test or the dir is removed.
 fn fake_web_dist() -> TempDir {
     let tmp = TempDir::new().expect("create tempdir for fake web dist");
-    std::fs::write(tmp.path().join("index.html"), FAKE_SPA_HTML)
-        .expect("write fake index.html");
+    std::fs::write(tmp.path().join("index.html"), FAKE_SPA_HTML).expect("write fake index.html");
     tmp
 }
 
