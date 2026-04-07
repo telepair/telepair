@@ -9,6 +9,10 @@ export interface TerminalHandle {
   write(data: string | Uint8Array): void;
   focus(): void;
   dispose(): void;
+  /** Fit-computed size; read by the parent to size the initial
+   *  `SessionJoin` frame so the server PTY spawns at the right dims. */
+  cols: number;
+  rows: number;
 }
 
 interface TerminalProps {
@@ -71,13 +75,16 @@ export default function Terminal(props: TerminalProps) {
       // WebGL not available, fall back to canvas
     }
 
-    fitAddon.fit();
-
     // Forward user input
     term.onData((data) => props.onData(data));
 
-    // Forward resize
+    // Register onResize BEFORE fit() so the initial 80×24 → real-size
+    // event actually reaches the parent. fit() fires onResize
+    // synchronously; registering after means the parent never sees the
+    // first snap and the server PTY stays at 80×24.
     term.onResize(({ cols, rows }) => props.onResize(cols, rows));
+
+    fitAddon.fit();
 
     // Auto-fit on container resize (debounced to avoid flooding server with resize messages)
     resizeObserver = new ResizeObserver(() => {
@@ -86,7 +93,8 @@ export default function Terminal(props: TerminalProps) {
     });
     resizeObserver.observe(containerRef);
 
-    // Expose handle to parent
+    // `cols`/`rows` read AFTER fit() so the handle exposes the real
+    // pixel-derived dims, not the xterm default 80×24.
     props.ref?.({
       write(data: string | Uint8Array) {
         term?.write(data);
@@ -97,6 +105,8 @@ export default function Terminal(props: TerminalProps) {
       dispose() {
         term?.dispose();
       },
+      cols: term.cols,
+      rows: term.rows,
     });
 
     term.focus();

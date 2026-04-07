@@ -75,6 +75,9 @@ export default function SessionPage() {
   let termHandle: TerminalHandle | undefined;
   let pendingOutput: Uint8Array[] = [];
   let socket: TelepairSocket | undefined;
+  // One-shot latch so HMR/StrictMode re-entry into the Terminal ref
+  // callback doesn't reopen the WebSocket.
+  let socketOpened = false;
 
   const handleBinary = (data: Uint8Array) => {
     if (termHandle) {
@@ -251,10 +254,12 @@ export default function SessionPage() {
     auth.logoutAndRedirect();
   };
 
-  // Connect WebSocket
+  // `connect()` is deferred until the Terminal ref fires so the
+  // initial `SessionJoin` frame can carry the fit-computed cols/rows;
+  // otherwise the server spawns the PTY at 80×24 and full-screen TUIs
+  // render inside a tiny viewport until the first corrective resize.
   socket = new TelepairSocket(handleMessage, handleBinary, handleStatus);
   socket.onReconnectInfo = setReconnectInfo;
-  socket.connect(params.id, auth.token());
 
   onCleanup(() => {
     // Drop any sticky reconnect toast so its Retry action cannot resurrect
@@ -344,6 +349,10 @@ export default function SessionPage() {
               termHandle = h;
               for (const data of pendingOutput) h.write(data);
               pendingOutput = [];
+              if (!socketOpened) {
+                socketOpened = true;
+                socket?.connect(params.id, auth.token(), h.cols, h.rows);
+              }
             }}
           />
         </div>
