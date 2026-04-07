@@ -16,7 +16,7 @@ use telepair_core::protocol::{ClientMessage, ServerMessage, error_codes, input_d
 use telepair_core::session::InputMode;
 use telepair_core::storage::Storage;
 
-use crate::session_hub::PtyCommand;
+use crate::session_hub::{PtyCommand, SessionAttachment};
 use crate::state::AppState;
 
 /// Hard cap on any single WebSocket frame/message. Terminal keystrokes are
@@ -161,10 +161,13 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
 
     let db_participants = participants_res.unwrap_or_default();
     let is_owner = session.owner_id == user.id;
-    let is_participant = db_participants.iter().any(|p| p.user_id == user.id);
+    // Single scan serves both "are they allowed in?" and "what's their
+    // role?" — the old code walked `db_participants` twice for the same
+    // predicate.
+    let me = db_participants.iter().find(|p| p.user_id == user.id);
 
     // Reject users who are neither the owner nor an existing participant
-    if !is_owner && !is_participant {
+    if !is_owner && me.is_none() {
         send_error(
             &mut ws_tx,
             error_codes::NOT_PARTICIPANT,
@@ -174,9 +177,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         return;
     }
 
-    let my_role = db_participants
-        .iter()
-        .find(|p| p.user_id == user.id)
+    let my_role = me
         .map(|p| p.role)
         .unwrap_or_else(|| if is_owner { Role::Owner } else { Role::Viewer });
 
@@ -193,21 +194,39 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
             return;
         }
     };
-    let (cmd_tx, mut output_rx, mut collab_rx, mut shutdown_rx, scrollback) = match hub
+    let SessionAttachment {
+        cmd_tx,
+        mut output_rx,
+        mut collab_rx,
+        mut shutdown_rx,
+        scrollback,
+    } = match hub
         .start_or_join(&session_id, &cmd, &args, &env, initial_cols, initial_rows)
         .await
     {
-        Ok(channels) => channels,
+        Ok(attachment) => attachment,
         Err(e) => {
-            send_error(&mut ws_tx, error_codes::PTY_ERROR, e).await;
+            send_error(&mut ws_tx, error_codes::PTY_ERROR, e.to_string()).await;
             return;
         }
     };
 
-    hub.add_participant(&session_id, user.id, user.name.clone(), my_role)
-        .await;
-
-    let participants = hub.get_participants(&session_id).await;
+    // `None` here means the session vanished from the hub between
+    // `start_or_join` and this call — force-stop, reaper sweep during
+    // the handshake gap, that kind of thing. The `shutdown_rx` we
+    // already hold will deliver the tear-down signal on the next loop
+    // iteration, so falling through with an empty list is safe; the
+    // warn log just makes the rare case debuggable.
+    let participants = hub
+        .add_participant_and_snapshot(&session_id, user.id, user.name.clone(), my_role)
+        .await
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                session = %session_id,
+                "session vanished between start_or_join and add_participant"
+            );
+            Vec::new()
+        });
 
     let state_msg = ServerMessage::SessionState {
         session: session.clone(),
@@ -313,13 +332,10 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let user_name = user.name.clone();
     let input_mode = session.input_mode;
 
-    // Role is captured at join time and never mutates for the lifetime of
-    // this WS connection. The previous code maintained a `tokio::sync::watch`
-    // updated by `PermUpdate`, but with no role-mutation API exposed there
-    // was nothing to update — every connection's role was constant from
-    // join to disconnect. If/when role updates land, the right place to
-    // re-check is on reconnect (so the auth model stays consistent across
-    // tabs), not via a side-channel that races the input loop.
+    // Role is captured at join time and constant for the lifetime of this
+    // WS connection. If a future role-mutation API lands, reconnect is the
+    // right place to re-check (keeps auth consistent across tabs), not a
+    // side-channel that races the input loop.
     let current_role = my_role;
     let can_forward_input = current_role.can_input()
         && !(input_mode == InputMode::Serialized && current_role != Role::Owner);
