@@ -1,6 +1,6 @@
 // web/src/lib/api.ts
 import type { TargetInfo, Session, InviteInfo, RedeemResult, Role, InputMode } from './protocol';
-import { STORAGE_KEY, readCurrentToken } from '../stores/auth';
+import { auth, readCurrentToken } from '../stores/auth';
 
 const BASE = '/api';
 
@@ -22,39 +22,18 @@ const PUBLIC_PATHS = new Set<string>(['/invite/redeem']);
 
 /**
  * Called from the request helper when the server returns 401 on an
- * authenticated endpoint. This is the single place responsible for
- * recovering from a stale token: drop the cached credential and push
- * the user back to the login screen instead of letting them stare at
- * a broken dashboard (which is what used to happen — a saved-but-
- * expired token left the dashboard rendering "No targets available"
- * and hid the real auth failure).
+ * authenticated endpoint. Delegates to `auth.logoutAndRedirect`, which
+ * is the single place responsible for "drop the cached credential and
+ * push the user back to /login" — the previous inline implementation
+ * here had drifted from the dashboard 403 path and the Session.tsx
+ * non-owner exit, leaving each call site with a slightly different
+ * guard around `window.location.assign`.
  *
- * Exported as a swap point so tests can stub navigation without
+ * Still exported as a swap point so tests can stub navigation without
  * touching window.location directly.
  */
 export let handleAuthExpired: () => void = () => {
-  // Clear both storage tiers. The sessionStorage slot is the
-  // authoritative per-tab identity; localStorage is the persistent
-  // admin fallback used to seed new tabs. A stale token that tripped
-  // this handler could live in either slot, so wipe both before
-  // bouncing to /login.
-  try {
-    sessionStorage.removeItem(STORAGE_KEY);
-  } catch {
-    // ignore — private-mode / storage quota is not actionable here
-  }
-  try {
-    localStorage.removeItem(STORAGE_KEY);
-  } catch {
-    // ignore
-  }
-  // Use a hard navigation instead of the router: by the time we
-  // notice a stale token the reactive auth store is still
-  // advertising the old value, and SolidJS routes won't re-run
-  // AuthGuard unless we force a reload.
-  if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
-    window.location.assign('/login');
-  }
+  auth.logoutAndRedirect();
 };
 
 /** Test hook — lets Vitest override the expiry handler. */
@@ -65,9 +44,9 @@ export function __setAuthExpiredHandler(fn: () => void) {
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   // Always read through the auth store's helper so the sessionStorage
   // tier wins over the persistent admin fallback. Reading localStorage
-  // directly here is what let finding #10 hide — a tab that had a
-  // guest sessionStorage entry would get the admin token stamped onto
-  // its requests and confuse the rest of the UI.
+  // directly here would let a tab with a guest sessionStorage entry
+  // get the admin token stamped onto its requests — the cross-tab
+  // identity-bleed bug the two-tier storage is designed to prevent.
   const token = readCurrentToken();
   const headers: Record<string, string> = {
     ...options.headers as Record<string, string>,

@@ -35,10 +35,7 @@ async function fetchTargets() {
     // the Dashboard renders as an empty state; that is not ideal
     // but is strictly better than masking stale-token bugs.
     if (e instanceof ApiError && e.status === 403) {
-      auth.logout();
-      if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
-        window.location.assign('/login');
-      }
+      auth.logoutAndRedirect();
       return;
     }
     console.error('fetchTargets failed:', e);
