@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { encodeInput, canInput, InputDeniedReason } from './protocol';
+import { encodeInput, canInput, CloseCode, InputDeniedReason } from './protocol';
 import type { ClientMessage, ServerMessage } from './protocol';
 
 describe('encodeInput', () => {
@@ -74,13 +74,32 @@ describe('ServerMessage type narrowing', () => {
   });
 });
 
+describe('CloseCode', () => {
+  // These two values are the protocol's retry-vs-giveup signal — they
+  // MUST stay in sync with `CLOSE_CODE_TERMINAL` / `CLOSE_CODE_TRANSIENT`
+  // in crates/telepair-core/src/protocol.rs. A desync silently strands
+  // users on a dead session page OR turns bad credentials into a
+  // reconnect storm, depending on which side drifts.
+  it('TERMINAL is 4001 (auth/permission/not-found failures)', () => {
+    expect(CloseCode.TERMINAL).toBe(4001);
+  });
+
+  it('TRANSIENT is 4503 (storage hiccups, retry on client)', () => {
+    expect(CloseCode.TRANSIENT).toBe(4503);
+  });
+
+  it('TERMINAL and TRANSIENT are distinct so the client can distinguish them', () => {
+    expect(CloseCode.TERMINAL).not.toBe(CloseCode.TRANSIENT);
+  });
+});
+
 describe('canInput', () => {
   // Matrix: the owner always drives; operators only drive in multiplexed
-  // sessions; viewers are always read-only. The 2-arg signature was
-  // introduced with finding #2 — an operator in a serialized session
-  // used to be silently allowed on the client and then dropped on the
-  // server, producing a dead-keyboard UX. These tests pin the matrix so
-  // a regression can't sneak back via a default-argument refactor.
+  // sessions; viewers are always read-only. The 2-arg signature exists
+  // because a 1-arg version once silently allowed an operator to type in
+  // a serialized session — the bytes were then dropped server-side,
+  // producing a dead-keyboard UX. These tests pin the matrix so a
+  // regression can't sneak back via a default-argument refactor.
   it('owner can always input', () => {
     expect(canInput('owner', 'multiplexed')).toBe(true);
     expect(canInput('owner', 'serialized')).toBe(true);

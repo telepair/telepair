@@ -72,6 +72,7 @@ export const en = {
     banner_ended: 'This session has ended.',
     banner_not_found: 'Session not found — it may have been deleted.',
     banner_not_participant: 'You are not a participant of this session.',
+    banner_storage_error: 'Temporary storage error — please retry in a moment.',
     banner_connection_lost: 'Connection lost. Automatic retry gave up.',
     banner_reconnecting:
       'Connection lost — retrying {{ attempt }}/{{ max }} (next in {{ seconds }}s)',

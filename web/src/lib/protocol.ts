@@ -12,8 +12,41 @@ export const ErrorCode = {
   NOT_PARTICIPANT: 'NOT_PARTICIPANT',
   TARGET_NOT_FOUND: 'TARGET_NOT_FOUND',
   PTY_ERROR: 'PTY_ERROR',
+  /**
+   * Transient storage failure during the WS handshake (e.g. the
+   * participants lookup errored out). Clients should treat it as
+   * "retry in a moment" — it is NOT a permission or invite problem.
+   * Paired with `CloseCode.TRANSIENT` on the close frame.
+   */
+  STORAGE_ERROR: 'STORAGE_ERROR',
 } as const;
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
+
+/**
+ * WebSocket close codes the gateway uses to signal "retry vs give up"
+ * to the client. MUST stay in sync with `CLOSE_CODE_TERMINAL` /
+ * `CLOSE_CODE_TRANSIENT` in `crates/telepair-core/src/protocol.rs` —
+ * the close code is the single signal the client has to decide whether
+ * to reconnect, since the preceding JSON `Error` frame may be dropped
+ * if the socket tears down mid-write.
+ */
+export const CloseCode = {
+  /**
+   * Permanent refusal — auth / permission / not-found / target-missing.
+   * `TelepairSocket.onclose` MUST surface an error state and NOT
+   * schedule a reconnect, otherwise a revoked token would DoS the
+   * gateway with a retry storm.
+   */
+  TERMINAL: 4001,
+  /**
+   * Transient failure (e.g. a one-off SQLite hiccup during the
+   * handshake). The client is expected to reconnect on its own. Sits
+   * in the private-use range (4000-4999) and is chosen to be visually
+   * distinct from TERMINAL rather than for any IANA meaning.
+   */
+  TRANSIENT: 4503,
+} as const;
+export type CloseCode = (typeof CloseCode)[keyof typeof CloseCode];
 
 export type Role = 'owner' | 'operator' | 'viewer';
 

@@ -12,7 +12,9 @@ use futures::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 
 use telepair_core::permission::Role;
-use telepair_core::protocol::{ClientMessage, ServerMessage, error_codes, input_denied};
+use telepair_core::protocol::{
+    ClientMessage, ServerMessage, close_code_for, error_codes, input_denied,
+};
 use telepair_core::session::InputMode;
 use telepair_core::storage::Storage;
 
@@ -57,25 +59,41 @@ async fn cleanup_orphan_session(state: &AppState, session_id: &str) {
     }
 }
 
+/// Build the two WebSocket frames that `send_error` will write for a
+/// given protocol error: a JSON `ServerMessage::Error` text frame the
+/// client's `onmessage` handler can surface, followed by a `Close`
+/// frame whose code decides "retry or give up" on the client side.
+///
+/// Extracted from `send_error` so the close-code decision is
+/// unit-testable without having to stand up a real WebSocket sink.
+/// The close code comes from `close_code_for` — the protocol layer is
+/// the single source of truth for terminal vs transient classification.
+fn build_error_frames(code: &str, message: String) -> (Message, Message) {
+    let err = ServerMessage::Error {
+        code: code.into(),
+        message: message.clone(),
+    };
+    // `serde_json::to_string` on a struct of owned `String`s never
+    // fails in practice, but we fall back to an empty JSON object
+    // instead of unwrapping so a hypothetical future variant with a
+    // non-serializable field can't crash the gateway.
+    let json = serde_json::to_string(&err).unwrap_or_else(|_| "{}".into());
+    let text = Message::Text(json.into());
+    let close = Message::Close(Some(CloseFrame {
+        code: close_code_for(code),
+        reason: message.into(),
+    }));
+    (text, close)
+}
+
 async fn send_error(
     ws_tx: &mut futures::stream::SplitSink<WebSocket, Message>,
     code: &str,
     message: String,
 ) {
-    let err = ServerMessage::Error {
-        code: code.into(),
-        message: message.clone(),
-    };
-    if let Ok(json) = serde_json::to_string(&err) {
-        let _ = ws_tx.send(Message::Text(json.into())).await;
-    }
-    // Send proper close frame so frontend can distinguish permanent errors
-    let _ = ws_tx
-        .send(Message::Close(Some(CloseFrame {
-            code: 4001,
-            reason: message.into(),
-        })))
-        .await;
+    let (text, close) = build_error_frames(code, message);
+    let _ = ws_tx.send(text).await;
+    let _ = ws_tx.send(close).await;
 }
 
 async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
@@ -172,7 +190,22 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         return;
     }
 
-    let db_participants = participants_res.unwrap_or_default();
+    // A DB failure here must not collapse into the `NOT_PARTICIPANT`
+    // branch below — that would misdiagnose a storage outage as a
+    // permission problem and push users into rebuilding invites.
+    let db_participants = match participants_res {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(session = %session_id, error = %e, "failed to list participants");
+            send_error(
+                &mut ws_tx,
+                error_codes::STORAGE_ERROR,
+                "temporary storage failure — please retry".into(),
+            )
+            .await;
+            return;
+        }
+    };
     let is_owner = session.owner_id == user.id;
     // Single scan serves both "are they allowed in?" and "what's their
     // role?" — the old code walked `db_participants` twice for the same
@@ -483,4 +516,73 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     // which keeps the DB consistent with the session lifecycle.
     hub.remove_participant(&session_id, user_id).await;
     tracing::info!(user = %user_name, session = %session_id, "WebSocket disconnected");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use telepair_core::protocol::{CLOSE_CODE_TERMINAL, CLOSE_CODE_TRANSIENT};
+
+    /// Pull the `CloseFrame` out of a `Message::Close`, or panic with a
+    /// descriptive error so test failures point at the right thing.
+    fn expect_close_frame(msg: &Message) -> &CloseFrame {
+        match msg {
+            Message::Close(Some(frame)) => frame,
+            other => panic!("expected Message::Close(Some(..)), got {other:?}"),
+        }
+    }
+
+    // The whole fix hinges on this: `STORAGE_ERROR` must ride out on a
+    // close code the frontend recognizes as transient, not on 4001
+    // which `web/src/lib/ws.ts` treats as terminal. If this test
+    // regresses, a SQLite hiccup again strands users on a dead page.
+    #[test]
+    fn build_error_frames_uses_transient_close_for_storage_error() {
+        let (_text, close) = build_error_frames(error_codes::STORAGE_ERROR, "boom".into());
+        let frame = expect_close_frame(&close);
+        assert_eq!(frame.code, CLOSE_CODE_TRANSIENT);
+        assert_ne!(frame.code, CLOSE_CODE_TERMINAL);
+    }
+
+    // Counterpart: revoked tokens / missing sessions MUST stay terminal.
+    // A regression that made these transient would turn every bad
+    // credential into a reconnect storm against the gateway.
+    #[test]
+    fn build_error_frames_uses_terminal_close_for_permanent_errors() {
+        for code in [
+            error_codes::AUTH_FAILED,
+            error_codes::AUTH_TIMEOUT,
+            error_codes::NOT_PARTICIPANT,
+            error_codes::SESSION_NOT_FOUND,
+            error_codes::SESSION_CLOSED,
+            error_codes::TARGET_NOT_FOUND,
+            error_codes::PTY_ERROR,
+        ] {
+            let (_text, close) = build_error_frames(code, "nope".into());
+            let frame = expect_close_frame(&close);
+            assert_eq!(
+                frame.code, CLOSE_CODE_TERMINAL,
+                "{code} must stay terminal to avoid reconnect storms"
+            );
+        }
+    }
+
+    // The text frame is what the client's `onmessage` handler parses to
+    // render a localized error — ensure the protocol `code` survives
+    // the round-trip through `build_error_frames`.
+    #[test]
+    fn build_error_frames_text_frame_carries_error_code() {
+        let (text, _close) = build_error_frames(error_codes::STORAGE_ERROR, "temporary".into());
+        let Message::Text(json) = text else {
+            panic!("expected Message::Text, got {text:?}");
+        };
+        let parsed: ServerMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ServerMessage::Error { code, message } => {
+                assert_eq!(code, error_codes::STORAGE_ERROR);
+                assert_eq!(message, "temporary");
+            }
+            other => panic!("expected Error variant, got {other:?}"),
+        }
+    }
 }
