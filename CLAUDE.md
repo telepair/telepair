@@ -46,15 +46,15 @@ All crates use `#![deny(unsafe_code)]`.
 
 **`make all` must pass before any `git push`.** No exceptions. This is the single
 source of truth for "ready to push": it runs `fmt-check`, `lint` (clippy + tsc),
-`test` (cargo + vitest), and `build` (release binary + web bundle) in one shot.
+`test` (cargo + vitest), `build` (release binary + web bundle), and `e2e`
+(Playwright) in one shot.
 
 ```bash
 make all                                     # required before every push
 ```
 
 If `make all` fails, fix the issue at its root — do not bypass with `--no-verify`,
-`fmt`-only partial runs, or skipping a subcommand. E2E (`make e2e`) is not part of
-the gate but should be run before shipping user-facing changes.
+`fmt`-only partial runs, or skipping a subcommand.
 
 ## Architecture
 

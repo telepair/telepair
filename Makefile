@@ -64,7 +64,7 @@ build: build-rust build-web ## Build everything (release)
 
 check: fmt-check lint test ## Run all CI gates locally (fmt + lint + test)
 
-all: check build ## Full pipeline: verify (fmt + lint + test) then build release artifacts
+all: check build e2e ## Full pipeline: verify (fmt + lint + test + e2e) then build release artifacts
 
 dev: ## Run backend in dev mode on :7700
 	cargo run
