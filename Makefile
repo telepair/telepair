@@ -47,7 +47,7 @@ test-web: ## Frontend unit tests (vitest)
 
 test: test-rust test-web ## Run all unit tests
 
-e2e: build-web ## Playwright E2E (forces fresh frontend build first)
+e2e: build-rust build-web ## Playwright E2E (reuses the release binary + fresh frontend build)
 	cd $(WEB) && npm run e2e
 
 # ---------- build ----------
