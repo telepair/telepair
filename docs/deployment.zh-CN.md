@@ -101,7 +101,7 @@ COPY migrations/ migrations/
 RUN cargo build --release
 
 # 构建前端
-FROM node:18 AS frontend
+FROM node:22 AS frontend
 WORKDIR /build
 COPY web/ web/
 RUN cd web && npm install && npm run build
