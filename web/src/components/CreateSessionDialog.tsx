@@ -22,10 +22,10 @@ interface CreateSessionDialogProps {
  * Confirmation + mode-picker modal shown after clicking a target card.
  *
  * Why this exists instead of a one-click launch:
- *   - The default mode matters. Finding #5: clicking a target used to
- *     bypass any mode picker, so users always got the server-side
- *     default and had no way to start a "solo" or "collaborative" run
- *     without editing storage manually.
+ *   - The default mode matters. Clicking a target straight to launch
+ *     would force the server-side default and leave users with no way
+ *     to start a "solo" or "collaborative" run without editing storage
+ *     manually.
  *   - A modal also prevents accidental launches — target cards are big
  *     click targets and a stray click used to spawn an unwanted PTY.
  *   - Showing the resolved command in the dialog gives the user one

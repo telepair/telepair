@@ -313,14 +313,13 @@ async fn redeem_with_auth_reuses_existing_user() {
 
 #[tokio::test]
 async fn redeem_by_owner_does_not_burn_invite_uses() {
-    // Finding #8: an owner who visits their own invite link (common
-    // smoke-test flow — "does this link work?") used to silently
-    // consume one use of the invite. On a default `max_uses = 1`
-    // invite that drained it to zero before the real guest arrived,
-    // producing a useless link. The fix short-circuits in
-    // `redeem_invite` when the caller is already a participant of
-    // the session; this test pins that behaviour so a future refactor
-    // can't reintroduce the burn.
+    // An owner who visits their own invite link (common smoke-test
+    // flow — "does this link work?") must NOT consume one use of the
+    // invite. On a default `max_uses = 1` invite that would drain it
+    // to zero before the real guest arrived, producing a useless link.
+    // `redeem_invite` short-circuits when the caller is already a
+    // participant of the session; this test pins that behaviour so a
+    // future refactor can't reintroduce the burn.
     let (state, app, owner_token) = setup().await;
     let session_id = create_session(&app, &owner_token).await;
 
