@@ -257,11 +257,7 @@ impl Storage for SqliteStorage {
         self.insert_user(name, is_admin, None).await
     }
 
-    async fn create_scoped_guest(
-        &self,
-        name: &str,
-        session_id: &str,
-    ) -> Result<(User, String)> {
+    async fn create_scoped_guest(&self, name: &str, session_id: &str) -> Result<(User, String)> {
         // Scoped path: guest bound to this one session, never an admin.
         // The HTTP and WS layers enforce the scope at request time.
         self.insert_user(name, false, Some(session_id)).await

@@ -18,11 +18,7 @@ pub trait Storage: Send + Sync {
     /// `Some(session_id)`, which the HTTP and WS layers use to reject
     /// account-level access and cross-session WS joins. Backs the
     /// invite-redeem guest flow.
-    async fn create_scoped_guest(
-        &self,
-        name: &str,
-        session_id: &str,
-    ) -> Result<(User, String)>;
+    async fn create_scoped_guest(&self, name: &str, session_id: &str) -> Result<(User, String)>;
     async fn get_user_by_name(&self, name: &str) -> Result<Option<User>>;
     async fn validate_token(&self, token: &str) -> Result<User>;
 
