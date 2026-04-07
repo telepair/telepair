@@ -352,9 +352,7 @@ impl SessionHub {
     /// behavior), a chunk could slip in during that gap and be lost
     /// entirely: not in the snapshot, and broadcast before the receiver
     /// existed.
-    async fn subscribe_existing(
-        live: &LiveSession,
-    ) -> (broadcast::Receiver<Bytes>, Vec<Bytes>) {
+    async fn subscribe_existing(live: &LiveSession) -> (broadcast::Receiver<Bytes>, Vec<Bytes>) {
         let sb = live.scrollback.lock().await;
         let output_rx = live.output_tx.subscribe();
         let snapshot = sb.snapshot();
