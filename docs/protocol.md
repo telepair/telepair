@@ -1,3 +1,5 @@
+English | [简体中文](protocol.zh-CN.md)
+
 # WebSocket Protocol
 
 Endpoint: `ws://localhost:7700/ws/session/{session_id}`

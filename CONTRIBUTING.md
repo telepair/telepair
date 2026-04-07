@@ -1,3 +1,5 @@
+English | [简体中文](CONTRIBUTING.zh-CN.md)
+
 # Contributing to telepair
 
 Thank you for your interest in contributing to telepair! This guide will help you get started.

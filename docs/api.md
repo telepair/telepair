@@ -1,3 +1,5 @@
+English | [简体中文](api.zh-CN.md)
+
 # REST API Reference
 
 Base URL: `http://localhost:7700/api`
