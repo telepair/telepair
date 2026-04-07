@@ -12,7 +12,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::sync::oneshot;
 
 use telepair_core::permission::Role;
-use telepair_core::protocol::{ClientMessage, ParticipantInfo, ServerMessage};
+use telepair_core::protocol::{ClientMessage, ServerMessage, error_codes};
 use telepair_core::session::InputMode;
 use telepair_core::storage::Storage;
 
@@ -77,14 +77,15 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                     }) => match state.auth.validate(&token).await {
                         Ok(user) => (user, cols, rows),
                         Err(_) => {
-                            send_error(&mut ws_tx, "AUTH_FAILED", "invalid token".into()).await;
+                            send_error(&mut ws_tx, error_codes::AUTH_FAILED, "invalid token".into())
+                                .await;
                             return;
                         }
                     },
                     _ => {
                         send_error(
                             &mut ws_tx,
-                            "EXPECTED_JOIN",
+                            error_codes::EXPECTED_JOIN,
                             "first message must be SessionJoin".into(),
                         )
                         .await;
@@ -95,7 +96,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
             _ => {
                 send_error(
                     &mut ws_tx,
-                    "AUTH_TIMEOUT",
+                    error_codes::AUTH_TIMEOUT,
                     "expected SessionJoin within 5 seconds".into(),
                 )
                 .await;
@@ -116,7 +117,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         _ => {
             send_error(
                 &mut ws_tx,
-                "SESSION_NOT_FOUND",
+                error_codes::SESSION_NOT_FOUND,
                 format!("session {session_id} not found"),
             )
             .await;
@@ -127,7 +128,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     if session.status == telepair_core::session::SessionStatus::Closed {
         send_error(
             &mut ws_tx,
-            "SESSION_CLOSED",
+            error_codes::SESSION_CLOSED,
             "this session has been closed".into(),
         )
         .await;
@@ -142,7 +143,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     if !is_owner && !is_participant {
         send_error(
             &mut ws_tx,
-            "NOT_PARTICIPANT",
+            error_codes::NOT_PARTICIPANT,
             "you are not a participant of this session".into(),
         )
         .await;
@@ -161,7 +162,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         None => {
             send_error(
                 &mut ws_tx,
-                "TARGET_NOT_FOUND",
+                error_codes::TARGET_NOT_FOUND,
                 format!("target {} not found", session.target_name),
             )
             .await;
@@ -174,7 +175,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     {
         Ok(channels) => channels,
         Err(e) => {
-            send_error(&mut ws_tx, "PTY_ERROR", e).await;
+            send_error(&mut ws_tx, error_codes::PTY_ERROR, e).await;
             return;
         }
     };
@@ -182,20 +183,11 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     hub.add_participant(&session_id, user.id, user.name.clone(), my_role)
         .await;
 
-    let connected = hub.get_participants(&session_id).await;
-    let participant_infos: Vec<ParticipantInfo> = connected
-        .iter()
-        .map(|p| ParticipantInfo {
-            user_id: p.user_id,
-            name: p.name.clone(),
-            role: p.role,
-            color: p.color.clone(),
-        })
-        .collect();
+    let participants = hub.get_participants(&session_id).await;
 
     let state_msg = ServerMessage::SessionState {
         session: session.clone(),
-        participants: participant_infos,
+        participants,
         your_role: my_role,
         your_user_id: user.id,
     };
@@ -329,7 +321,9 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                     }
                     Message::Binary(data) => {
                         if can_forward_input {
-                            let _ = cmd_tx.send(PtyCommand::Input(data.to_vec())).await;
+                            // `data` is already a refcounted `Bytes` from
+                            // axum 0.8's WS codec — forward without copy.
+                            let _ = cmd_tx.send(PtyCommand::Input(data)).await;
                         }
                     }
                     Message::Close(_) => break,

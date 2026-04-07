@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 telepair-core = { workspace = true }
 portable-pty = { workspace = true }
+bytes = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true }
