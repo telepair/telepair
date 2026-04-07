@@ -1,6 +1,7 @@
 import { createSignal, Show } from 'solid-js';
 import { api } from '../lib/api';
 import type { Role } from '../lib/protocol';
+import { toast } from '../stores/toast';
 
 interface InviteDialogProps {
   sessionId: string;
@@ -21,9 +22,11 @@ export default function InviteDialog(props: InviteDialogProps) {
       const url = `${location.origin}/join/${invite.token}`;
       setInviteUrl(url);
     } catch (e) {
-      console.error('Failed to create invite:', e);
+      const msg = e instanceof Error ? e.message : String(e);
+      toast.error(`Failed to create invite: ${msg}`);
+    } finally {
+      setCreating(false);
     }
-    setCreating(false);
   };
 
   const handleCopy = async () => {
