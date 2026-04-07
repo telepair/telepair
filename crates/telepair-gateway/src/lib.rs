@@ -5,14 +5,20 @@ pub mod session_hub;
 pub mod state;
 pub mod ws;
 
+use std::convert::Infallible;
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use axum::{
     Router,
-    http::HeaderValue,
+    body::Body,
+    http::{HeaderValue, Request, Response, StatusCode, header},
     routing::{delete, get, post},
 };
 use state::AppState;
+use tower::service_fn;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 
 /// Default loopback origins allowed when the operator does not pass
 /// `--allowed-origins` or `--allow-any-origin`. These match the Vite
@@ -119,8 +125,65 @@ pub fn build_router_with_options(
 
     let router = match web_dir {
         Some(dir) => {
-            let serve =
-                ServeDir::new(dir).not_found_service(ServeFile::new(format!("{dir}/index.html")));
+            // SPA deep-linking fix: previously we used
+            //   ServeDir::not_found_service(ServeFile(index.html))
+            // which correctly served the HTML body for routes like
+            // `/login`, `/join/<token>`, and `/session/<id>` — but
+            // with `HTTP 404`. The reason is a tower-http gotcha:
+            // `ServeFile` is just a `ServeDir` pinned to one path,
+            // and when it receives a request whose URI doesn't
+            // match that path it returns 404 (not 200 with the
+            // pinned file). Chaining it behind `not_found_service`
+            // means every SPA deep link went out the door as 404,
+            // which breaks reverse proxies (nginx
+            // `proxy_intercept_errors`), CDN rules, uptime probes,
+            // and OG/SEO crawlers.
+            //
+            // Correct behaviour: the SPA shell should answer with
+            // `200 OK` for any non-asset request so the client-side
+            // router can take over. We read `index.html` once at
+            // boot, wrap it in an `Arc<Vec<u8>>`, and hand
+            // `ServeDir` a `service_fn` fallback that returns the
+            // bytes with an explicit 200 for every path. Reading
+            // once avoids a disk hit on every deep-link request;
+            // if `index.html` can't be read at startup we fail
+            // loudly rather than silently serving an empty body.
+            let index_path: PathBuf = PathBuf::from(dir).join("index.html");
+            let index_bytes = std::fs::read(&index_path).map_err(|e| {
+                format!(
+                    "failed to read SPA shell `{}`: {e}. \
+                     Build the web frontend before starting the gateway.",
+                    index_path.display()
+                )
+            })?;
+            let index_body: Arc<Vec<u8>> = Arc::new(index_bytes);
+            let spa_fallback = service_fn(move |_req: Request<Body>| {
+                let body = index_body.clone();
+                async move {
+                    let response = Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                        // SPA shell must never be cached by
+                        // intermediaries — a fresh deploy needs to
+                        // reach every client on their next
+                        // navigation. Hashed asset files keep their
+                        // own caching via `ServeDir`.
+                        .header(header::CACHE_CONTROL, "no-cache")
+                        .body(Body::from(body.as_ref().clone()))
+                        .expect("static SPA shell response is always well-formed");
+                    Ok::<_, Infallible>(response)
+                }
+            });
+
+            // Use `.fallback()` (not `.not_found_service()`) —
+            // critical gotcha: `not_found_service` wraps the
+            // fallback in `SetStatus::new(..., NOT_FOUND)`, which
+            // overrides whatever status our service_fn returns and
+            // forces it back to 404. That is literally the bug we
+            // are fixing in this file. `.fallback()` preserves the
+            // fallback's own status code, which is documented at
+            // https://docs.rs/tower-http/0.6/tower_http/services/struct.ServeDir.html#method.fallback
+            let serve = ServeDir::new(dir).fallback(spa_fallback);
             api.fallback_service(serve)
         }
         None => api,
