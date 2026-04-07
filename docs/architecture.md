@@ -25,7 +25,7 @@ The foundation crate. Contains no business logic — only shared abstractions.
 | `protocol.rs` | `ClientMessage`/`ServerMessage` enums (JSON, `#[serde(tag = "type")]`); PTY output is sent as raw binary WS frames |
 | `storage.rs` | Async `Storage` trait — CRUD for users, sessions, participants, invite tokens |
 | `storage/sqlite.rs` | `SqliteStorage` implementation using sqlx |
-| `auth.rs` | `TokenAuthProvider` — bcrypt-based token validation |
+| `auth.rs` | `TokenAuthProvider` — SHA-256 hashed token validation (raw token returned once at creation, never persisted) |
 | `target.rs` | `Target` and `TargetKind` definitions |
 | `error.rs` | `Error` enum (Auth, NotFound, Storage, Internal) |
 
@@ -142,4 +142,4 @@ All IDs are UUIDs stored as TEXT. Timestamps are ISO 8601 TEXT. The `Storage` tr
 - **Authentication**: Bearer token in `Authorization` header. Tokens are stored as their SHA-256 hex digest only — the raw value is returned to the caller exactly once at creation and never persisted.
 - **Authorization**: Role-based per session. WS handler checks role on every input/resize action.
 - **Invite tokens**: Single-use by default. Stored as SHA-256 digests; atomic `used_count < max_uses` increment prevents concurrent redemption race conditions.
-- **CORS**: Configurable via `--allowed-origins`. When unset, the server allows **all origins** (permissive default for development). In production behind a reverse proxy, set `--allowed-origins` to restrict access to trusted domains.
+- **CORS**: Configurable via `--allowed-origins` (comma-separated absolute URLs). When unset, the server defaults to **loopback dev origins only** (`http://localhost:5173`, `http://127.0.0.1:5173`) to match the Vite dev server. Malformed origins are fatal at startup so a typo can never silently widen the allowlist. `--allow-any-origin` opts into `Access-Control-Allow-Origin: *` and is only safe in dev or behind a reverse proxy that enforces CORS. For production direct-exposure (no reverse proxy), set `--allowed-origins` to the trusted frontend domain.

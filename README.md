@@ -81,33 +81,37 @@ telepair is a Cargo workspace with composable roles:
 | `telepair-gateway` | Axum HTTP/WS server, REST API, static file serving |
 | `telepair-cli` | CLI argument parsing, initialization, server startup |
 
-### Composable Roles
+### Deployment Shape
 
-```bash
-telepair                          # all roles (single-node, default)
-telepair --agent --gateway        # agent + gateway only
-telepair --control                # control-only (headless)
-```
-
-No flags = all roles enabled. This is the recommended mode for single-machine use.
+telepair today ships as a single-node binary: agent, control, and gateway run in the same process. Splitting them across hosts for clustering is planned future work — see `crates/telepair-cli/src/main.rs` for the (currently hidden) role flags.
 
 ## Configuration
 
 ### CLI Options
 
 ```
-telepair [OPTIONS]
+telepair [OPTIONS] [COMMAND]
+
+Commands:
+  admin    Admin operations (token recovery, user management)
+           e.g. `telepair admin show-token` prints the saved admin token
 
 Options:
-      --agent              Enable agent role (PTY, virtual targets)
-      --control            Enable control role (auth, sessions, storage)
-      --gateway            Enable gateway role (HTTP/WS endpoints)
-      --host <HOST>        Bind address [default: 0.0.0.0]
-      --port <PORT>        Server port [default: 7700]
-      --config <PATH>      Path to config file
-      --targets <PATH>     Path to targets config [default: ~/.telepair/targets.yaml]
-      --web-dir <PATH>     Path to web frontend dist directory
+      --host <HOST>                Server bind address [default: 0.0.0.0]
+      --port <PORT>                Server port [default: 7700]
+      --config <PATH>              Path to config file
+      --targets <PATH>             Path to targets config [default: ~/.telepair/targets.yaml]
+      --web-dir <PATH>             Path to web frontend dist directory
+      --allowed-origins <LIST>     Comma-separated absolute-URL CORS allowlist.
+                                   Unset defaults to loopback dev origins
+                                   (http://localhost:5173, http://127.0.0.1:5173).
+                                   Parse failures are fatal at startup.
+      --allow-any-origin           Allow any origin (Access-Control-Allow-Origin: *).
+                                   Only safe in dev or behind a CORS-enforcing proxy.
+                                   Mutually exclusive with --allowed-origins (wins).
 ```
+
+> Lost the admin token? Run `telepair admin show-token` — it reads the token cached in `~/.telepair/admin_token` (mode 0600, written once at first startup).
 
 ### Virtual Targets
 

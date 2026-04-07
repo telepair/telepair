@@ -33,7 +33,7 @@ After=network.target
 [Service]
 Type=simple
 User=telepair
-ExecStart=/usr/local/bin/telepair --web-dir /opt/telepair/web/dist
+ExecStart=/usr/local/bin/telepair --host 127.0.0.1 --web-dir /opt/telepair/web/dist
 WorkingDirectory=/opt/telepair
 Restart=on-failure
 Environment=RUST_LOG=info
@@ -157,6 +157,22 @@ docker run -v ./targets.yaml:/root/.telepair/targets.yaml telepair
 
 See the [README](../README.md#virtual-targets) for targets.yaml format.
 
+### CORS
+
+telepair serves a same-origin frontend in production, so when the browser fetches `/api` and `/ws` from the same host that served `index.html`, CORS is bypassed entirely and no extra config is required. You only need to think about CORS when the frontend lives on a different origin than the API:
+
+- **Reverse-proxy deployment (recommended).** nginx terminates TLS, serves `/` and proxies `/api` + `/ws/` to `127.0.0.1:7700`. Same-origin from the browser's point of view — no CORS flags needed.
+- **Direct exposure without a proxy.** If you host the frontend on a different domain (e.g. serving `web/dist` from a CDN while the API runs elsewhere), you must pass the exact frontend origin:
+
+  ```bash
+  ./telepair --web-dir web/dist \
+             --allowed-origins https://telepair.example.com
+  ```
+
+  Comma-separate to allow multiple. Malformed origins abort startup — a typo can never silently degrade to an empty list.
+- **Default (no flag).** Falls back to `http://localhost:5173, http://127.0.0.1:5173` for the Vite dev server only. This is intentionally **not** "allow any" — earlier versions defaulted to `*` and that was a footgun.
+- **`--allow-any-origin`.** Only safe in dev or when a reverse proxy enforces CORS upstream. Overrides `--allowed-origins`.
+
 ### Environment Variables
 
 | Variable | Default | Description |
@@ -178,7 +194,8 @@ Back up `telepair.db` to preserve user accounts and session history.
 ## Security Considerations
 
 - **Always use TLS** in production (via reverse proxy)
-- **Save the admin token** from first run — it is also written to `~/.telepair/admin_token` (mode 0600) for recovery
-- **Restrict network access** — telepair binds to `0.0.0.0` by default; use `--host 127.0.0.1` if only accessed via reverse proxy
+- **Save the admin token** from first run — it is also written to `~/.telepair/admin_token` (mode 0600) for recovery. Lost it? Run `telepair admin show-token` to print the cached value.
+- **Restrict network access** — telepair binds to `0.0.0.0` by default; use `--host 127.0.0.1` when behind a reverse proxy so the port is never reachable from the outside
+- **Pin CORS** — never deploy with `--allow-any-origin` on a direct-exposed host. Either run behind a proxy (same-origin, no CORS) or explicitly list the frontend origin with `--allowed-origins`.
 - **Invite tokens** are single-use by default; increase `max_uses` only when needed
 - **PTY access** is equivalent to shell access — carefully manage who gets operator/owner roles
