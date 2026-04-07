@@ -11,6 +11,7 @@ telepair-control = { workspace = true }
 telepair-agent = { workspace = true }
 axum = { workspace = true }
 axum-extra = { workspace = true }
+tower = { workspace = true }
 tower-http = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -30,3 +31,4 @@ tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 telepair-core = { workspace = true }
 chrono = { workspace = true }
+tempfile = { workspace = true }

@@ -70,6 +70,7 @@ bytes = "1"
 # Testing
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.26"
+tempfile = "3"
 
 # CLI extras
 anyhow = "1"

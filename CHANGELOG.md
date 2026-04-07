@@ -64,6 +64,23 @@ real-time chat.
 - `telepair admin show-token` subcommand for recovering the admin token
   from `~/.telepair/admin_token` (mode `0600`, written on first startup).
 
+### Fixed
+
+- **SPA deep-link status code** — `build_router_with_options` used
+  `ServeDir::not_found_service(ServeFile(index.html))` which correctly
+  served the shell body for client-side routes like `/login`,
+  `/join/<token>`, and `/session/<id>` but returned `HTTP 404`
+  (tower-http's `not_found_service` wraps the fallback in
+  `SetStatus::new(..., NOT_FOUND)`, which forcibly rewrites the status).
+  The 404 broke nginx `proxy_intercept_errors`, CDN rules that treat
+  404s as cacheable dead links, uptime probes, and OG/SEO crawlers.
+  Replace the `ServeFile` fallback with a `service_fn` that reads
+  `index.html` once at boot into an `Arc<Vec<u8>>` and hand it to
+  `ServeDir::fallback(..)` (not `not_found_service`) so the reply is
+  `200 OK` with `Cache-Control: no-cache`. Failing to read `index.html`
+  at startup now hard-errors instead of silently serving an empty
+  body.
+
 ### Added — Web frontend (SolidJS + Vite)
 
 - Vite + SolidJS + TypeScript scaffold.
