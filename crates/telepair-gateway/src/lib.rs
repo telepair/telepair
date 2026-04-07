@@ -157,9 +157,35 @@ pub fn build_router_with_options(
                 )
             })?;
             let index_body: Arc<Vec<u8>> = Arc::new(index_bytes);
-            let spa_fallback = service_fn(move |_req: Request<Body>| {
+            let spa_fallback = service_fn(move |req: Request<Body>| {
                 let body = index_body.clone();
                 async move {
+                    // API + WebSocket routes must NEVER fall through
+                    // to the SPA shell. Without this guard, an
+                    // unknown `/api/typo` returns `200 text/html`
+                    // (the SPA HTML), which:
+                    //   - hides typos in the frontend (caller sees
+                    //     200, then a JSON-parse error two layers
+                    //     deeper)
+                    //   - makes uptime probes report a dead route as
+                    //     "alive" because the body type changed but
+                    //     the status didn't
+                    //   - lets a failed `/ws/*` upgrade silently
+                    //     deliver an HTML body to a websocket
+                    //     client, which is a debugging nightmare
+                    // The contract: anything under `/api/` or `/ws/`
+                    // that the router didn't match is a real 404,
+                    // returned as JSON so frontend error handling
+                    // stays on the structured-error path.
+                    let path = req.uri().path();
+                    if path.starts_with("/api/") || path.starts_with("/ws/") {
+                        let response = Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(br#"{"error":"not_found"}"#.to_vec()))
+                            .expect("static 404 JSON response is always well-formed");
+                        return Ok::<_, Infallible>(response);
+                    }
                     let response = Response::builder()
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")

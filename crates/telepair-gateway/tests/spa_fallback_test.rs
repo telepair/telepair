@@ -136,6 +136,90 @@ async fn api_routes_are_not_swallowed_by_spa_fallback() {
 }
 
 #[tokio::test]
+async fn unknown_api_route_returns_404_json_not_spa_shell() {
+    // Regression for the SPA-fallback escape hatch: previously the
+    // fallback unconditionally returned `200 text/html` (the SPA
+    // shell) for *any* path the router didn't match, including
+    // `/api/typo`. That hid frontend bugs (caller sees 200, then a
+    // JSON-parse error deep in the stack), broke uptime probes
+    // (every typoed API path "looked alive"), and made the SPA shell
+    // body show up at the API contract layer.
+    //
+    // Contract: anything under `/api/` that the router doesn't
+    // recognise is a real 404 with a JSON body, never the SPA shell.
+    let tmp = fake_web_dist();
+    let app = build_app_with_spa(&tmp).await;
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/this-route-does-not-exist")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "unknown /api/* paths must be 404, not 200 (SPA fallback would otherwise swallow them \
+         and return the SPA shell as the body, which silently masks every typo + dead route)"
+    );
+
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.starts_with("application/json"),
+        "unknown /api/* must return JSON content-type, got `{content_type}` — frontend error \
+         handling branches on JSON vs HTML and an HTML body here will mask the bug"
+    );
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body = std::str::from_utf8(&bytes).expect("404 body is utf-8");
+    assert!(
+        !body.contains("marker-42"),
+        "unknown /api/* response body must NOT contain the SPA shell marker, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn unknown_ws_route_returns_404_not_spa_shell() {
+    // Same regression as above, applied to /ws/. A failed websocket
+    // upgrade that silently delivered an HTML body to the client was
+    // a debugging nightmare — the client side just saw a closed
+    // connection with no useful signal. Pin the contract that
+    // unknown /ws/* paths are 404, not 200-text/html.
+    let tmp = fake_web_dist();
+    let app = build_app_with_spa(&tmp).await;
+
+    let resp = app
+        .oneshot(
+            Request::get("/ws/this-ws-route-does-not-exist")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "unknown /ws/* paths must be 404, not 200 — the SPA fallback must not bleed into the \
+         websocket namespace"
+    );
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body = std::str::from_utf8(&bytes).expect("404 body is utf-8");
+    assert!(
+        !body.contains("marker-42"),
+        "unknown /ws/* response body must NOT contain the SPA shell marker, got: {body}"
+    );
+}
+
+#[tokio::test]
 async fn missing_index_html_fails_build_loudly() {
     // Constructing a router with `--web-dir` pointing at a dir with
     // no `index.html` must fail at startup. The old implementation
