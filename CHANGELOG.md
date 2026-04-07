@@ -7,75 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **Invite links now work for brand-new collaborators.** `POST /api/invite/redeem`
-  previously required a valid bearer token, which meant the "share a link to
-  collaborate" flow was broken for anyone who had not already been handed an
-  admin token. The endpoint now accepts anonymous callers, mints a guest user
-  (`guest-<nanoid>`) on redemption, and returns the freshly issued bearer token
-  in the response body. Authenticated callers still reuse their existing
-  identity and get `token: null`. Guests are only created **after** the invite
-  is successfully consumed, so a rejected link never leaves an orphan user
-  behind.
-- **Invitees can reconnect after a transient disconnect.** The WebSocket
-  handler used to eagerly stamp `left_at` on every socket close, while the
-  session reaper kept the in-memory `LiveSession` alive for a 120 s grace
-  window. Clients auto-retrying inside that window hit the `NOT_PARTICIPANT`
-  branch and were closed with 4001, meaning an invitee could only ever join
-  once per socket lifetime. Participant cleanup is now done by `close_session`
-  and `close_stale_sessions` inside a single transaction that also flips the
-  session status, so a socket blip no longer marks the participant row gone.
-  The owner path was masked from the old bug by a `is_owner` short-circuit,
-  which is why the original reaper test used an owner and missed it — a new
-  regression test exercises the invitee path explicitly.
-- **Stale admin tokens no longer leave the dashboard in a broken state.** The
-  REST client now intercepts 401 on any protected path, clears the cached
-  token, and forces a navigation to `/login`. Previously the dashboard would
-  silently render "No targets available" while hiding the real auth failure.
-  The redeem endpoint is explicitly exempt so that a half-filled guest flow
-  does not bounce the visitor out of the invite.
-- **`input_mode` typos return 400 instead of silently degrading.** Unknown
-  values used to fall back to `serialized`, which masked client bugs and could
-  surprise the caller with the wrong input semantics. The `POST /api/sessions`
-  handler now parses `input_mode` strictly.
-- **Handler error mappings no longer leak `InvalidInput` as 500.** Introduced
-  `Error::http_status()` and a handler-side `status_for()` helper so that
-  authorization failures always come back as 401 / 403 and input errors as
-  400, regardless of which storage call produced them.
-
-### Changed
-
-- `POST /api/invite/redeem` response schema gained a nullable `token` field.
-  It is populated only when a new guest was minted; authenticated callers
-  keep using their original token and get `"token": null`.
-- Join page (`web/src/pages/Join.tsx`) no longer shows a "please paste a
-  token first" wall — it always attempts to redeem and only surfaces an
-  error when the invite itself is invalid, expired, or points at a closed
-  session (410 Gone).
-- Login help copy updated to reflect the new "open the link, no token
-  needed" flow for guests.
-
-### Removed
-
-- Dead `TokenAuthProvider::create_user` method (no callers).
-- Dead `Storage::remove_participant` method and its only caller in the
-  WebSocket handler. Participant `left_at` writes now happen exclusively
-  inside `close_session` / `close_stale_sessions`.
-
-### Testing
-
-- Rust workspace up to **87** tests (from 77), with new coverage for
-  `create_guest` uniqueness, the anonymous-redeem happy path, invitee
-  reconnect within the reaper grace window, bulk `close_session` participant
-  settling, strict `input_mode` rejection, and the 400/410 error codes on
-  `POST /api/invite/redeem`.
-- Web Vitest suite up to **67** tests (from 63), covering the new 401
-  interceptor — including the `/invite/redeem` opt-out so anonymous guests
-  are not yanked back to `/login`.
-- Playwright suite up to **18** tests (from 16), adding a full
-  anonymous-guest redeem flow and an invalid-invite error path.
-
 ## [0.1.0] - 2026-04-07
 
 Initial public release of **telepair** — a web-based terminal collaboration
@@ -92,23 +23,46 @@ real-time chat.
   Owner / Operator / Viewer permission model.
 - `Storage` trait with an async SQLite implementation (sqlx) and auto-applied
   migrations from `/migrations/`.
-- Token-based authentication provider.
+- Token-based authentication with SHA-256 hashed storage — raw tokens are
+  returned exactly once at creation and never persisted in plaintext.
 - PTY manager built on `portable-pty` (spawn, I/O, resize).
 - Virtual target engine driven by `~/.telepair/targets.yaml`.
 - Session and target services in `telepair-control`.
 - Axum HTTP gateway exposing REST routes for health, targets, sessions, and
   invite tokens; static file serving for the web frontend.
+- **Anonymous invite redemption** on `POST /api/invite/redeem`: opening a
+  shared invite link no longer requires the visitor to already hold a
+  bearer token. The endpoint mints a throwaway `guest-<nanoid>` user on
+  successful redemption and returns the freshly issued token in the response
+  body. Authenticated callers reuse their existing identity and get
+  `"token": null` in the response. Guests are only created **after** the
+  invite is successfully consumed, so a rejected link never leaves an
+  orphan user behind.
+- Strict `input_mode` parsing on `POST /api/sessions`: unknown values return
+  `400 Bad Request` rather than silently collapsing to `serialized`, so
+  client typos surface instead of masking themselves as the wrong semantics.
+- Structured error-to-HTTP mapping via `Error::http_status()`: authorization
+  failures always surface as 401/403 and input errors as 400 regardless of
+  which storage call produced them — no more `InvalidInput` leaking out as
+  500. `POST /api/invite/redeem` returns 400 for unknown/expired/exhausted
+  tokens and 410 Gone when the target session is closed (the invite is not
+  consumed so it can still be revoked or reassigned).
 - WebSocket handler with a `SessionHub` that multiplexes PTY I/O and
   collaboration traffic across participants.
+- Reconnect-safe participant lifecycle: the WebSocket handler does not
+  stamp `left_at` on socket close — participant cleanup happens
+  exclusively inside `close_session` / `close_stale_sessions`, in the
+  same transaction that flips session status, so a transient socket blip
+  inside the reaper's grace window does not evict an invitee.
 - Multi-user participant tracking with join/leave/chat/cursor messages.
 - Binary WebSocket frames for terminal I/O (zero-copy via `Bytes`); JSON
   frames for control and collaboration messages with `#[serde(tag = "type")]`
   discriminants.
 - Bounded WebSocket chat size, cursor update rate, and frame limits.
-- `telepair` CLI with composable `--agent`, `--control`, `--gateway` role
-  flags (no flags = all roles, single-node default).
-- `telepair admin show-token` subcommand to recover the admin token.
-- Admin token persisted to `~/.telepair/admin_token` with mode `0600`.
+- Single-node `telepair` binary running agent + control + gateway in one
+  process; hidden role flags are reserved for future clustering work.
+- `telepair admin show-token` subcommand for recovering the admin token
+  from `~/.telepair/admin_token` (mode `0600`, written on first startup).
 
 ### Added — Web frontend (SolidJS + Vite)
 
@@ -117,7 +71,18 @@ real-time chat.
 - Reactive auth and session stores.
 - Login page, dashboard with available targets, and session page with
   xterm.js terminal (WebGL rendering).
-- Invite flow: invite dialog, join page, and REST/WS integration.
+- Anonymous invite flow: the Join page always attempts to redeem the token
+  in the URL — no "paste your admin token first" wall — and only surfaces
+  an error when the invite itself is invalid, expired, or points at a
+  closed session (410 Gone). The newly minted guest token is cached in
+  the browser for the rest of the tab's lifetime.
+- Login copy mirrors the anonymous flow: invitees are told to just open
+  the link, admins paste their token.
+- REST client 401 interceptor: any protected path returning 401 clears the
+  cached token and forces a redirect to `/login`, so a stale admin token
+  can never leave the dashboard silently rendering "No targets available".
+  `POST /api/invite/redeem` is explicitly exempt so a half-filled guest
+  flow does not bounce the visitor out of the invite.
 - Real-time collaboration UI: participants list and chat panel wired into
   the session page.
 - UI primitives (toast, banner, skeleton) and a banner-based reconnect UX.
@@ -125,9 +90,16 @@ real-time chat.
 ### Added — Documentation
 
 - Project README, contributing guide, and MIT license.
-- `docs/architecture.md`, `docs/protocol.md`, `docs/api.md`,
-  `docs/deployment.md` (with systemd, nginx, Docker, and Docker Compose
-  recipes).
+- `docs/architecture.md`, `docs/protocol.md`, `docs/api.md`, and
+  `docs/deployment.md` — the deployment guide covers systemd, nginx,
+  Docker, Docker Compose, and a dedicated CORS section covering same-origin
+  reverse-proxy, direct-exposure with `--allowed-origins`, and dev-only
+  `--allow-any-origin`. The systemd example binds `--host 127.0.0.1` so
+  the listener is loopback-only behind a proxy by default.
+- README documents the full `telepair --help` surface including
+  `--allowed-origins` / `--allow-any-origin`, the `admin show-token`
+  recovery path, and calls out that the binary runs as a single-node
+  process today.
 
 ### Security
 
@@ -155,16 +127,26 @@ real-time chat.
 
 ### Testing
 
-- **77** Rust tests across the workspace (unit, integration, and backend
-  collaboration end-to-end flows).
-- **63** Vitest unit tests covering the protocol, stores, REST client, and
-  WebSocket client.
-- **16** Playwright browser E2E tests covering authentication, dashboard,
-  session lifecycle, terminal I/O, and collaboration.
+- **87** Rust tests across the workspace (unit, integration, and backend
+  collaboration end-to-end flows), including coverage for `create_guest`
+  uniqueness, the anonymous-redeem happy path, invitee reconnection inside
+  the reaper grace window, bulk `close_session` participant settling, the
+  strict `input_mode` rejection path, and the 400 / 410 error codes on
+  `POST /api/invite/redeem`.
+- **67** Vitest unit tests covering the protocol, stores, REST client
+  (including the 401 interceptor and its `/invite/redeem` opt-out), and
+  the WebSocket client.
+- **18** Playwright browser E2E tests covering authentication, dashboard,
+  session lifecycle, terminal I/O, collaboration, the full anonymous-guest
+  redeem flow, and the invalid-invite error path.
 
 ### Build & CI
 
-- Makefile wiring `cargo fmt --check`, `cargo clippy`, and test targets.
+- Makefile wiring `fmt` / `fmt-check` / `lint` / `test` / `build` targets
+  plus an `all` target that chains `check` + `build` into a single
+  pre-release pipeline (fmt-check + clippy + type-check + unit tests +
+  release binary + frontend bundle). `.DEFAULT_GOAL` stays on `help` so
+  the bare `make` experience remains a menu.
 - GitHub Actions CI pipeline and release workflow.
 - MIT license across the workspace.
 
