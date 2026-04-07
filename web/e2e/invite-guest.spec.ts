@@ -40,10 +40,10 @@ test.describe('Invite flow (anonymous guest)', () => {
     const guestCtx = await browser.newContext();
     const guestPage = await guestCtx.newPage();
 
-    // Sanity: the guest really starts with nothing. Finding #10 fix
-    // moved per-tab identity into sessionStorage (with localStorage as
-    // a persistent admin fallback), so both tiers must be cleared to
-    // simulate a genuinely brand-new visitor.
+    // Sanity: the guest really starts with nothing. Per-tab identity
+    // lives in sessionStorage with localStorage as a persistent admin
+    // fallback, so both tiers must be cleared to simulate a genuinely
+    // brand-new visitor.
     await guestPage.goto('/login');
     await guestPage.evaluate(() => {
       localStorage.clear();
@@ -69,8 +69,8 @@ test.describe('Invite flow (anonymous guest)', () => {
 
     // And the backend must have handed us a token — otherwise a page
     // reload would snap us back to /login. Guest tokens land in
-    // sessionStorage (per-tab identity), not localStorage — that's
-    // the whole point of finding #10's fix.
+    // sessionStorage (per-tab identity), not localStorage, so they
+    // can never bleed into another tab.
     const storedToken = await guestPage.evaluate(() =>
       sessionStorage.getItem('telepair_token'),
     );

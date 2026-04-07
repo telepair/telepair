@@ -6,7 +6,7 @@ vi.stubGlobal('fetch', mockFetch);
 // Two independent backing stores so the test can assert *which tier*
 // each write lands in. The sessionStorage stub is the per-tab
 // identity slot; the localStorage stub is the persistent admin
-// fallback. Finding #10's fix depends on keeping these distinct, so
+// fallback. Cross-tab isolation depends on keeping these distinct, so
 // testing them as a single `store` would mask a regression.
 const tabStore: Record<string, string> = {};
 const persistStore: Record<string, string> = {};
@@ -148,7 +148,7 @@ describe('auth.logout', () => {
   });
 });
 
-describe('cross-tab isolation (regression for finding #10)', () => {
+describe('cross-tab isolation', () => {
   it('guest redeem in one "tab" does not clobber the admin token in another', async () => {
     // Simulate: admin logged in elsewhere — the persistent tier holds
     // their token. This tab has no sessionStorage entry yet, so any
@@ -188,7 +188,7 @@ describe('readCurrentToken in storage-restricted environments', () => {
   it('still prefers sessionStorage when both storage and signal hold a value', () => {
     // Sanity check: the fallback must not regress the existing
     // sessionStorage-first ordering, which is load-bearing for the
-    // cross-tab isolation fix in finding #10.
+    // cross-tab isolation guarantee.
     auth.setToken('signal-token');
     tabStore[STORAGE_KEY] = 'tab-token';
     expect(readCurrentToken()).toBe('tab-token');
