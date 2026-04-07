@@ -404,3 +404,66 @@ async fn ws_disconnects_after_session_stopped() {
         "WS connection should close after session stop"
     );
 }
+
+// Test 7: WS-phase launch failure closes the orphaned DB session row so
+// the idle reaper (which only tracks hub entries) doesn't leave it
+// lingering as `status=active` until the next server restart.
+#[tokio::test]
+async fn ws_closes_session_when_target_resolve_fails() {
+    let (addr, state) = start_server().await;
+    let token = state.create_test_user("solo").await;
+    let user = state.auth.validate(&token).await.unwrap();
+
+    // Bypass `POST /api/sessions` so we can plant a row whose
+    // `target_name` the engine will refuse to resolve. In production
+    // this happens when targets.yaml is hot-edited between session
+    // creation and WS join; simulating it by hand is the same shape.
+    let session = state
+        .sessions
+        .storage()
+        .create_session_with_owner(user.id, "ghost-target", InputMode::Serialized)
+        .await
+        .unwrap();
+
+    let (mut ws, _) = connect_async(ws_url(&addr, &session.id))
+        .await
+        .expect("failed to connect");
+
+    ws.send(session_join_msg(&session.id, &token))
+        .await
+        .unwrap();
+
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(3), recv_json(&mut ws))
+        .await
+        .expect("timed out waiting for error");
+
+    match msg {
+        Some(ServerMessage::Error { code, .. }) => {
+            assert_eq!(code, "TARGET_NOT_FOUND");
+        }
+        other => panic!("expected TARGET_NOT_FOUND error, got: {other:?}"),
+    }
+
+    // The whole point of the fix: the DB row must be `Closed`, not
+    // lingering as `Active`. Drain any pending close frame first so the
+    // server-side `cleanup_orphan_session` definitely committed.
+    let _ = ws.close(None).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let fetched = state
+        .sessions
+        .storage()
+        .get_session(&session.id)
+        .await
+        .unwrap()
+        .expect("session row must still exist");
+    assert_eq!(
+        fetched.status,
+        telepair_core::session::SessionStatus::Closed,
+        "failed WS launch must close the DB session row so it doesn't zombie",
+    );
+    assert!(
+        fetched.closed_at.is_some(),
+        "closed_at must be stamped by cleanup_orphan_session",
+    );
+}
