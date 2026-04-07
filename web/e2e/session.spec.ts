@@ -19,7 +19,7 @@ test.describe('Session page', () => {
     await gotoSession(page);
 
     const badge = page.locator('.role-badge');
-    await expect(badge).toHaveText('owner');
+    await expect(badge).toHaveText('Owner');
     await expect(badge).toHaveAttribute('data-role', 'owner');
   });
 
@@ -77,6 +77,6 @@ test.describe('Session page', () => {
     const participantRow = page.locator('.participant-row');
     await expect(participantRow.first()).toBeVisible({ timeout: 10_000 });
     await expect(page.locator('.participant-name').first()).toHaveText('admin');
-    await expect(page.locator('.participant-role').first()).toHaveText('owner');
+    await expect(page.locator('.participant-role').first()).toHaveText('Owner');
   });
 });
