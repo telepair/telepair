@@ -20,15 +20,15 @@ cd web && npm run dev                        # dev server on :5173, proxies /api
 ## Testing
 
 ```bash
-cargo test --workspace                       # 87 Rust tests across all crates
+cargo test --workspace                       # 117 Rust tests across all crates
 cargo test -p telepair-core                  # single crate
 cargo test -p telepair-core storage          # single test by name substring
 
-cd web && npm test                           # 67 Vitest unit tests
+cd web && npm test                           # 104 Vitest unit tests
 cd web && npm run test:watch                 # watch mode
 cd web && npm run type-check                 # TypeScript type checking
 
-cd web && npm run e2e                        # 18 Playwright browser E2E tests
+cd web && npm run e2e                        # 19 Playwright browser E2E tests
 cd web && npm run e2e:ui                     # Playwright UI mode (interactive)
 ```
 
