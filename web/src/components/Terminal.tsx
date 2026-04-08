@@ -35,7 +35,8 @@ export default function Terminal(props: TerminalProps) {
       cursorBlink: true,
       cursorStyle: 'block',
       fontSize: 14,
-      fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace",
+      fontFamily:
+        "'JetBrainsMono Nerd Font Mono', 'Menlo', 'Monaco', 'Courier New', monospace",
       scrollback: 10000,
       theme: {
         background: '#0d1117',
@@ -68,11 +69,30 @@ export default function Terminal(props: TerminalProps) {
     // Expose xterm instance for E2E test buffer access
     (containerRef as any).__xterm = term;
 
-    // Try WebGL renderer for performance
+    // Try WebGL renderer for performance. Keep a reference so we can
+    // rebuild its texture atlas once the bundled Nerd Font finishes
+    // loading — otherwise the first paint uses fallback-font glyph
+    // metrics and prompts render with shifted Nerd Font icons.
+    let webglAddon: WebglAddon | undefined;
     try {
-      term.loadAddon(new WebglAddon());
+      webglAddon = new WebglAddon();
+      term.loadAddon(webglAddon);
     } catch {
       // WebGL not available, fall back to canvas
+    }
+
+    // When the async webfont lands, purge cached glyph textures and
+    // refit so character cells are re-measured against the real font.
+    if (typeof document !== 'undefined' && document.fonts?.load) {
+      document.fonts
+        .load('14px "JetBrainsMono Nerd Font Mono"')
+        .then(() => {
+          webglAddon?.clearTextureAtlas();
+          fitAddon?.fit();
+        })
+        .catch(() => {
+          // Font failed to load — keep the fallback stack, nothing to do
+        });
     }
 
     // Forward user input

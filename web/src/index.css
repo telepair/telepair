@@ -1,3 +1,15 @@
+/* JetBrains Mono Nerd Font Mono — bundled so any user sees Powerline /
+ * Nerd Font icons in prompts (Starship, p10k, etc.) regardless of what
+ * fonts are installed on their machine. Mono variant guarantees
+ * fixed-width cells for terminal alignment. */
+@font-face {
+  font-family: 'JetBrainsMono Nerd Font Mono';
+  src: url('/fonts/JetBrainsMonoNerdFontMono-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   --bg-primary: #0d1117;
   --bg-secondary: #161b22;
@@ -10,7 +22,7 @@
   --success: #3fb950;
   --error: #f85149;
   --warning: #d29922;
-  --font-mono: 'Menlo', 'Monaco', 'Courier New', monospace;
+  --font-mono: 'JetBrainsMono Nerd Font Mono', 'Menlo', 'Monaco', 'Courier New', monospace;
   --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
 }
 
