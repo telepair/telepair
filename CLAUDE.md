@@ -28,7 +28,7 @@ cd web && npm test                           # 112 Vitest unit tests
 cd web && npm run test:watch                 # watch mode
 cd web && npm run type-check                 # TypeScript type checking
 
-cd web && npm run e2e                        # 19 Playwright browser E2E tests
+cd web && npm run e2e                        # 36 Playwright browser E2E tests
 cd web && npm run e2e:ui                     # Playwright UI mode (interactive)
 ```
 

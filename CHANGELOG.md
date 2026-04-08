@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-04-07
+## [0.1.0] - 2026-04-08
 
 Initial public release of **telepair** — a web-based terminal collaboration
 tool ("Google Docs for your terminal") that lets multiple users share one live
@@ -209,9 +209,12 @@ real-time chat.
   (including the 401 interceptor and its `/invite/redeem` opt-out), the
   WebSocket client, and the i18n dictionaries (locale auto-detect,
   English ↔ Chinese key symmetry, template rendering, and label coverage).
-- **19** Playwright browser E2E tests covering authentication, dashboard,
+- **36** Playwright browser E2E tests covering authentication, dashboard,
   session lifecycle, terminal I/O, collaboration, the full anonymous-guest
-  redeem flow, and the invalid-invite error path.
+  redeem flow, the invalid-invite error path, and a 17-step
+  `human-simulation.spec.ts` end-to-end happy path that drives the UI
+  the way a real user would (login → launch → type → chat → invite →
+  guest joins → solo-mode block → owner closes session → logout).
 
 ### Build & CI
 
