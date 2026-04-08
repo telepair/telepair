@@ -71,6 +71,13 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     throw new ApiError(resp.status, await resp.text());
   }
 
+  // 204 No Content (DELETE endpoints) has no body — calling
+  // `resp.json()` on it would throw SyntaxError. Return undefined
+  // cast to T so `Promise<void>` callers work without a special case.
+  if (resp.status === 204) {
+    return undefined as T;
+  }
+
   return resp.json();
 }
 
@@ -92,6 +99,17 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ target_name, input_mode }),
     });
+  },
+
+  /**
+   * Owner-only. Closes the session: server stops the PTY, broadcasts
+   * `SESSION_CLOSED` to all participants, and flips the row to
+   * `closed` in storage. Returns 204 No Content on success — the
+   * handler throws on any non-2xx, so the caller can `await` it and
+   * rely on an exception for failures.
+   */
+  closeSession(sessionId: string): Promise<void> {
+    return request(`/sessions/${sessionId}`, { method: 'DELETE' });
   },
 
   /**

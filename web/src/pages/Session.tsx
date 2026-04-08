@@ -2,6 +2,7 @@
 import { createSignal, onCleanup, Show } from 'solid-js';
 import { useParams, useNavigate } from '@solidjs/router';
 import { auth } from '../stores/auth';
+import { api } from '../lib/api';
 import { TelepairSocket } from '../lib/ws';
 import type { ConnectionStatus, ReconnectInfo } from '../lib/ws';
 import { encodeInput, canInput, ErrorCode, InputDeniedReason } from '../lib/protocol';
@@ -70,6 +71,15 @@ export default function SessionPage() {
   const [chatMessages, setChatMessages] = createSignal<ChatMessage[]>([]);
   const [showInvite, setShowInvite] = createSignal(false);
   const [sidebarOpen, setSidebarOpen] = createSignal(true);
+  // Close-session "armed" latch: the first click flips this on and
+  // swaps the button label to a confirmation prompt; a second click
+  // within 3s actually closes. The modeless inline-confirm pattern
+  // avoids a native `window.confirm()` (which looks cheap) and also
+  // dodges the need for a whole ConfirmDialog component for one
+  // button. Stored as a signal so Solid rerenders the label reactively.
+  const [closeArmed, setCloseArmed] = createSignal(false);
+  const [closing, setClosing] = createSignal(false);
+  let closeDisarmTimer: ReturnType<typeof setTimeout> | undefined;
   let hasConnectedOnce = false;
 
   let termHandle: TerminalHandle | undefined;
@@ -268,6 +278,38 @@ export default function SessionPage() {
     socket?.reconnectNow();
   };
 
+  // Two-step close flow:
+  //   1. First click arms the button — label flips to "Click again
+  //      to close" and a 3s timer disarms it so an accidental single
+  //      click can't leak into a later real intent to close.
+  //   2. Second click within the window calls DELETE /api/sessions/{id}.
+  //      On success we do NOT navigate — the server broadcasts a
+  //      SESSION_CLOSED frame over WS which triggers the existing
+  //      `endedReasonKey` banner with a "Back to Dashboard" action.
+  //      This keeps all participants (including the closer) on the
+  //      same exit path.
+  const handleCloseSession = async () => {
+    if (closing()) return;
+    if (!closeArmed()) {
+      setCloseArmed(true);
+      clearTimeout(closeDisarmTimer);
+      closeDisarmTimer = setTimeout(() => setCloseArmed(false), 3000);
+      return;
+    }
+    clearTimeout(closeDisarmTimer);
+    setClosing(true);
+    try {
+      await api.closeSession(params.id);
+      // Success — banner will land via WS SESSION_CLOSED. Leave the
+      // button in "closing" state so it can't be re-clicked.
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      toast.error(t('session.close_failed', { msg }));
+      setClosing(false);
+      setCloseArmed(false);
+    }
+  };
+
   // Owners have a real dashboard to return to. Non-owners — guests
   // and invited operators/viewers — do not: a scoped-guest token
   // 403s on every dashboard route (`require_unscoped` in
@@ -298,6 +340,7 @@ export default function SessionPage() {
     // Drop any sticky reconnect toast so its Retry action cannot resurrect
     // this page's socket after the user has navigated away or logged out.
     toast.dismiss('reconnect');
+    clearTimeout(closeDisarmTimer);
     socket?.disconnect();
   });
 
@@ -323,6 +366,13 @@ export default function SessionPage() {
           <LocaleSwitcher variant="topbar" />
           <Show when={role() === 'owner'}>
             <button class="action-btn" onClick={() => setShowInvite(true)}>{t('session.invite')}</button>
+            <button
+              class={closeArmed() ? 'action-btn danger armed' : 'action-btn danger'}
+              onClick={handleCloseSession}
+              disabled={closing()}
+            >
+              {closeArmed() ? t('session.close_confirm') : t('session.close')}
+            </button>
           </Show>
           <button class="action-btn" onClick={() => setSidebarOpen(!sidebarOpen())}>
             {sidebarOpen() ? t('session.sidebar_hide') : t('session.sidebar_show')}
@@ -427,6 +477,24 @@ export default function SessionPage() {
         .status-dot[data-status="giveup"] { background: var(--error); }
         .topbar-actions { margin-left: auto; display: flex; gap: 8px; }
         .topbar-actions .action-btn { font-size: 12px; padding: 4px 10px; }
+        .topbar-actions .action-btn.danger {
+          color: var(--error);
+          border-color: rgba(248, 81, 73, 0.4);
+        }
+        .topbar-actions .action-btn.danger:hover {
+          background: rgba(248, 81, 73, 0.1);
+          border-color: var(--error);
+        }
+        .topbar-actions .action-btn.danger.armed {
+          background: var(--error);
+          color: #fff;
+          border-color: var(--error);
+          animation: close-pulse 1s ease-in-out infinite;
+        }
+        @keyframes close-pulse {
+          0%, 100% { box-shadow: 0 0 0 0 rgba(248, 81, 73, 0.5); }
+          50%      { box-shadow: 0 0 0 4px rgba(248, 81, 73, 0); }
+        }
         .session-body { flex: 1; display: flex; overflow: hidden; }
         .terminal-container { flex: 1; padding: 4px; overflow: hidden; }
         .sidebar {

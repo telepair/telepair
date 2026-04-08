@@ -58,6 +58,9 @@ export const zh: Dict = {
   session: {
     label: '会话:{{ id }}',
     invite: '邀请',
+    close: '关闭会话',
+    close_confirm: '再次点击确认关闭',
+    close_failed: '关闭会话失败:{{ msg }}',
     sidebar_show: '显示侧栏',
     sidebar_hide: '隐藏侧栏',
     banner_ended: '此会话已结束。',
