@@ -16,6 +16,13 @@ RUN npm run build
 
 # Stage 3: Runtime
 FROM debian:bookworm-slim
+
+# OCI labels — GHCR auto-links the published package to this repo when
+# `org.opencontainers.image.source` points at a GitHub repo URL.
+LABEL org.opencontainers.image.source="https://github.com/telepair/telepair"
+LABEL org.opencontainers.image.description="Self-hosted, browser-based collaborative terminal with live PTY sharing, RBAC, and invite links. Rust + SolidJS."
+LABEL org.opencontainers.image.licenses="MIT"
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
