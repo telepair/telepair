@@ -2,7 +2,7 @@ English | [简体中文](README.zh-CN.md)
 
 # telepair
 
-**Google Docs for your terminal.** Share terminal sessions with collaborators in real time, right from the browser.
+Share terminal sessions with collaborators in real time, right from the browser.
 
 telepair is an open-source web terminal collaboration tool. Run it on any machine, open a browser, and invite teammates to view, operate, or co-drive terminal sessions with fine-grained permissions.
 
