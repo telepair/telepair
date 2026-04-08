@@ -67,6 +67,9 @@ export const en = {
   session: {
     label: 'Session: {{ id }}',
     invite: 'Invite',
+    close: 'Close',
+    close_confirm: 'Click again to close',
+    close_failed: 'Failed to close session: {{ msg }}',
     sidebar_show: 'Show Sidebar',
     sidebar_hide: 'Hide Sidebar',
     banner_ended: 'This session has ended.',
