@@ -18,7 +18,7 @@ real-time chat.
 
 - Cargo workspace with 5 crates (`telepair-core`, `telepair-agent`,
   `telepair-control`, `telepair-gateway`, `telepair-cli`) built on Rust
-  Edition 2024, toolchain 1.86+, and `#![deny(unsafe_code)]` everywhere.
+  Edition 2024, toolchain 1.94+, and `#![deny(unsafe_code)]` everywhere.
 - Shared types for sessions, targets, config, protocol, errors, and the
   Owner / Operator / Viewer permission model.
 - `Storage` trait with an async SQLite implementation (sqlx) and auto-applied

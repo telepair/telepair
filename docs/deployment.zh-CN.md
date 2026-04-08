@@ -93,7 +93,7 @@ server {
 
 ```dockerfile
 # 构建后端
-FROM rust:1.86 AS backend
+FROM rust:1.94 AS backend
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
