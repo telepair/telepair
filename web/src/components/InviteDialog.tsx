@@ -62,6 +62,10 @@ export default function InviteDialog(props: InviteDialogProps) {
   const [inviteMaxUses, setInviteMaxUses] = createSignal<number>(1);
   const [creating, setCreating] = createSignal(false);
   const [copied, setCopied] = createSignal(false);
+  // Ref to the readonly <input> so the execCommand fallback can
+  // select it — picking text from an unfocused input is a no-op on
+  // most browsers.
+  let urlInputRef: HTMLInputElement | undefined;
 
   const handleCreate = async () => {
     setCreating(true);
@@ -83,10 +87,58 @@ export default function InviteDialog(props: InviteDialogProps) {
     }
   };
 
+  // Copy strategy:
+  //   1. Prefer `navigator.clipboard.writeText` — works in secure
+  //      contexts (localhost, HTTPS).
+  //   2. Fall back to selecting the readonly input and firing
+  //      `document.execCommand('copy')` — this is the only path that
+  //      works when telepair is accessed over a LAN IP
+  //      (`http://192.168.x.x:7700`), which is NOT a secure context
+  //      and where `navigator.clipboard` is `undefined`. Without this
+  //      fallback the first await throws, the exception is swallowed
+  //      by the button's onClick handler, and the user experiences
+  //      "Copy doesn't do anything" — the original bug report.
+  //   3. If both fail, surface a toast telling the user to copy
+  //      manually instead of silently failing.
   const handleCopy = async () => {
-    await navigator.clipboard.writeText(inviteUrl());
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    const url = inviteUrl();
+    if (!url) return;
+    // Always select first so the user can manually copy even if
+    // every programmatic path fails.
+    urlInputRef?.focus();
+    urlInputRef?.select();
+
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(url);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+        return;
+      }
+    } catch {
+      // Fall through to execCommand fallback.
+    }
+
+    try {
+      // execCommand is deprecated but still the de-facto fallback for
+      // non-secure contexts; browsers won't remove it without a
+      // replacement because of exactly this use case.
+      if (document.execCommand && document.execCommand('copy')) {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+        return;
+      }
+    } catch {
+      // Fall through to toast.
+    }
+
+    // Platform-appropriate keyboard hint. Mac users see ⌘C, everyone
+    // else sees Ctrl+C.
+    const isMac =
+      typeof navigator !== 'undefined' && /Mac|iPhone|iPad/i.test(navigator.platform);
+    toast.error(
+      t('invite.copy_failed', { shortcut: isMac ? '⌘C' : 'Ctrl+C' }),
+    );
   };
 
   const handleClose = () => {
@@ -105,7 +157,13 @@ export default function InviteDialog(props: InviteDialogProps) {
             <div class="invite-result">
               <label>{t('invite.link_label')}</label>
               <div class="invite-url-row">
-                <input type="text" value={inviteUrl()} readonly />
+                <input
+                  ref={urlInputRef}
+                  type="text"
+                  value={inviteUrl()}
+                  readonly
+                  onClick={(e) => e.currentTarget.select()}
+                />
                 <button class="primary" onClick={handleCopy}>
                   {copied() ? t('common.copied') : t('common.copy')}
                 </button>

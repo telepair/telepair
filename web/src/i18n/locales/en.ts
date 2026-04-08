@@ -123,6 +123,8 @@ export const en = {
     expiry_in_days_singular: 'in ~{{ n }} day',
     expiry_in_days_plural: 'in ~{{ n }} days',
     failed: 'Failed to create invite: {{ msg }}',
+    copy_failed:
+      'Could not copy automatically. Select the link and press {{ shortcut }} to copy.',
   },
   chat: {
     heading: 'Chat',
