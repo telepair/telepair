@@ -8,7 +8,7 @@ WEB := web
 .PHONY: help install fmt fmt-check lint lint-rust lint-web \
         test test-rust test-web e2e \
         build build-rust build-web \
-        all check dev clean
+        all check dev run clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*?## "; printf "Usage: make <target>\n\nTargets:\n"} \
@@ -68,6 +68,15 @@ all: check build e2e ## Full pipeline: verify (fmt + lint + test + e2e) then bui
 
 dev: ## Run backend in dev mode on :7700
 	cargo run
+
+run: build ## Build (if needed) and run the release binary with bundled web dist
+	# `--allow-any-origin` mirrors the LAN/dev use case: it emits
+	# `Access-Control-Allow-Origin: *` so reaching the server from any
+	# host (e.g. `http://<laptop-lan-ip>:7700` from a phone or another
+	# machine on the network) passes CORS. Not appropriate for a
+	# public-internet deployment — see `docs/deployment.md` for the
+	# reverse-proxy + explicit allowlist variant.
+	./target/release/telepair --web-dir $(WEB)/dist --allow-any-origin
 
 clean: ## Remove build artifacts (Rust target + frontend dist/cache)
 	cargo clean
