@@ -199,13 +199,13 @@ real-time chat.
 
 ### Testing
 
-- **117** Rust tests across the workspace (unit, integration, and backend
+- **107** Rust tests across the workspace (unit, integration, and backend
   collaboration end-to-end flows), including coverage for `create_guest`
   uniqueness, the anonymous-redeem happy path, invitee reconnection inside
   the reaper grace window, bulk `close_session` participant settling, the
   strict `input_mode` rejection path, and the 400 / 410 error codes on
   `POST /api/invite/redeem`.
-- **104** Vitest unit tests covering the protocol, stores, REST client
+- **112** Vitest unit tests covering the protocol, stores, REST client
   (including the 401 interceptor and its `/invite/redeem` opt-out), the
   WebSocket client, and the i18n dictionaries (locale auto-detect,
   English ↔ Chinese key symmetry, template rendering, and label coverage).
