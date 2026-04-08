@@ -80,6 +80,28 @@ real-time chat.
   `200 OK` with `Cache-Control: no-cache`. Failing to read `index.html`
   at startup now hard-errors instead of silently serving an empty
   body.
+- WebSocket connect is now deferred until xterm completes its initial
+  `fit()`, so the PTY is spawned with the real terminal cols/rows
+  instead of the default 80×24 (so `vim`, `htop`, etc. open at the
+  right size).
+- The gateway closes the session row and aborts the output forwarder
+  when WebSocket launch fails midway, preventing orphan session rows
+  that would block subsequent joins.
+- Transient `STORAGE_ERROR` codes are now propagated as **retryable**
+  across the gateway → WS → frontend stack, instead of forcing a logout
+  the first time SQLite returns `SQLITE_BUSY` under load.
+- Unknown `/api/*` and `/ws/*` paths now return `404 Not Found` instead
+  of falling through to the SPA shell, so misnamed API calls fail loudly
+  instead of receiving HTML.
+- `POST /api/sessions/{id}/invite` returns `410 Gone` when the target
+  session has already been closed, matching the redeem path so the
+  client can show a consistent "session ended" message.
+- Scoped invite guests now get bounced off the dashboard cleanly
+  (redirected back to their session) instead of being left staring at
+  an empty target list.
+- The CLI no longer prints a stray warning when the optional
+  `~/.telepair/targets.yaml` is absent — a missing file is the default,
+  not an error.
 
 ### Added — Web frontend (SolidJS + Vite)
 
@@ -103,6 +125,21 @@ real-time chat.
 - Real-time collaboration UI: participants list and chat panel wired into
   the session page.
 - UI primitives (toast, banner, skeleton) and a banner-based reconnect UX.
+- **Bilingual English / Simplified Chinese UI** with a live locale switcher
+  in the topbar; the choice is persisted in `localStorage` and the bundle
+  ships both dictionaries plus a small auto-detect helper.
+- **JetBrainsMono Nerd Font bundled with the frontend** so powerline,
+  dev-icon, and box-drawing glyphs render correctly in xterm.js without
+  the user having to install a font on the host machine.
+- Owner-only **Close session** control on the session top bar with a
+  two-step confirm — clicking once arms the button, clicking again issues
+  `DELETE /api/sessions/{id}`.
+- **System notices in the chat panel** when participants join or leave the
+  session, rendered as italic centered lines so they don't get mistaken
+  for chat messages.
+- Invite-link **Copy** button falls back to `document.execCommand('copy')`
+  in non-secure contexts (HTTP / raw-IP origins) so the dashboard still
+  works without HTTPS.
 
 ### Added — Documentation
 
@@ -156,29 +193,33 @@ real-time chat.
   stay present and orphan PTYs do not leak.
 - Indexed `participants(user_id)` with cascading foreign-key deletes.
 - Atomic session create / join / close paths.
+- SPA shell `index.html` is loaded once at boot into a refcounted
+  `Bytes` and shared across requests, removing per-request file I/O on
+  the deep-link fallback.
 
 ### Testing
 
-- **87** Rust tests across the workspace (unit, integration, and backend
+- **117** Rust tests across the workspace (unit, integration, and backend
   collaboration end-to-end flows), including coverage for `create_guest`
   uniqueness, the anonymous-redeem happy path, invitee reconnection inside
   the reaper grace window, bulk `close_session` participant settling, the
   strict `input_mode` rejection path, and the 400 / 410 error codes on
   `POST /api/invite/redeem`.
-- **67** Vitest unit tests covering the protocol, stores, REST client
-  (including the 401 interceptor and its `/invite/redeem` opt-out), and
-  the WebSocket client.
-- **18** Playwright browser E2E tests covering authentication, dashboard,
+- **104** Vitest unit tests covering the protocol, stores, REST client
+  (including the 401 interceptor and its `/invite/redeem` opt-out), the
+  WebSocket client, and the i18n dictionaries (locale auto-detect,
+  English ↔ Chinese key symmetry, template rendering, and label coverage).
+- **19** Playwright browser E2E tests covering authentication, dashboard,
   session lifecycle, terminal I/O, collaboration, the full anonymous-guest
   redeem flow, and the invalid-invite error path.
 
 ### Build & CI
 
-- Makefile wiring `fmt` / `fmt-check` / `lint` / `test` / `build` targets
-  plus an `all` target that chains `check` + `build` into a single
-  pre-release pipeline (fmt-check + clippy + type-check + unit tests +
-  release binary + frontend bundle). `.DEFAULT_GOAL` stays on `help` so
-  the bare `make` experience remains a menu.
+- Makefile wiring `fmt` / `fmt-check` / `lint` / `test` / `build` / `e2e`
+  targets plus an `all` target that chains the full pre-push pipeline
+  (fmt-check + clippy + type-check + unit tests + release binary +
+  frontend bundle + Playwright E2E) in one shot. `.DEFAULT_GOAL` stays
+  on `help` so the bare `make` experience remains a menu.
 - GitHub Actions CI pipeline and release workflow.
 - MIT license across the workspace.
 

@@ -168,13 +168,13 @@ telepair stores its data in `~/.telepair/`:
 ## Development
 
 ```bash
-# Run backend tests (87 tests)
+# Run backend tests (117 tests)
 cargo test --workspace
 
-# Run frontend unit tests (67 tests)
+# Run frontend unit tests (104 tests)
 cd web && npm test
 
-# Run browser E2E tests (18 tests, requires running server + Chromium)
+# Run browser E2E tests (19 tests, requires running server + Chromium)
 cd web && npx playwright install chromium    # first time only
 cd web && npm run e2e                        # server auto-starts or reuses :7700
 

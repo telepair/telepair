@@ -168,13 +168,13 @@ telepair 的所有数据放在 `~/.telepair/`:
 ## 开发
 
 ```bash
-# 后端测试(87 项)
+# 后端测试(117 项)
 cargo test --workspace
 
-# 前端单元测试(67 项)
+# 前端单元测试(104 项)
 cd web && npm test
 
-# 浏览器 E2E 测试(18 项,需要运行中的 server + Chromium)
+# 浏览器 E2E 测试(19 项,需要运行中的 server + Chromium)
 cd web && npx playwright install chromium    # 仅首次需要
 cd web && npm run e2e                        # server 自动起或复用 :7700
 
