@@ -10,9 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2026-04-08
 
 Initial public release of **telepair** — a web-based terminal collaboration
-tool ("Google Docs for your terminal") that lets multiple users share one live
-PTY through the browser, with role-based permissions, invite links, and
-real-time chat.
+tool that lets multiple users share one live PTY through the browser, with
+role-based permissions, invite links, and real-time chat.
 
 ### Added — Backend (Rust workspace)
 
