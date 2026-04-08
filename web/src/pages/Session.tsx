@@ -87,6 +87,24 @@ export default function SessionPage() {
     }
   };
 
+  // Push a synthetic "system" entry into the chat stream (join/leave
+  // notices). Kept to the same 500-item ring as regular chat so
+  // long-lived sessions with lots of churn can't balloon memory.
+  // `idSuffix` keeps the For key stable per-event so Solid doesn't
+  // see two system messages as the same row.
+  const appendSystemChat = (idSuffix: string, text: string) => {
+    setChatMessages((prev) => [
+      ...prev.slice(-(MAX_CHAT_HISTORY - 1)),
+      {
+        user_id: `__system__:${idSuffix}:${Date.now()}`,
+        name: '',
+        text,
+        ts: new Date().toISOString(),
+        kind: 'system',
+      },
+    ]);
+  };
+
   const handleMessage = (msg: ServerMessage) => {
     switch (msg.type) {
       case 'SessionState':
@@ -99,9 +117,24 @@ export default function SessionPage() {
           ...prev.filter((p) => p.user_id !== msg.user_id),
           { user_id: msg.user_id, name: msg.name, role: msg.role, color: msg.color },
         ]);
+        appendSystemChat(
+          `peer-joined:${msg.user_id}`,
+          t('chat.system_joined', { name: msg.name }),
+        );
         break;
       case 'PeerLeft':
-        setParticipants((prev) => prev.filter((p) => p.user_id !== msg.user_id));
+        // Read the leaving peer's name from the current participant
+        // list BEFORE we prune it, otherwise the system message falls
+        // back to the user_id and looks like a debug log.
+        {
+          const leaving = participants().find((p) => p.user_id === msg.user_id);
+          const leavingName = leaving?.name ?? msg.user_id;
+          setParticipants((prev) => prev.filter((p) => p.user_id !== msg.user_id));
+          appendSystemChat(
+            `peer-left:${msg.user_id}`,
+            t('chat.system_left', { name: leavingName }),
+          );
+        }
         break;
       case 'PeerChat':
         setChatMessages((prev) => [

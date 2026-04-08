@@ -117,6 +117,8 @@ export const zh: Dict = {
     heading: '聊天',
     placeholder: '输入消息...',
     send: '发送',
+    system_joined: '{{ name }} 加入了会话',
+    system_left: '{{ name }} 离开了会话',
   },
   participants: {
     heading: '参与者({{ count }})',

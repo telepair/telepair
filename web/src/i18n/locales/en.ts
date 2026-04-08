@@ -130,6 +130,8 @@ export const en = {
     heading: 'Chat',
     placeholder: 'Type a message...',
     send: 'Send',
+    system_joined: '{{ name }} joined the session',
+    system_left: '{{ name }} left the session',
   },
   participants: {
     heading: 'Participants ({{ count }})',

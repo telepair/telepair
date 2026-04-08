@@ -1,11 +1,21 @@
 import { createSignal, createEffect, on, For } from 'solid-js';
 import { useI18n } from '../i18n';
 
+/**
+ * Chat stream items. Two variants:
+ *   - `kind: 'user'` (default when omitted) — real chat from a peer.
+ *   - `kind: 'system'` — join/leave notices and other announcements
+ *     generated locally when a `PeerJoined` / `PeerLeft` frame lands.
+ *     Rendered as an italic, centered muted line with no sender badge.
+ *     `user_id` is kept (set to a synthetic value) so the For key
+ *     stays stable but it's not shown in the UI.
+ */
 export interface ChatMessage {
   user_id: string;
   name: string;
   text: string;
   ts: string;
+  kind?: 'user' | 'system';
 }
 
 interface ChatPanelProps {
@@ -56,13 +66,20 @@ export default function ChatPanel(props: ChatPanelProps) {
       <h4>{t('chat.heading')}</h4>
       <div class="chat-messages">
         <For each={props.messages}>
-          {(msg) => (
-            <div class="chat-msg">
-              <span class="chat-name">{msg.name}</span>
-              <span class="chat-time">{formatTime(msg.ts)}</span>
-              <p class="chat-text">{msg.text}</p>
-            </div>
-          )}
+          {(msg) =>
+            msg.kind === 'system' ? (
+              <div class="chat-msg system" role="status">
+                <span class="chat-system-text">{msg.text}</span>
+                <span class="chat-time">{formatTime(msg.ts)}</span>
+              </div>
+            ) : (
+              <div class="chat-msg">
+                <span class="chat-name">{msg.name}</span>
+                <span class="chat-time">{formatTime(msg.ts)}</span>
+                <p class="chat-text">{msg.text}</p>
+              </div>
+            )
+          }
         </For>
         <div ref={messagesEnd} />
       </div>
@@ -84,6 +101,17 @@ export default function ChatPanel(props: ChatPanelProps) {
         .chat-name { font-weight: 600; margin-right: 6px; }
         .chat-time { color: var(--text-secondary); font-size: 11px; }
         .chat-text { margin-top: 2px; word-break: break-word; }
+        .chat-msg.system {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          justify-content: center;
+          font-style: italic;
+          color: var(--text-secondary);
+          font-size: 12px;
+          padding: 2px 0;
+        }
+        .chat-system-text { word-break: break-word; }
         .chat-input-row { display: flex; gap: 6px; padding: 8px 4px 4px; border-top: 1px solid var(--border); }
         .chat-input-row input { flex: 1; font-family: var(--font-sans); font-size: 13px; }
         .chat-input-row button { font-size: 13px; padding: 6px 12px; }
