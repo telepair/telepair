@@ -14,9 +14,16 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const BASE_URL = 'http://localhost:7700';
 const FRAMES_DIR = join(__dirname, '../tmp/demo-frames');
 const OUTPUT_GIF = join(__dirname, '../web/public/demo.gif');
-const VIEWPORT = { width: 550, height: 580 };
+const VIEWPORT = { width: 720, height: 480 };
 const FPS = 10;
 const FRAME_MS = Math.round(1000 / FPS);
+
+// Override the production xterm fontSize (14px) to something more legible
+// in an inline README GIF. 20px gives ~60 cols × ~18 rows in a 720x480
+// pane — still wide enough for htop to render its CPU/mem panel and tall
+// enough to show ~10 process rows, while making each glyph ~43% bigger
+// than the production default.
+const RECORDING_FONT_SIZE = 20;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function getAdminToken(): string {
@@ -80,9 +87,12 @@ async function main() {
     // ── Browser setup ───────────────────────────────────────────────────────────
     browser = await chromium.launch({ headless: false });
 
-    const ownerCtx    = await browser.newContext({ viewport: VIEWPORT });
-    const operatorCtx = await browser.newContext({ viewport: VIEWPORT });
-    const viewerCtx   = await browser.newContext({ viewport: VIEWPORT });
+    // Lock locale to en-US so the i18n provider resolves to English copy
+    // (matches e2e tests). The "Hide Sidebar" button text below depends on it.
+    const ctxOpts = { viewport: VIEWPORT, locale: 'en-US' };
+    const ownerCtx    = await browser.newContext(ctxOpts);
+    const operatorCtx = await browser.newContext(ctxOpts);
+    const viewerCtx   = await browser.newContext(ctxOpts);
 
     const ownerPage    = await ownerCtx.newPage();
     const operatorPage = await operatorCtx.newPage();
@@ -105,7 +115,7 @@ async function main() {
 
     await ownerPage.locator('.xterm').waitFor({ state: 'visible', timeout: 10_000 });
     await ownerPage.locator('.status-dot[data-status="connected"]').waitFor({
-      state: 'visible', timeout: 10_000,
+      state: 'attached', timeout: 10_000,
     });
     console.log('Owner connected');
 
@@ -126,7 +136,7 @@ async function main() {
     await operatorPage.waitForURL(/\/session\/.+/, { timeout: 10_000 });
     await operatorPage.locator('.xterm').waitFor({ state: 'visible', timeout: 10_000 });
     await operatorPage.locator('.status-dot[data-status="connected"]').waitFor({
-      state: 'visible', timeout: 10_000,
+      state: 'attached', timeout: 10_000,
     });
     console.log('Operator connected');
 
@@ -135,14 +145,33 @@ async function main() {
     await viewerPage.waitForURL(/\/session\/.+/, { timeout: 10_000 });
     await viewerPage.locator('.xterm').waitFor({ state: 'visible', timeout: 10_000 });
     await viewerPage.locator('.status-dot[data-status="connected"]').waitFor({
-      state: 'visible', timeout: 10_000,
+      state: 'attached', timeout: 10_000,
     });
     console.log('Viewer connected');
 
-    // ── Cursor hide (clean recording) ───────────────────────────────────────────
+    // ── Close sidebars + bump font + hide cursors (clean recording) ─────────────
+    // Sidebar default-open eats half the viewport at this size; close it on
+    // each page so the terminal gets the full width and htop renders cleanly.
+    // Clicking the actual button (vs. CSS-hide) lets Solid's reactive resize
+    // run so xterm refits to the new container width.
     for (const p of [ownerPage, operatorPage, viewerPage]) {
+      await p.getByRole('button', { name: 'Hide Sidebar' }).click();
+      await p.locator('.sidebar').waitFor({ state: 'detached', timeout: 5_000 });
+
+      // Bump xterm font size for the recording. Setting `term.options.fontSize`
+      // triggers an internal refresh; the container's ResizeObserver then
+      // catches the new dimensions and refits cols/rows.
+      await p.evaluate((size) => {
+        const el = document.querySelector('.terminal-container > div') as any;
+        const term = el?.__xterm;
+        if (term) term.options.fontSize = size;
+      }, RECORDING_FONT_SIZE);
+
       await p.addStyleTag({ content: '* { cursor: none !important; }' });
     }
+    // Give xterm time to refit after the resize + font swap (debounced 100ms
+    // ResizeObserver in Terminal.tsx, plus a margin for the actual fit pass).
+    await ownerPage.waitForTimeout(800);
 
     // ── Frame capture ───────────────────────────────────────────────────────────
     let frameIdx = 0;
@@ -230,14 +259,16 @@ async function main() {
 
     console.log('Stitching frames with ffmpeg...');
 
-    // hstack three image sequences into one video
+    // vstack three image sequences into one video — vertical stacking keeps
+    // each pane at full viewport width, which fits a typical README column
+    // far better than three side-by-side panes squeezed into the same width.
     execSync(
       [
         'ffmpeg -y',
         `-framerate ${FPS} -start_number 0 -i "${FRAMES_DIR}/owner_%04d.png"`,
         `-framerate ${FPS} -start_number 0 -i "${FRAMES_DIR}/operator_%04d.png"`,
         `-framerate ${FPS} -start_number 0 -i "${FRAMES_DIR}/viewer_%04d.png"`,
-        `-filter_complex "[0:v][1:v][2:v]hstack=inputs=3[out]"`,
+        `-filter_complex "[0:v][1:v][2:v]vstack=inputs=3[out]"`,
         `-map "[out]" "${TMP_MP4}"`,
       ].join(' '),
       { stdio: 'inherit' },
