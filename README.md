@@ -168,10 +168,10 @@ telepair stores its data in `~/.telepair/`:
 ## Development
 
 ```bash
-# Run backend tests (117 tests)
+# Run backend tests (107 tests)
 cargo test --workspace
 
-# Run frontend unit tests (104 tests)
+# Run frontend unit tests (112 tests)
 cd web && npm test
 
 # Run browser E2E tests (19 tests, requires running server + Chromium)
