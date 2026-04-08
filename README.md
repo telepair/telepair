@@ -6,6 +6,8 @@ English | [简体中文](README.zh-CN.md)
 
 telepair is an open-source web terminal collaboration tool. Run it on any machine, open a browser, and invite teammates to view, operate, or co-drive terminal sessions with fine-grained permissions.
 
+![telepair demo](web/public/demo.gif)
+
 ## Features
 
 - **Real-time collaboration** — multiple users in one terminal session with live output streaming
