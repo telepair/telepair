@@ -91,10 +91,14 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
+      # NOTE: linux/arm64 temporarily dropped — QEMU-emulated arm64 cargo
+      # build takes ~40 min with no cache, gating every release. Tracked in
+      # telepair/telepair#1 (native arm64 runner + BuildKit cargo cache).
+      # Restore `linux/amd64,linux/arm64` once #1 lands.
       - uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: |
             ghcr.io/${{ github.repository }}:${{ steps.version.outputs.VERSION }}
