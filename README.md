@@ -174,7 +174,7 @@ cargo test --workspace
 # Run frontend unit tests (112 tests)
 cd web && npm test
 
-# Run browser E2E tests (19 tests, requires running server + Chromium)
+# Run browser E2E tests (36 tests, requires running server + Chromium)
 cd web && npx playwright install chromium    # first time only
 cd web && npm run e2e                        # server auto-starts or reuses :7700
 
