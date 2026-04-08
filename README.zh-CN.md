@@ -20,7 +20,7 @@ telepair 是一个开源的 Web 终端协作工具。在任意机器上运行它
 
 ### 先决条件
 
-- Rust 1.85+(edition 2024)
+- Rust 1.86+(edition 2024)
 - Node.js 18+
 
 ### 构建
