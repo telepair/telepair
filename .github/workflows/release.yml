@@ -112,9 +112,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # NOTE: pattern filters out docker/build-push-action@v6's auto-uploaded
+      # `*.dockerbuild` provenance artifact — downloading it unconditionally
+      # has failed with "Artifact download failed after 5 retries" against
+      # Azure blob storage. Only binary tarballs are needed here.
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: telepair-*
           merge-multiple: true
 
       - name: Create release
