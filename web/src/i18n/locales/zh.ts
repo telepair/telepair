@@ -111,6 +111,7 @@ export const zh: Dict = {
     expiry_in_days_singular: '约 {{ n }} 天后',
     expiry_in_days_plural: '约 {{ n }} 天后',
     failed: '创建邀请失败:{{ msg }}',
+    copy_failed: '无法自动复制,请选中链接并按 {{ shortcut }} 复制。',
   },
   chat: {
     heading: '聊天',
