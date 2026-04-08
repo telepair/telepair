@@ -102,10 +102,10 @@ where
         loop {
             match rx.next().await {
                 Some(Ok(ref msg)) => {
-                    if let Some(sm) = parse_server_msg(msg) {
-                        if pred(&sm) {
-                            return sm;
-                        }
+                    if let Some(sm) = parse_server_msg(msg)
+                        && pred(&sm)
+                    {
+                        return sm;
                     }
                     if matches!(msg, Message::Close(_)) {
                         panic!("connection closed while waiting for JSON message");

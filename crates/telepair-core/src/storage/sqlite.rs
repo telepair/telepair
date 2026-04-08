@@ -160,10 +160,10 @@ fn generate_token() -> (String, String) {
 }
 
 fn check_invite_validity(invite: &InviteToken) -> Result<()> {
-    if let Some(expires_at) = invite.expires_at {
-        if expires_at < Utc::now() {
-            return Err(Error::InvalidInput("invite token has expired".into()));
-        }
+    if let Some(expires_at) = invite.expires_at
+        && expires_at < Utc::now()
+    {
+        return Err(Error::InvalidInput("invite token has expired".into()));
     }
     if invite.used_count >= invite.max_uses {
         return Err(Error::InvalidInput(
