@@ -20,7 +20,7 @@ telepair is an open-source web terminal collaboration tool. Run it on any machin
 
 ### Prerequisites
 
-- Rust 1.86+ (edition 2024)
+- Rust 1.94+ (edition 2024)
 - Node.js 18+
 
 ### Build

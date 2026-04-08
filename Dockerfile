@@ -1,5 +1,5 @@
 # Stage 1: Build backend
-FROM rust:1.86-bookworm AS backend
+FROM rust:1.94-bookworm AS backend
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/

@@ -8,7 +8,7 @@
 
 ### 先决条件
 
-- Rust 1.86+(edition 2024)
+- Rust 1.94+(edition 2024)
 - Node.js 18+
 - SQLite(通过 sqlx 捆绑,无需单独安装)
 
@@ -67,7 +67,7 @@ telepair/
 
 ### Rust
 
-- Edition 2024,stable toolchain(>= 1.86)
+- Edition 2024,stable toolchain(>= 1.94)
 - 使用目录式模块(`foo/bar.rs`),**不要**用 `mod.rs` 风格
 - 优先返回 `Result` 而不是 panic
 - 提交前跑 `cargo clippy`
