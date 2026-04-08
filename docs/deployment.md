@@ -93,7 +93,7 @@ Key points:
 
 ```dockerfile
 # Build backend
-FROM rust:1.85 AS backend
+FROM rust:1.86 AS backend
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/

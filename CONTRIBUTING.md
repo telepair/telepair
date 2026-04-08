@@ -8,7 +8,7 @@ Thank you for your interest in contributing to telepair! This guide will help yo
 
 ### Prerequisites
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.86+ (edition 2024)
 - Node.js 18+
 - SQLite (bundled via sqlx)
 
@@ -67,7 +67,7 @@ telepair/
 
 ### Rust
 
-- Edition 2024, stable toolchain (>= 1.85)
+- Edition 2024, stable toolchain (>= 1.86)
 - Directory-based modules (`foo/bar.rs`), **not** `mod.rs` style
 - Prefer returning `Result` over panicking
 - Run `cargo clippy` before submitting
