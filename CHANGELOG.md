@@ -319,12 +319,13 @@ row. See the expanded **Fixed** section below for the full list.
   `upgrade_test`, expanded `invite_storage_test` and the
   gateway-level `http_test` / `ws_test` cases for the hub
   reservation, reload-guard, and ws error-classification fixes.
-- Vitest count: **112 → 136**. New unit tests cover the admin
+- Vitest count: **112 → 134**. New unit tests cover the admin
   targets route guard state machine, the invite-management list
   reducer, the session-history filter helpers, the
   `parseReloadError` parser seam for the structured reload banner,
   the auth store's token-keyed identity cache, and the
-  session-exit dispatch key.
+  session-exit dispatch key. Two dead `readCurrentToken` tests
+  removed after the REST/WS token-source unification.
 - Playwright count: **36 → 43**. New specs: `invite-management.spec
   .ts`, `history.spec.ts`, `session-audit.spec.ts`,
   `admin-targets.spec.ts`. Each covers at least one happy path

@@ -5,11 +5,11 @@ vi.stubGlobal('fetch', mockFetch);
 
 // Stub both storage tiers. The auth store reads sessionStorage first
 // (per-tab identity) and falls back to localStorage (persistent admin
-// fallback). api.ts now goes through `readCurrentToken` which honours
-// that lookup order, so the test needs both slots to be controllable.
-// Tests that want the "signed in as admin" state write to `store`
-// (localStorage) because that's where login persists; tests that want
-// tab-scoped state write to `tabStore`.
+// fallback) during signal initialisation. api.ts reads the in-memory
+// signal directly (auth.token()), so the test seeds storage to prime
+// the signal at import time. Tests that want the "signed in as admin"
+// state write to `store` (localStorage) because that's where login
+// persists; tests that want tab-scoped state write to `tabStore`.
 const store: Record<string, string> = {};
 const tabStore: Record<string, string> = {};
 vi.stubGlobal('localStorage', {
@@ -24,6 +24,7 @@ vi.stubGlobal('sessionStorage', {
 });
 
 // Import after stubs are in place
+const { auth } = await import('../stores/auth');
 const { api, ApiError, __setAuthExpiredHandler } = await import('./api');
 
 function jsonResponse(data: unknown, status = 200) {
@@ -39,6 +40,7 @@ function errorResponse(body: string, status: number) {
 
 beforeEach(() => {
   mockFetch.mockReset();
+  auth.setToken('');
   delete store['telepair_token'];
   delete tabStore['telepair_token'];
   // Replace the default handler (which tries to navigate via
@@ -60,7 +62,7 @@ describe('api.health', () => {
 
 describe('api.listTargets', () => {
   it('sends Authorization header when token exists', async () => {
-    store['telepair_token'] = 'test-token';
+    auth.setToken('test-token');
     mockFetch.mockResolvedValueOnce(jsonResponse([]));
     await api.listTargets();
     const [, init] = mockFetch.mock.calls[0];
