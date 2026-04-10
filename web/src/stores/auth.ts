@@ -122,20 +122,43 @@ export type AuthErrorKey =
 const [token, setTokenSignal] = createSignal(readInitialToken());
 const [validating, setValidating] = createSignal(false);
 const [errorKey, setErrorKey] = createSignal<AuthErrorKey>(null);
-// Cached caller identity. Empty string when unknown — populated
-// lazily by `loadIdentity()` from `/api/auth/whoami` so the dashboard
-// can compare it against `session.owner_id` to decide whether a
-// closed-row click should open the owner-only audit dialog. Without
-// this signal the dashboard had no way to tell "session I own" from
-// "session I merely joined", and clicking the latter would 403 the
-// audit fetch and surface as a confusing in-dialog error.
-const [currentUserId, setCurrentUserId] = createSignal('');
-// Role snapshot for the same caller. `null` while loadIdentity is
-// pending so route guards that depend on it can fail-closed (treat
-// "unknown" as "not admin") without flashing the admin UI to a
-// guest on the first paint. Populated by the same whoami call as
-// `currentUserId`, so the two always lands together.
-const [currentUserIsAdmin, setCurrentUserIsAdmin] = createSignal<boolean | null>(null);
+// Cached caller identity from `/api/auth/whoami`. `null` while
+// unknown (before the first successful load, or after logout),
+// populated atomically by `loadIdentity()` so the `id`, `isAdmin`,
+// and `isGuest` fields can never disagree. The dashboard's owner
+// gate reads `id` to match against `session.owner_id`; route guards
+// read `isAdmin` to gate admin pages; the session-page back button
+// reads `isGuest` to decide between "return to dashboard" (real
+// user keeps their identity) and "log out" (scoped guest has
+// nowhere else to go — their token is only valid for this one
+// session). These were previously three independent signals that
+// always had to be set or cleared together — collapsing them
+// removes the drift risk and the duplicate boilerplate.
+interface CurrentUser {
+  id: string;
+  isAdmin: boolean;
+  isGuest: boolean;
+}
+const [currentUser, setCurrentUser] = createSignal<CurrentUser | null>(null);
+const currentUserId = () => currentUser()?.id ?? '';
+const currentUserIsAdmin = () => currentUser()?.isAdmin ?? null;
+const currentUserIsGuest = () => currentUser()?.isGuest ?? null;
+
+// In-flight `loadIdentity` promise, memoized so two concurrent
+// mounts (e.g. Dashboard + AdminGuard on a deep link) share one
+// whoami round-trip instead of racing. Cleared on success or
+// failure so the next caller starts fresh.
+let identityInFlight: Promise<void> | null = null;
+
+// Flips to `true` when the FIRST `loadIdentity()` call settles —
+// either the whoami succeeded and `currentUser` was populated, or
+// it failed and `currentUser` stays null. AdminGuard watches this
+// instead of `currentUserIsAdmin() !== null` so it can distinguish
+// "still in flight" (show spinner placeholder) from "request
+// finished but returned no usable identity" (redirect home instead
+// of staying blank forever). Reset to `false` on logout so the
+// next open of the admin page re-runs the check.
+const [identityChecked, setIdentityChecked] = createSignal(false);
 
 export interface SetTokenOptions {
   /**
@@ -148,10 +171,24 @@ export interface SetTokenOptions {
 }
 
 function setToken(value: string, options: SetTokenOptions = {}) {
+  const previous = token();
   if (value) {
     safeSet(sessionStore(), STORAGE_KEY, value);
     if (options.persist) {
       safeSet(localStore(), STORAGE_KEY, value);
+    }
+    // Identity is bound to the credential — a token swap (admin
+    // logged in, then same tab walks a /join/:token invite link and
+    // picks up a guest token) must invalidate the cached whoami, or
+    // AdminGuard / dashboard owner gate / Session back-button all
+    // keep running against the previous user's id and flags. Only
+    // invalidate when the token actually changes so back-to-back
+    // writes of the same value (persist upgrade, retry) don't churn
+    // an in-flight whoami.
+    if (value !== previous) {
+      setCurrentUser(null);
+      setIdentityChecked(false);
+      identityInFlight = null;
     }
   } else {
     // Logout: clear both tiers. A shared-admin-then-logout flow should
@@ -160,13 +197,13 @@ function setToken(value: string, options: SetTokenOptions = {}) {
     safeRemove(sessionStore(), STORAGE_KEY);
     safeRemove(localStore(), STORAGE_KEY);
     // Identity is bound to the credential — when the credential goes
-    // away, the cached id must too. Otherwise the next login (e.g.
+    // away, the cached user must too. Otherwise the next login (e.g.
     // admin → guest invite → admin) would observe a stale id from
-    // the previous session and mis-gate the dashboard's owner check.
-    // The admin flag rides on the same lifecycle: a stale `true` here
-    // would leak the admin gear icon to a subsequent guest session.
-    setCurrentUserId('');
-    setCurrentUserIsAdmin(null);
+    // the previous session and mis-gate the dashboard's owner check,
+    // or leak the admin gear icon to a subsequent guest session.
+    setCurrentUser(null);
+    setIdentityChecked(false);
+    identityInFlight = null;
   }
   setTokenSignal(value);
   setErrorKey(null);
@@ -174,24 +211,46 @@ function setToken(value: string, options: SetTokenOptions = {}) {
 
 /**
  * Fetch and cache the caller's identity from `/api/auth/whoami`.
- * Idempotent: returns immediately if `currentUserId` is already set
- * or no token is in scope, so callers can fire it from any mount
- * without worrying about double-fetches. Failures are swallowed —
- * the next protected request will surface the real error through
- * the global 401 interceptor, and the dashboard's owner-gate falls
- * back to "no rows are owned" which is the safer side of the call.
+ * Idempotent AND de-duplicated: concurrent callers (Dashboard and
+ * AdminGuard mounting on the same tick of a deep link) share one
+ * HTTP round-trip via `identityInFlight`. Returns immediately if
+ * the identity is already cached or no token is in scope. Failures
+ * are swallowed — the next protected request will surface the real
+ * error through the global 401 interceptor, and the dashboard's
+ * owner-gate falls back to "no rows are owned" which is the safer
+ * side of the call.
  */
 async function loadIdentity(): Promise<void> {
-  if (currentUserId() || !token()) return;
-  try {
-    const me = await api.whoami();
-    setCurrentUserId(me.user_id);
-    setCurrentUserIsAdmin(me.is_admin);
-  } catch {
-    // Non-fatal: see comment above. Specifically NOT calling
-    // `logoutAndRedirect` here — a transient network blip during
-    // dashboard mount must not bounce the user back to /login.
+  if (currentUser() || !token()) {
+    // Already loaded, or no token — mark as settled so AdminGuard
+    // doesn't hang on a whoami that will never fire.
+    setIdentityChecked(true);
+    return;
   }
+  if (identityInFlight) return identityInFlight;
+  identityInFlight = (async () => {
+    try {
+      const me = await api.whoami();
+      setCurrentUser({
+        id: me.user_id,
+        isAdmin: me.is_admin,
+        isGuest: me.is_guest,
+      });
+    } catch {
+      // Non-fatal: see comment above. Specifically NOT calling
+      // `logoutAndRedirect` here — a transient network blip during
+      // dashboard mount must not bounce the user back to /login.
+      // AdminGuard will redirect to `/` on its next render
+      // (identityChecked=true, currentUserIsAdmin=null → not true).
+    } finally {
+      identityInFlight = null;
+      // Signal that the first attempt has settled. AdminGuard reads
+      // this to know when to stop showing the loading placeholder and
+      // either render the content or redirect away.
+      setIdentityChecked(true);
+    }
+  })();
+  return identityInFlight;
 }
 
 async function validateToken(t: string): Promise<boolean> {
@@ -254,6 +313,8 @@ export const auth = {
   errorKey,
   currentUserId,
   currentUserIsAdmin,
+  currentUserIsGuest,
+  identityChecked,
   setToken,
   validateToken,
   loadIdentity,

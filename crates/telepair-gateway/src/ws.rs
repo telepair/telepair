@@ -17,7 +17,7 @@ use telepair_core::protocol::{
 };
 use telepair_core::session::{CloseReason, InputMode};
 
-use crate::session_hub::{PtyCommand, SessionAttachment};
+use crate::session_hub::{PtyCommand, PtyLaunch, SessionAttachment};
 use crate::state::AppState;
 
 /// Hard cap on any single WebSocket frame/message. Terminal keystrokes are
@@ -51,6 +51,15 @@ pub async fn ws_handler(
 /// this path is exclusively about "launch broke mid-handshake" —
 /// nothing the owner did.
 async fn cleanup_orphan_session(state: &AppState, session_id: &str) {
+    // Drop the hub reservation minted by `create_session` before this
+    // attach attempt failed. Without this, a `Pending` entry sits in
+    // the hub for up to `pending_attach_ttl` and `count_live_sessions
+    // _per_target` keeps reporting the target as in-use, blocking
+    // `/api/admin/targets/reload` on a phantom session that nobody is
+    // ever going to attach to. `release_reservation` is a no-op on
+    // Live entries (paranoid against a slow error path racing a real
+    // attach), so it's safe to call unconditionally here.
+    state.hub.release_reservation(session_id).await;
     // No actor: the close is server-initiated after a mid-handshake
     // launch failure, not something the owner asked for. Audit will
     // render it as "reason=error, actor=none".
@@ -174,13 +183,30 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         state.sessions.list_participants(&session_id),
     );
 
+    // Three-way split is load-bearing: lumping `Err(_)` in with
+    // `Ok(None)` would surface a transient SQLite hiccup as
+    // `SESSION_NOT_FOUND`, which `web/src/lib/ws.ts` treats as a
+    // terminal close — the user sees "session does not exist" and
+    // the page never reconnects, even though the row is still on
+    // disk. Storage errors must take the same `STORAGE_ERROR` /
+    // transient close path as the `participants_res` branch below.
     let session = match session_res {
         Ok(Some(s)) => s,
-        _ => {
+        Ok(None) => {
             send_error(
                 &mut ws_tx,
                 error_codes::SESSION_NOT_FOUND,
                 format!("session {session_id} not found"),
+            )
+            .await;
+            return;
+        }
+        Err(e) => {
+            tracing::error!(session = %session_id, error = %e, "failed to load session");
+            send_error(
+                &mut ws_tx,
+                error_codes::STORAGE_ERROR,
+                "temporary storage failure — please retry".into(),
             )
             .await;
             return;
@@ -257,7 +283,17 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         mut shutdown_rx,
         scrollback,
     } = match hub
-        .start_or_join(&session_id, &cmd, &args, &env, initial_cols, initial_rows)
+        .start_or_join(
+            &session_id,
+            &session.target_name,
+            PtyLaunch {
+                command: &cmd,
+                args: &args,
+                env: &env,
+                cols: initial_cols,
+                rows: initial_rows,
+            },
+        )
         .await
     {
         Ok(attachment) => attachment,

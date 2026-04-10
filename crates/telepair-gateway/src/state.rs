@@ -61,7 +61,6 @@ impl AppState {
         let invites = Arc::new(InviteService::new(
             storage.clone(),
             sessions.clone(),
-            auth.clone(),
             audit.clone(),
         ));
         let targets = Arc::new(ArcSwap::from_pointee(engine));
@@ -99,7 +98,6 @@ impl AppState {
         let invites = Arc::new(InviteService::new(
             storage.clone(),
             sessions.clone(),
-            auth.clone(),
             audit.clone(),
         ));
         let targets = Arc::new(ArcSwap::from_pointee(engine));
@@ -123,6 +121,16 @@ impl AppState {
     /// a request.
     pub async fn create_test_user(&self, name: &str) -> String {
         let (_, token) = self.storage.create_user(name, false).await.unwrap();
+        token
+    }
+
+    /// Test helper: seed an admin user and return their raw token.
+    /// Same rules as [`Self::create_test_user`] — integration tests
+    /// only. Needed so tests can exercise the admin-only branches of
+    /// handlers like `list_sessions` without reaching around the
+    /// service layer.
+    pub async fn create_test_admin(&self, name: &str) -> String {
+        let (_, token) = self.storage.create_user(name, true).await.unwrap();
         token
     }
 }

@@ -20,6 +20,14 @@ pub enum Error {
     PermissionDenied(String),
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// Internal server-side failure that does not fit the other
+    /// variants. Used for cases like "retry loop exhausted against
+    /// an otherwise well-defined failure mode" where callers can't
+    /// meaningfully react to the specific cause and we just want a
+    /// 500 with a descriptive message. Keep the string concise —
+    /// it goes into logs and (generically masked) HTTP responses.
+    #[error("internal error: {0}")]
+    Internal(String),
     #[error("storage error: {0}")]
     Storage(#[from] sqlx::Error),
     #[error("io error: {0}")]
@@ -45,7 +53,7 @@ impl Error {
             Error::SessionNotFound(_) | Error::TargetNotFound(_) => 404,
             Error::SessionClosed(_) => 410,
             Error::InvalidInput(_) | Error::Json(_) => 400,
-            Error::Storage(_) | Error::Io(_) | Error::Yaml(_) => 500,
+            Error::Internal(_) | Error::Storage(_) | Error::Io(_) | Error::Yaml(_) => 500,
         }
     }
 }

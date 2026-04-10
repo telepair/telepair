@@ -292,3 +292,16 @@ export const api = {
 };
 
 export { ApiError };
+
+/**
+ * Extract a user-facing message string from an unknown thrown value.
+ * Centralised here because every `catch (e)` site used to inline the
+ * same `e instanceof Error ? e.message : String(e)` dance — five or
+ * six copies that were one `toString()`-vs-`String()` typo away from
+ * silently drifting. `ApiError.message` carries the server's error
+ * body (see `request()` above), which is already the right thing to
+ * show in a toast, so no special-casing is needed here.
+ */
+export function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}

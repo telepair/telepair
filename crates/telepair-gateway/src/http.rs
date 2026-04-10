@@ -7,10 +7,11 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use telepair_control::invite_service::{CreateInviteParams, CreateInviteResult, RedeemResult};
+use telepair_control::invite_service::CreateInviteParams;
 use telepair_core::error::Error;
 use telepair_core::permission::Role;
-use telepair_core::session::{CloseReason, InputMode, SessionListFilter, SessionStatus, User};
+use telepair_core::session::{InputMode, SessionListFilter, SessionStatus, User};
+use telepair_core::target::TargetKind;
 
 use crate::state::AppState;
 
@@ -78,17 +79,25 @@ pub async fn health() -> impl IntoResponse {
 /// would otherwise produce a deterministic 403). 401 on missing or
 /// invalid bearer; never returns 403, since "I am a guest" is still a
 /// valid identity to surface.
+#[derive(Serialize)]
+struct WhoamiResponse {
+    user_id: String,
+    name: String,
+    is_admin: bool,
+    is_guest: bool,
+}
+
 pub async fn whoami(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = extract_user(&state, &headers).await?;
-    Ok(Json(serde_json::json!({
-        "user_id": user.id.to_string(),
-        "name": user.name,
-        "is_admin": user.is_admin,
-        "is_guest": user.is_guest(),
-    })))
+    Ok(Json(WhoamiResponse {
+        user_id: user.id.to_string(),
+        is_admin: user.is_admin,
+        is_guest: user.is_guest(),
+        name: user.name,
+    }))
 }
 
 pub async fn list_targets(
@@ -209,6 +218,21 @@ pub async fn create_session(
         .create_session(&user, &body.target_name, mode)
         .await?;
 
+    // Reserve the target slot in the hub *before* returning 201 so a
+    // `targets` reload landing in the gap between this response and
+    // the client's WS attach sees the target as still in use. Without
+    // this, the reload guard's `count_live_sessions_per_target` walks
+    // an empty hub for the brand-new session and could happily drop
+    // the target — `ws::handle_socket` would then fail target
+    // resolution and `cleanup_orphan_session` would stamp the row
+    // `Error` before the client ever connected. The reservation is
+    // upgraded to `Live` by `start_or_join` once the WS attaches, or
+    // GCed after `pending_attach_ttl` if the client never shows.
+    state
+        .hub
+        .reserve_target(&session.id, &body.target_name)
+        .await;
+
     Ok((StatusCode::CREATED, Json(session)))
 }
 
@@ -263,9 +287,15 @@ pub async fn list_sessions(
     Query(query): Query<ListSessionsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = extract_user(&state, &headers).await?;
+    // Admin-aware dispatch: admins see every session in the system
+    // so the counts on the admin targets page and the deep-linked
+    // session list agree; everyone else (including scoped guests)
+    // sees only their own owner/participant rows. The branch lives
+    // inside `SessionService::list_sessions_visible_to` so the
+    // gateway doesn't spread auth decisions across layers.
     let visible = state
         .sessions
-        .list_sessions_for_user(user.id, query.into_filter())
+        .list_sessions_visible_to(&user, query.into_filter())
         .await?;
 
     Ok(Json(visible))
@@ -327,17 +357,7 @@ pub async fn create_invite(
         )
         .await?;
 
-    Ok((StatusCode::CREATED, Json(invite_response(&result))))
-}
-
-fn invite_response(r: &CreateInviteResult) -> serde_json::Value {
-    serde_json::json!({
-        "token": r.token,
-        "role": r.role,
-        "max_uses": r.max_uses,
-        "expires_at": r.expires_at,
-        "session_id": r.session_id,
-    })
+    Ok((StatusCode::CREATED, Json(result)))
 }
 
 #[derive(Deserialize)]
@@ -350,27 +370,20 @@ pub async fn close_session(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // We need the User, not just the session, so the audit emit in
-    // `close_session` can attribute the close to the actor. Auth and
-    // the session lookup run concurrently — saves one DB-query's
-    // worth of latency on the happy path without rewriting the
-    // ownership check into an opaque helper.
-    let (user_res, session_res) = tokio::join!(
-        extract_user(&state, &headers),
-        state.sessions.get_session(&session_id),
-    );
-    let user = user_res?;
-    let session = session_res?.ok_or(ApiError(StatusCode::NOT_FOUND))?;
-    if session.owner_id != user.id {
-        return Err(ApiError(StatusCode::FORBIDDEN));
-    }
-    // Owner-initiated close → CloseReason::Owner. The reaper and the
-    // boot-time cleanup paths stamp their own reasons when they call
-    // close_session; the history view reads that column to pick the
-    // right chip ("Owner closed" / "Timed out" / "Server restart").
+    // The "owner can close their own session" policy lives entirely
+    // inside `SessionService::close_session_as_owner`, which combines
+    // the existence check, ownership check, and audit-stamped close
+    // into one call. Previously this handler hand-rolled all three —
+    // duplicating the rule already encoded in `require_owner` and
+    // making it possible to drift one site without the other. The
+    // earlier version also overlapped auth and the session fetch
+    // with `tokio::join!` to save one round-trip; that micro-opt was
+    // not worth keeping a second copy of the policy in the gateway,
+    // since DELETE fires once per session lifetime.
+    let user = extract_user(&state, &headers).await?;
     state
         .sessions
-        .close_session(&session_id, CloseReason::Owner, Some(&user))
+        .close_session_as_owner(&user, &session_id)
         .await?;
     state.hub.stop_session(&session_id).await;
     Ok(StatusCode::NO_CONTENT)
@@ -416,18 +429,12 @@ pub async fn redeem_invite(
 
     // Everything else — preview, scoped-guest check, closed-session
     // gate, existing-member no-op, atomic consume, guest mint,
-    // participant upsert — lives inside `InviteService::redeem`. The
-    // HTTP layer translates the `RedeemResult` into the wire shape.
+    // participant upsert — lives inside `InviteService::redeem`.
+    // `RedeemResult` derives `Serialize` with `issued_token` renamed
+    // to `token`, so we can hand it straight to `Json` without a
+    // per-field copy.
     let result = state.invites.redeem(existing_user, &body.token).await?;
-    Ok(Json(redeem_response(&result)))
-}
-
-fn redeem_response(r: &RedeemResult) -> serde_json::Value {
-    serde_json::json!({
-        "session_id": r.session_id,
-        "role": r.role,
-        "token": r.issued_token,
-    })
+    Ok(Json(result))
 }
 
 /// `GET /api/sessions/:id/invites`
@@ -527,8 +534,11 @@ pub async fn list_session_audit(
 struct AdminTargetInfo {
     name: String,
     display: String,
+    /// `TargetKind` already serializes as lowercase (`"virtual"` /
+    /// `"local"`) via its `rename_all` attribute, so we let serde do
+    /// the mapping and just rename the field to `type` on the wire.
     #[serde(rename = "type")]
-    kind: String,
+    kind: TargetKind,
     command: Option<String>,
     args: Vec<String>,
     shell: Option<String>,
@@ -584,6 +594,13 @@ pub async fn list_admin_targets(
     // Snapshot read: hold the guard just long enough to clone the
     // fields out. A concurrent reload installs a new pointer
     // atomically; this reader walks the snapshot it started with.
+    //
+    // Snapshot the process environment once instead of calling
+    // `std::env::var` per key per target — each call takes a global
+    // mutex and copies the value out just to discard it. One HashMap
+    // probe per key is cheaper and cannot race with a concurrent
+    // `setenv` mid-response (same-request snapshot semantics).
+    let env_keys: std::collections::HashSet<String> = std::env::vars().map(|(k, _)| k).collect();
     let engine = state.targets.load();
     let mut out: Vec<AdminTargetInfo> = engine
         .list_targets()
@@ -597,17 +614,14 @@ pub async fn list_admin_targets(
                 .keys()
                 .map(|k| AdminTargetEnvKey {
                     key: k.clone(),
-                    set: std::env::var(k).is_ok(),
+                    set: env_keys.contains(k),
                 })
                 .collect();
             env.sort_by(|a, b| a.key.cmp(&b.key));
             AdminTargetInfo {
                 name: t.name.clone(),
                 display: t.display.clone(),
-                kind: match t.kind {
-                    telepair_core::target::TargetKind::Virtual => "virtual".into(),
-                    telepair_core::target::TargetKind::Local => "local".into(),
-                },
+                kind: t.kind,
                 command: t.command.clone(),
                 args: t.args.clone(),
                 shell: t.shell.clone(),
@@ -639,6 +653,16 @@ pub async fn list_admin_targets(
 /// - 400 with `reason=parse_error`: the file on disk is now
 ///   malformed; the old engine stays loaded and the response body
 ///   carries the parse error string so the admin can fix the yaml.
+/// - 400 with `reason=still_referenced`: the parsed engine would
+///   drop or rename at least one target that still has active
+///   sessions pointing at it by name. The response body's
+///   `targets` array lists `{target, active_sessions}` entries so
+///   the admin UI can say "close these sessions first". The old
+///   engine stays loaded. Without this guard a hot reload that
+///   deletes a target would silently wedge every running session
+///   on that target: the next WS reconnect resolves the missing
+///   name, `cleanup_orphan_session` marks the DB row `Error`, and
+///   the owner can never rejoin the still-running PTY.
 /// - 200: swap succeeded; response carries the new target count
 ///   and the absolute path that was re-read, and an audit event
 ///   (`target.reloaded`) is emitted with the same payload.
@@ -699,6 +723,63 @@ pub async fn reload_targets(
             ));
         }
     };
+
+    // Refuse to drop or rename a target that still has a **live**
+    // session referencing it by name. Without this guard a reload
+    // that removes `foo` from the yaml will wedge every running
+    // session on `foo`: `ws::handle_socket` resolves target names
+    // through the live engine, so the next reconnect would hit
+    // `TARGET_NOT_FOUND` and `cleanup_orphan_session` would stamp
+    // the DB row `Error`, leaving the owner unable to rejoin.
+    //
+    // This counts the hub, not the DB. The DB `sessions.status`
+    // column can briefly report `active` for rows whose PTY has
+    // already exited and are waiting for the reaper (or for the
+    // cleanup branch of the PTY loop) to land the close. Blocking
+    // a reload on those stale rows would prevent the admin from
+    // rotating targets during the idle-grace window. The hub map,
+    // on the other hand, is exactly the set of running shells: if
+    // a `target_name` is present in the hub, there is a live PTY
+    // that would break on reconnect without its yaml entry.
+    //
+    // This is a conservative gate: admins can still add targets,
+    // delete unreferenced targets, or tweak `command/args/env` on
+    // referenced targets — only the specific "drop or rename a
+    // name still pointed at by a live session" case gets a 400.
+    let live_counts = state.hub.count_live_sessions_per_target().await;
+    let mut still_referenced: Vec<(String, u32)> = live_counts
+        .into_iter()
+        .filter(|(name, _)| new_engine.find(name).is_none())
+        .collect();
+    if !still_referenced.is_empty() {
+        // Sort deterministically so the response body and the
+        // warn log render in a stable order — HashMap iteration is
+        // undefined and would shuffle between runs.
+        still_referenced.sort_by(|a, b| a.0.cmp(&b.0));
+        tracing::warn!(
+            path = %path.display(),
+            actor = %user.name,
+            missing = ?still_referenced,
+            "targets reload: rejected — new engine drops targets with live sessions"
+        );
+        let targets_json: Vec<_> = still_referenced
+            .into_iter()
+            .map(|(name, count)| {
+                serde_json::json!({
+                    "target": name,
+                    "active_sessions": count,
+                })
+            })
+            .collect();
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "reason": "still_referenced",
+                "message": "refusing to drop or rename targets that still have live sessions",
+                "targets": targets_json,
+            })),
+        ));
+    }
 
     // Capture the count BEFORE the swap so the audit detail and the
     // HTTP response agree even if another admin races to reload.

@@ -9,7 +9,8 @@ use crate::audit::{AuditEvent, AuditFilter};
 use crate::error::Result;
 use crate::permission::Role;
 use crate::session::{
-    CloseReason, InputMode, InviteToken, Participant, Session, SessionListFilter, User,
+    CloseReason, InputMode, InviteToken, Participant, RedeemIdentity, RedeemOutcome, Session,
+    SessionListFilter, User,
 };
 
 pub use sqlite::SqliteStorage;
@@ -56,6 +57,13 @@ pub trait Storage: Send + Sync {
         user_id: Uuid,
         filter: SessionListFilter,
     ) -> Result<Vec<Session>>;
+    /// List every session in the system, filtered only by `filter`,
+    /// with no ownership / participant scoping. Callers MUST enforce
+    /// the admin gate themselves — this trait method does not know
+    /// who is asking. `SessionService::list_sessions_visible_to`
+    /// branches on `User::is_admin` and is the only intended caller
+    /// on the production path.
+    async fn list_all_sessions(&self, filter: SessionListFilter) -> Result<Vec<Session>>;
     /// Close every still-active session in one transaction. Used by
     /// the startup cleanup path after an unclean shutdown; passes
     /// `CloseReason::Startup` so the history view shows the right
@@ -77,6 +85,26 @@ pub trait Storage: Send + Sync {
         role: Role,
     ) -> Result<Participant>;
     async fn list_participants(&self, session_id: &str) -> Result<Vec<Participant>>;
+    /// Atomic existing-participant lookup, scoped to **active** sessions.
+    /// Returns `Some(role)` iff *all* of the following hold in the same
+    /// MVCC snapshot: the user has a participant row in the session,
+    /// the row's `left_at IS NULL`, and the session's `status = 'active'`.
+    /// Returns `None` if the row doesn't exist, the user has already
+    /// left, or the session is closed.
+    ///
+    /// Backs the invite-redeem existing-member short path so a no-op
+    /// "owner verifies their own share link" cannot return success
+    /// against a session that was closed between the pre-check and the
+    /// participant lookup. The two-query alternative
+    /// (`get_session` + `list_participants`) was vulnerable to a TOCTOU
+    /// race where a concurrent `close_session` could commit between
+    /// the two reads, producing a "you're a member" reply against a
+    /// dead session. A single SELECT-JOIN closes that gap.
+    async fn find_active_participant_role(
+        &self,
+        session_id: &str,
+        user_id: Uuid,
+    ) -> Result<Option<Role>>;
 
     // Invite Tokens
     async fn create_invite(
@@ -87,12 +115,51 @@ pub trait Storage: Send + Sync {
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<(InviteToken, String)>;
     /// Look up an invite by its raw token without decrementing any
-    /// counters. Useful for pre-validation (e.g. "is the target
-    /// session still active?") before calling `consume_invite`.
-    /// Does NOT check expiry / max_uses — callers that want to
-    /// enforce those should call `consume_invite`.
+    /// counters. Used by the service layer as a fast-fail preview
+    /// before committing to a `redeem_invite` transaction — the
+    /// authoritative expiry / max_uses / session-active gates live
+    /// inside that transaction's WHERE clause, so this method is a
+    /// read-only helper that does NOT check any of them.
     async fn find_invite(&self, token: &str) -> Result<InviteToken>;
-    async fn consume_invite(&self, token: &str) -> Result<InviteToken>;
+    /// Look up an invite directly by its SHA-256 PK. Used by the
+    /// revoke path where the caller already has the digest (it's the
+    /// URL parameter) and doesn't want the `find_invite` pre-hash
+    /// step. Returns `Ok(None)` on miss so the caller can distinguish
+    /// "not in session" from a real DB error.
+    async fn find_invite_by_sha256(&self, token_sha256: &str) -> Result<Option<InviteToken>>;
+    /// Atomically consume an invite AND install the redeemer as a
+    /// session participant in one transaction. Supersedes the v0.1.1
+    /// split-step sequence (pre-check session active → increment
+    /// `used_count` → insert guest user → upsert participant), which
+    /// had two failure modes:
+    ///
+    /// 1. Partial failure: a transient error between the counter
+    ///    increment and `upsert_participant` left `used_count`
+    ///    drained with no participant row (invite silently burned).
+    /// 2. TOCTOU on session close: the pre-check "session still
+    ///    active" ran outside any transaction, so a concurrent
+    ///    `close_session` could commit between the check and the
+    ///    participant write — leaving a participant row pointing
+    ///    at a closed session.
+    ///
+    /// This method fixes both by folding the session-status check
+    /// into the invite `UPDATE` (`EXISTS (SELECT … WHERE status =
+    /// 'active')`) and wrapping everything in a single transaction.
+    /// Concrete errors:
+    /// - [`Error::InvalidInput`] — token not found, expired, or
+    ///   exhausted (`used_count >= max_uses`).
+    /// - [`Error::SessionClosed`] — the invite's session was closed
+    ///   before (or during) redemption.
+    /// - [`Error::SessionNotFound`] — the invite points at a
+    ///   deleted session row (should only happen in test fixtures).
+    /// - [`Error::Storage`] — underlying driver errors, including
+    ///   the UNIQUE(name) violation the caller retries on for the
+    ///   `NewGuest` path.
+    async fn redeem_invite(
+        &self,
+        token: &str,
+        identity: RedeemIdentity<'_>,
+    ) -> Result<RedeemOutcome>;
     /// List every invite row for a session, newest-first. Returned
     /// rows still carry `token_sha256` (not the raw token) — the
     /// raw bearer is only ever visible at mint time.

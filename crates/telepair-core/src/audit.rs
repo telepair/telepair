@@ -179,13 +179,6 @@ impl AuditEvent {
         self
     }
 
-    /// Attach an actor id without a name snapshot. Used by the auth
-    /// path where we have the id but want to keep the row tight.
-    pub fn with_actor_id(mut self, id: Uuid) -> Self {
-        self.actor_id = Some(id);
-        self
-    }
-
     pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
         self

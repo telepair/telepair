@@ -33,7 +33,7 @@ async fn setup() -> Fixture {
     let audit = Arc::new(AuditSink::new(storage.clone()));
     let sessions = Arc::new(SessionService::new(storage.clone(), audit.clone()));
     let auth = Arc::new(TokenAuthProvider::new(storage.clone()));
-    let invites = InviteService::new(storage.clone(), sessions.clone(), auth.clone(), audit);
+    let invites = InviteService::new(storage.clone(), sessions.clone(), audit);
     Fixture {
         invites,
         sessions,
@@ -203,6 +203,62 @@ async fn create_rejects_past_absolute_expiry() {
 }
 
 #[tokio::test]
+async fn create_rejects_absolute_expiry_beyond_ceiling() {
+    // Regression for the TTL-bypass finding: `MAX_INVITE_TTL_MINUTES`
+    // was only enforced on the relative `expires_in_minutes` path
+    // (via `.min(...)` clamp). A direct-API caller could pass an
+    // `expires_at` timestamp weeks or months in the future and the
+    // service would accept it unchanged, effectively disabling the
+    // hard ceiling that the UI slider respects. The fix rejects
+    // out-of-range absolute timestamps with 400 so the ceiling is
+    // single-point enforced across both input paths.
+    let fx = setup().await;
+    let owner = seed_user(&fx, "owner").await;
+    let session = seed_session(&fx, &owner).await;
+
+    // 30 days out — comfortably beyond the 7-day ceiling.
+    let too_far = Utc::now() + Duration::days(30);
+    let err = fx
+        .invites
+        .create(
+            &owner,
+            &session.id,
+            CreateInviteParams {
+                role: Role::Viewer,
+                max_uses: 1,
+                expires_in_minutes: None,
+                expires_at: Some(too_far),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidInput(_)),
+        "30-day absolute expiry must reject, got {err:?}"
+    );
+
+    // Sanity: an `expires_at` exactly inside the ceiling still
+    // works, so the reject is a strict upper bound, not a
+    // blanket disable of the absolute-timestamp path.
+    let inside = Utc::now() + Duration::minutes(MAX_INVITE_TTL_MINUTES - 5);
+    let ok = fx
+        .invites
+        .create(
+            &owner,
+            &session.id,
+            CreateInviteParams {
+                role: Role::Viewer,
+                max_uses: 1,
+                expires_in_minutes: None,
+                expires_at: Some(inside),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(ok.expires_at.is_some());
+}
+
+#[tokio::test]
 async fn create_rejects_non_owner() {
     let fx = setup().await;
     let owner = seed_user(&fx, "owner").await;
@@ -287,7 +343,7 @@ async fn redeem_by_owner_is_noop_and_preserves_uses() {
 
     // Invite's used_count must stay at 0 — sanity-checking a link
     // should never burn a use.
-    let preview = fx.invites.preview(&created.token).await.unwrap();
+    let preview = fx.storage.find_invite(&created.token).await.unwrap();
     assert_eq!(preview.used_count, 0);
 }
 
@@ -324,7 +380,7 @@ async fn redeem_by_scoped_guest_for_other_session_is_forbidden() {
     assert!(matches!(err, Error::PermissionDenied(_)));
 
     // Critically: the invite must NOT have been consumed.
-    let preview = fx.invites.preview(&invite_b.token).await.unwrap();
+    let preview = fx.storage.find_invite(&invite_b.token).await.unwrap();
     assert_eq!(preview.used_count, 0);
 }
 
@@ -350,7 +406,71 @@ async fn redeem_against_closed_session_returns_gone_without_burn() {
     // Invite row must still be intact — we want to fail without
     // burning a use so the operator can re-use it against a new
     // session or retract it cleanly.
-    let preview = fx.invites.preview(&created.token).await.unwrap();
+    let preview = fx.storage.find_invite(&created.token).await.unwrap();
+    assert_eq!(preview.used_count, 0);
+}
+
+#[tokio::test]
+async fn redeem_by_existing_member_of_closed_session_returns_gone() {
+    // Regression for H5: the "owner/existing member clicks their own
+    // invite" short path used to rebuild the active-session check
+    // out of two independent queries (`get_session_required` +
+    // `list_participants`). With those two queries, a concurrent
+    // `close_session` committing between them could cause this
+    // branch to return a happy `RedeemResult` against a session
+    // that was *already* closed — the caller then navigated to a
+    // dead session and ate a WS-layer bounce instead of the clean
+    // `SessionClosed` error the API contract promises.
+    //
+    // The fix routes the short path through
+    // `SessionService::find_active_participant_role`, a single
+    // SELECT-JOIN that evaluates both predicates (`left_at IS NULL`
+    // and `sessions.status = 'active'`) in one MVCC snapshot. Under
+    // that shape, a pre-closed session is structurally unreachable
+    // from the short path: the join returns `None` and we fall
+    // through to the outer active-session rejection.
+    //
+    // This test deterministically simulates the race outcome — the
+    // session is closed *before* redeem runs, so the short path
+    // sees a closed session from the start. A raced close would
+    // resolve to the same code path via the same lookup.
+    let fx = setup().await;
+    let owner = seed_user(&fx, "owner").await;
+    let session = seed_session(&fx, &owner).await;
+    let created = fx
+        .invites
+        .create(&owner, &session.id, default_params(Role::Operator))
+        .await
+        .unwrap();
+
+    // Close the session BEFORE the owner (who is already a
+    // participant) tries to redeem. The pre-H5 code would still
+    // have caught this via the up-front `get_session_required`
+    // check; the new shape catches it via the atomic lookup even
+    // if the up-front check were removed or raced.
+    fx.sessions
+        .close_session(&session.id, CloseReason::Owner, Some(&owner))
+        .await
+        .unwrap();
+
+    // Owner is an existing participant of a now-closed session.
+    // The redeem MUST NOT return a happy short-path success —
+    // that would lie to the caller about the session being
+    // joinable. Expect a SessionClosed error (→ 410 Gone).
+    let err = fx
+        .invites
+        .redeem(Some(owner.clone()), &created.token)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::SessionClosed(_)),
+        "existing member of a closed session must get SessionClosed, got {err:?}"
+    );
+
+    // And the invite's use count must stay pristine — the failure
+    // path is still a no-op so a future retry against a new
+    // session (or a revoke) has clean state to work with.
+    let preview = fx.storage.find_invite(&created.token).await.unwrap();
     assert_eq!(preview.used_count, 0);
 }
 

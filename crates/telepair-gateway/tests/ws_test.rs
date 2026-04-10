@@ -420,6 +420,25 @@ async fn ws_closes_session_when_target_resolve_fails() {
         .await
         .unwrap();
 
+    // Mirror the production flow: `POST /api/sessions` always reserves
+    // the target slot in the hub before returning 201. We bypassed the
+    // HTTP layer for the row, so we have to plant the same reservation
+    // by hand — otherwise the "release on failure" assertion below
+    // would be a no-op (you can't release a reservation that was never
+    // taken) and the regression we're guarding against would still
+    // sneak past the test.
+    state.hub.reserve_target(&session.id, "ghost-target").await;
+    assert_eq!(
+        state
+            .hub
+            .count_live_sessions_per_target()
+            .await
+            .get("ghost-target")
+            .copied(),
+        Some(1),
+        "precondition: reserve_target must register the pending slot",
+    );
+
     let (mut ws, _) = connect_async(ws_url(&addr, &session.id))
         .await
         .expect("failed to connect");
@@ -460,4 +479,53 @@ async fn ws_closes_session_when_target_resolve_fails() {
         fetched.closed_at.is_some(),
         "closed_at must be stamped by cleanup_orphan_session",
     );
+
+    // Reservation must also be released so a subsequent
+    // `/api/admin/targets/reload` doesn't see a phantom `Pending`
+    // session pinning the now-deleted target. Before the fix this
+    // assertion would still report the slot as in-use until the
+    // pending TTL elapsed, blocking admin reload on a corpse.
+    let counts = state.hub.count_live_sessions_per_target().await;
+    assert!(
+        !counts.contains_key("ghost-target"),
+        "cleanup_orphan_session must release the hub reservation, \
+         got lingering counts: {counts:?}",
+    );
+}
+
+// --------------------------------------------------------------------------
+// Joining a session id that does not exist on disk must surface as
+// SESSION_NOT_FOUND. This pins the `Ok(None)` arm of the three-way
+// match in `ws::handle_socket` so a future refactor can't lump it back
+// together with the storage-error arm and turn either into the wrong
+// close code (terminal vs transient).
+// --------------------------------------------------------------------------
+#[tokio::test]
+async fn ws_unknown_session_id_returns_session_not_found() {
+    let (addr, state) = start_server().await;
+    // Real token, real user — only the session id is bogus.
+    let token = state.create_test_user("tester").await;
+    let bogus_session_id = Uuid::new_v4().to_string();
+
+    let (mut ws, _) = connect_async(ws_url(&addr, &bogus_session_id))
+        .await
+        .expect("failed to connect");
+
+    ws.send(session_join_msg(&bogus_session_id, &token))
+        .await
+        .unwrap();
+
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(3), recv_json(&mut ws))
+        .await
+        .expect("timed out waiting for error");
+
+    match msg {
+        Some(ServerMessage::Error { code, .. }) => {
+            assert_eq!(
+                code, "SESSION_NOT_FOUND",
+                "an unknown session id must surface as SESSION_NOT_FOUND, not STORAGE_ERROR",
+            );
+        }
+        other => panic!("expected SESSION_NOT_FOUND error, got: {other:?}"),
+    }
 }

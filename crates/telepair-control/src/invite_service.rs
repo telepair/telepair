@@ -3,11 +3,19 @@ use std::sync::Arc;
 use chrono::{DateTime, Duration, Utc};
 
 use telepair_core::audit::{AuditEvent, AuditEventType, AuditSink};
-use telepair_core::auth::TokenAuthProvider;
+use telepair_core::auth::{is_unique_violation, random_guest_name};
 use telepair_core::error::{Error, Result};
 use telepair_core::permission::Role;
-use telepair_core::session::{InviteToken, SessionStatus, User};
+use telepair_core::session::{InviteToken, RedeemIdentity, SessionStatus, User};
 use telepair_core::storage::{SqliteStorage, Storage};
+
+/// Max attempts when a fresh guest's random name collides with an
+/// existing `users.name` row. `guest-<nanoid8>` has ≈47 bits of
+/// entropy; a collision is vanishing, but we still bound the loop so
+/// a corrupted DB can't spin forever. Each attempt runs the full
+/// `redeem_invite` transaction — the rolled-back failure leaves
+/// `used_count` untouched, so retrying is safe.
+const GUEST_NAME_MAX_ATTEMPTS: usize = 5;
 
 use crate::session_service::SessionService;
 
@@ -34,7 +42,9 @@ pub struct CreateInviteParams {
 
 /// Output DTO for [`InviteService::create`]. Carries the raw token
 /// that the HTTP layer will hand back to the caller exactly once.
-#[derive(Debug, Clone)]
+/// Serialized directly into the `POST /api/sessions/:id/invites`
+/// response body — the field names ARE the wire format.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CreateInviteResult {
     pub session_id: String,
     /// Raw bearer token — the DB only stores its SHA-256 digest,
@@ -50,10 +60,15 @@ pub struct CreateInviteResult {
 /// `Some(raw)` when a fresh scoped guest was minted, and `None` when
 /// an authenticated caller joined (or reused their seat) under their
 /// existing identity.
-#[derive(Debug, Clone)]
+///
+/// Serialized directly into the `POST /api/invite/redeem` response
+/// body; `issued_token` is renamed to `token` on the wire so the
+/// frontend keeps reading the single-word field name it's used to.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RedeemResult {
     pub session_id: String,
     pub role: Role,
+    #[serde(rename = "token")]
     pub issued_token: Option<String>,
 }
 
@@ -88,7 +103,7 @@ pub struct InviteSummary {
 impl InviteSummary {
     fn from_token(t: InviteToken) -> Self {
         let remaining = (t.max_uses - t.used_count).max(0);
-        let token_prefix = t.token_sha256.chars().take(8).collect::<String>();
+        let token_prefix = t.token_prefix().to_string();
         Self {
             token_sha256: t.token_sha256,
             token_prefix,
@@ -113,21 +128,24 @@ impl InviteSummary {
 pub struct InviteService {
     storage: Arc<SqliteStorage>,
     sessions: Arc<SessionService>,
-    auth: Arc<TokenAuthProvider>,
     audit: Arc<AuditSink>,
 }
 
 impl InviteService {
+    /// Build an `InviteService`. As of v0.1.2 the constructor no
+    /// longer needs a `TokenAuthProvider`: the old redeem path used
+    /// `auth.create_guest` to mint scoped guests in a separate write,
+    /// but the new atomic `Storage::redeem_invite` does the user
+    /// INSERT inside its own transaction, so the auth handle is not
+    /// needed here anymore.
     pub fn new(
         storage: Arc<SqliteStorage>,
         sessions: Arc<SessionService>,
-        auth: Arc<TokenAuthProvider>,
         audit: Arc<AuditSink>,
     ) -> Self {
         Self {
             storage,
             sessions,
-            auth,
             audit,
         }
     }
@@ -163,22 +181,44 @@ impl InviteService {
             )));
         }
 
-        // Resolve expiry: absolute timestamp wins over TTL. Negative /
-        // zero TTL is rejected loudly so a slider overshoot doesn't
-        // silently produce a never-expires invite; positive TTL is
-        // clamped to the hard ceiling.
+        // Resolve expiry. The two input paths intentionally carry
+        // different policies:
+        //
+        // * `expires_in_minutes` is silently clamped to the ceiling
+        //   because the UI slider can overshoot as a benign UX
+        //   mistake and clamping is friendlier than a 400. See the
+        //   `create_clamps_huge_ttl_to_ceiling` test.
+        //
+        // * `expires_at` is an explicit wall-clock pick, so silently
+        //   rewriting it would lie to the caller — a client asking
+        //   for "Jan 1 2030" and getting a week-long token back has
+        //   no way to notice the downgrade. We reject out-of-range
+        //   absolute timestamps loudly. This is the teeth behind
+        //   `MAX_INVITE_TTL_MINUTES`; without it, any direct-API
+        //   caller could bypass the hard ceiling by passing an
+        //   absolute timestamp.
+        //
+        // Negative / zero relative TTL is rejected in either case so
+        // a slider overshoot does not silently produce a
+        // never-expires invite.
+        let now = Utc::now();
         let expires_at = match (params.expires_at, params.expires_in_minutes) {
             (Some(at), _) => {
-                if at <= Utc::now() {
+                if at <= now {
                     return Err(Error::InvalidInput(
                         "expires_at must be in the future".into(),
                     ));
+                }
+                if at > now + Duration::minutes(MAX_INVITE_TTL_MINUTES) {
+                    return Err(Error::InvalidInput(format!(
+                        "expires_at must not exceed {MAX_INVITE_TTL_MINUTES} minutes from now"
+                    )));
                 }
                 Some(at)
             }
             (None, Some(minutes)) if minutes > 0 => {
                 let clamped = minutes.min(MAX_INVITE_TTL_MINUTES);
-                Some(Utc::now() + Duration::minutes(clamped))
+                Some(now + Duration::minutes(clamped))
             }
             (None, Some(_)) => {
                 return Err(Error::InvalidInput(
@@ -198,14 +238,13 @@ impl InviteService {
         // exactly the lifetime of this response. Role and max_uses
         // live in `detail` so the history view can render a chip
         // without a second lookup.
-        let token_prefix = invite.token_sha256.chars().take(8).collect::<String>();
         self.audit
             .record(
                 AuditEvent::new(AuditEventType::InviteMinted)
                     .with_actor(owner.id, owner.name.clone())
                     .with_session(session_id.to_string())
                     .with_detail(serde_json::json!({
-                        "token_prefix": token_prefix,
+                        "token_prefix": invite.token_prefix(),
                         "role": invite.role.as_str(),
                         "max_uses": invite.max_uses,
                         "expires_at": invite.expires_at,
@@ -226,15 +265,26 @@ impl InviteService {
     /// caller is already authenticated and is added under their
     /// existing identity (or, if they're already a member, the
     /// redeem is a no-op that does not consume a use). When it's
-    /// `None`, a throwaway scoped guest is minted *after* the invite
-    /// is successfully consumed so a rejected token never leaves an
-    /// orphan user behind.
+    /// `None`, a throwaway scoped guest is minted as part of the
+    /// same storage transaction so a rejected redeem never leaks a
+    /// guest user row.
+    ///
+    /// As of v0.1.2 the actual write step (`consume invite` →
+    /// `create guest` → `upsert participant`) runs through a single
+    /// [`Storage::redeem_invite`] transaction. That closes two v0.1.1
+    /// bugs: (1) the session-active TOCTOU window between the
+    /// service-layer pre-check and the participant upsert, and
+    /// (2) the partial-failure path where a transient error
+    /// between steps left `used_count` drained with no membership.
     pub async fn redeem(&self, existing_user: Option<User>, token: &str) -> Result<RedeemResult> {
-        // Preview the invite without consuming. Lets us run the
-        // scoped-guest check and the closed-session check before we
-        // burn a use — prevents the old bug where a revoked/closed
-        // session silently drained `max_uses` and dropped a ghost
-        // participant.
+        // Preview the invite without consuming. Still needed for
+        // the scoped-guest cross-session check and the existing-
+        // member short-circuit — both of which want to know the
+        // target session id before we commit to a storage tx. The
+        // definitive closed-session gate lives inside
+        // `redeem_invite`'s WHERE clause, so this preview is an
+        // optimization (fail fast on obviously-bad tokens) rather
+        // than the authoritative check.
         let preview = self.storage.find_invite(token).await?;
 
         // Scoped guests can only redeem invites for the session they
@@ -248,9 +298,12 @@ impl InviteService {
             ));
         }
 
-        // Target session must still be alive. 410 Gone (SessionClosed)
-        // is different from 404 (SessionNotFound) — the invite knew
-        // about a real session that has since been retired.
+        // Fast-path closed-session rejection so an obviously-dead
+        // invite doesn't even reach the redeem transaction. The
+        // transaction still re-checks `sessions.status = 'active'`
+        // in its UPDATE guard — that's the TOCTOU-closing gate.
+        // Here we just want the clearer 410 Gone error path on the
+        // common case.
         let session = self
             .sessions
             .get_session_required(&preview.session_id)
@@ -264,75 +317,120 @@ impl InviteService {
         // burn a use. The participant list already carries the role
         // snapshot, so we can return it directly. No audit row — the
         // participant is already recorded in the original join event.
-        if let Some(ref user) = existing_user {
-            let participants = self.sessions.list_participants(&preview.session_id).await?;
-            if let Some(existing) = participants.iter().find(|p| p.user_id == user.id) {
-                return Ok(RedeemResult {
-                    session_id: preview.session_id.clone(),
-                    role: existing.role,
-                    issued_token: None,
-                });
-            }
+        //
+        // The lookup is routed through
+        // `find_active_participant_role`, which does a single
+        // SELECT-JOIN against `participants` and `sessions`. That
+        // replaces the previous two-query sequence
+        // (`get_session_required` + `list_participants`), which had
+        // a narrow but real TOCTOU window — a concurrent
+        // `close_session` committing between the two reads could
+        // cause this branch to return a "you're a member" success
+        // against a session that was already closed. The atomic
+        // query guarantees both predicates resolve against the same
+        // MVCC snapshot. The residual window between this query and
+        // the `Ok(...)` return below is unavoidable without holding
+        // a DB lock across the WS handshake; the WS layer's own
+        // active-session check is the last line of defence for
+        // that micro-gap, and its failure mode is a benign UX error.
+        if let Some(ref user) = existing_user
+            && let Some(existing_role) = self
+                .sessions
+                .find_active_participant_role(&preview.session_id, user.id)
+                .await?
+        {
+            return Ok(RedeemResult {
+                session_id: preview.session_id.clone(),
+                role: existing_role,
+                issued_token: None,
+            });
         }
 
-        // Atomic consume — validates expiry + max_uses + increments
-        // used_count in one transaction.
-        let invite = self.storage.consume_invite(token).await?;
-
-        // Mint-after-consume ordering is load-bearing: it guarantees
-        // that a rejected redeem never leaks a guest user row.
-        let (user_id, actor_name, issued_token, as_guest) = match existing_user {
-            Some(u) => (u.id, u.name, None, false),
+        // Atomic redeem: one storage transaction that consumes the
+        // invite, INSERTs a scoped guest if needed, and upserts the
+        // participant row. The UNIQUE(name) retry loop wraps the
+        // whole transaction — a collision rolls back cleanly, so
+        // `used_count` is untouched and we can safely retry with a
+        // fresh random name.
+        let as_guest = existing_user.is_none();
+        let outcome = match existing_user {
+            Some(ref user) => {
+                self.storage
+                    .redeem_invite(token, RedeemIdentity::Existing(user.id))
+                    .await?
+            }
             None => {
-                let (guest, raw_token) = self.auth.create_guest(&invite.session_id).await?;
-                (guest.id, guest.name, Some(raw_token), true)
+                let mut last_err: Option<Error> = None;
+                let mut outcome = None;
+                for _ in 0..GUEST_NAME_MAX_ATTEMPTS {
+                    let name = random_guest_name();
+                    match self
+                        .storage
+                        .redeem_invite(token, RedeemIdentity::NewGuest { name: &name })
+                        .await
+                    {
+                        Ok(o) => {
+                            outcome = Some(o);
+                            break;
+                        }
+                        Err(e) if is_unique_violation(&e) => {
+                            last_err = Some(e);
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                outcome.ok_or_else(|| {
+                    last_err
+                        .unwrap_or_else(|| Error::Internal("exhausted guest name retries".into()))
+                })?
             }
         };
-
-        self.sessions
-            .upsert_participant(&invite.session_id, user_id, invite.role)
-            .await?;
 
         // Two audit rows: the invite redemption and the participant
         // join that happened because of it. Keeping them separate
         // lets the "who joined this session" timeline stay useful
         // even when filtered down to ParticipantJoined only.
-        let token_prefix = invite.token_sha256.chars().take(8).collect::<String>();
-        self.audit
-            .record(
-                AuditEvent::new(AuditEventType::InviteRedeemed)
-                    .with_actor(user_id, actor_name.clone())
-                    .with_session(invite.session_id.clone())
-                    .with_detail(serde_json::json!({
-                        "token_prefix": token_prefix,
-                        "role": invite.role.as_str(),
-                        "as_guest": as_guest,
-                    })),
-            )
-            .await;
-        self.audit
-            .record(
-                AuditEvent::new(AuditEventType::ParticipantJoined)
-                    .with_actor(user_id, actor_name)
-                    .with_session(invite.session_id.clone())
-                    .with_detail(serde_json::json!({ "role": invite.role.as_str() })),
-            )
-            .await;
+        //
+        // Suppressed entirely on the `was_already_member` storage
+        // short path — that branch fires when a race-losing
+        // concurrent redeem discovered the caller is already in
+        // the session (upstream `find_active_participant_role`
+        // said "no" before the race-winner committed). The
+        // original join already produced its audit rows; emitting
+        // another pair here would double-log the same membership
+        // and silently turn a race-loss into a timeline artifact.
+        let user_id = outcome.user_id;
+        let actor_name = outcome.user_name;
+        let invite = outcome.invite;
+        if !outcome.was_already_member {
+            self.audit
+                .record(
+                    AuditEvent::new(AuditEventType::InviteRedeemed)
+                        .with_actor(user_id, actor_name.clone())
+                        .with_session(invite.session_id.clone())
+                        .with_detail(serde_json::json!({
+                            "token_prefix": invite.token_prefix(),
+                            "role": invite.role.as_str(),
+                            "as_guest": as_guest,
+                        })),
+                )
+                .await;
+            self.audit
+                .record(
+                    AuditEvent::new(AuditEventType::ParticipantJoined)
+                        .with_actor(user_id, actor_name)
+                        .with_session(invite.session_id.clone())
+                        .with_detail(serde_json::json!({ "role": invite.role.as_str() })),
+                )
+                .await;
+        }
 
         Ok(RedeemResult {
             session_id: invite.session_id,
             role: invite.role,
-            issued_token,
+            issued_token: outcome.issued_token,
         })
-    }
-
-    /// Look up an invite by token without consuming it. Thin wrapper
-    /// retained for the HTTP layer's preview flows (e.g. "does this
-    /// link still point at a live session?"). Does NOT check expiry
-    /// / max_uses — prefer [`redeem`] when you actually want to
-    /// enforce them.
-    pub async fn preview(&self, token: &str) -> Result<InviteToken> {
-        self.storage.find_invite(token).await
     }
 
     /// List every invite row owned by `session_id`, sanitized into
@@ -359,31 +457,29 @@ impl InviteService {
     /// Revoke (hard-delete) an invite row. Requires ownership +
     /// that the invite actually belongs to the stated session —
     /// the path parameter `session_id` must match what the invite
-    /// row points at. Mismatch returns `SessionNotFound` so a
+    /// row points at. Mismatch returns `InvalidInput` (→ 400) so a
     /// caller poking at `/api/sessions/X/invites/<token>` cannot
     /// probe for the existence of invites in session Y.
     pub async fn revoke(&self, owner: &User, session_id: &str, token_sha256: &str) -> Result<()> {
         self.sessions.require_owner(owner, session_id).await?;
-        // Find the row first so we can verify it belongs to this
-        // session. `find_invite` uses the raw-token lookup path
-        // which hashes before comparison — here we already have the
-        // SHA-256, so query storage directly by listing and
-        // filtering. A dedicated `find_invite_by_sha256` would be
-        // nicer but the blast radius of scanning a single session's
-        // invites is tiny and avoids a new trait method.
-        let rows = self.storage.list_invites_for_session(session_id).await?;
-        let target = rows
-            .into_iter()
-            .find(|r| r.token_sha256 == token_sha256)
+        // Single indexed PK lookup — direct SHA-256 hit, O(1) even
+        // when a session has hundreds of invites. The alternative
+        // (list-and-filter) parsed every row in the session just to
+        // find one.
+        let target = self
+            .storage
+            .find_invite_by_sha256(token_sha256)
+            .await?
+            .filter(|r| r.session_id == session_id)
             .ok_or_else(|| {
                 Error::InvalidInput(format!(
                     "invite {token_sha256} not found in session {session_id}"
                 ))
             })?;
         let role = target.role;
+        let token_prefix = target.token_prefix().to_string();
         self.storage.revoke_invite(&target.token_sha256).await?;
 
-        let token_prefix = target.token_sha256.chars().take(8).collect::<String>();
         self.audit
             .record(
                 AuditEvent::new(AuditEventType::InviteRevoked)

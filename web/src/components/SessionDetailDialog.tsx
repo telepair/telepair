@@ -28,8 +28,8 @@ import {
   For,
   Show,
 } from 'solid-js';
-import { api } from '../lib/api';
-import type { AuditEvent, Session } from '../lib/protocol';
+import { api, errorMessage } from '../lib/api';
+import { AuditEventType, type AuditEvent, type Session } from '../lib/protocol';
 import { useI18n, type Translator, type TranslationKey } from '../i18n';
 
 interface SessionDetailDialogProps {
@@ -40,29 +40,20 @@ interface SessionDetailDialogProps {
 
 /** Map an audit event-type string to its localised label. Unknown
  *  variants fall through to the raw type so a backend that adds a new
- *  variant doesn't render an empty cell. The list mirrors
- *  `AuditEventType::as_str()` in `crates/telepair-core/src/audit.rs`. */
+ *  variant doesn't render an empty cell. */
+const AUDIT_EVENT_LABEL_KEYS: Record<AuditEventType, TranslationKey> = {
+  [AuditEventType.SESSION_CREATED]: 'session_detail.event_session_created',
+  [AuditEventType.SESSION_CLOSED]: 'session_detail.event_session_closed',
+  [AuditEventType.PARTICIPANT_JOINED]: 'session_detail.event_participant_joined',
+  [AuditEventType.INVITE_MINTED]: 'session_detail.event_invite_minted',
+  [AuditEventType.INVITE_REDEEMED]: 'session_detail.event_invite_redeemed',
+  [AuditEventType.INVITE_REVOKED]: 'session_detail.event_invite_revoked',
+  [AuditEventType.TARGET_ACCESS_DENIED]: 'session_detail.event_target_access_denied',
+  [AuditEventType.TARGET_RELOADED]: 'session_detail.event_target_reloaded',
+};
+
 function eventLabel(t: Translator, type: string): string {
-  const key: TranslationKey | null = (() => {
-    switch (type) {
-      case 'session.created':
-        return 'session_detail.event_session_created';
-      case 'session.closed':
-        return 'session_detail.event_session_closed';
-      case 'participant.joined':
-        return 'session_detail.event_participant_joined';
-      case 'invite.minted':
-        return 'session_detail.event_invite_minted';
-      case 'invite.redeemed':
-        return 'session_detail.event_invite_redeemed';
-      case 'invite.revoked':
-        return 'session_detail.event_invite_revoked';
-      case 'target.access_denied':
-        return 'session_detail.event_target_access_denied';
-      default:
-        return null;
-    }
-  })();
+  const key = AUDIT_EVENT_LABEL_KEYS[type as AuditEventType];
   return key ? t(key) : type;
 }
 
@@ -207,9 +198,7 @@ export default function SessionDetailDialog(props: SessionDetailDialogProps) {
             <Show when={audit.error}>
               <p class="manage-error" data-testid="session-detail-error">
                 {t('session_detail.load_failed', {
-                  msg: audit.error instanceof Error
-                    ? audit.error.message
-                    : String(audit.error),
+                  msg: errorMessage(audit.error),
                 })}
               </p>
             </Show>
@@ -245,7 +234,7 @@ export default function SessionDetailDialog(props: SessionDetailDialogProps) {
                         <Show when={summary}>
                           <div class="timeline-summary">{summary}</div>
                         </Show>
-                        <Show when={row.detail != null && row.detail !== null && id >= 0}>
+                        <Show when={row.detail != null && id >= 0}>
                           <button
                             type="button"
                             class="timeline-detail-toggle"

@@ -1,5 +1,5 @@
 import { createEffect, createSignal, For, Show } from 'solid-js';
-import { api } from '../lib/api';
+import { api, errorMessage } from '../lib/api';
 import type { InviteSummary, Role, InputMode } from '../lib/protocol';
 import { toast } from '../stores/toast';
 import { useI18n, type Translator, type TranslationKey } from '../i18n';
@@ -57,9 +57,19 @@ export default function InviteDialog(props: InviteDialogProps) {
   // accidentally send `expires_in_minutes: undefined` from a
   // half-initialised dialog.
   const [ttlMinutes, setTtlMinutes] = createSignal<number | null>(60);
-  const [inviteUrl, setInviteUrl] = createSignal('');
-  const [inviteExpiresAt, setInviteExpiresAt] = createSignal<string | null>(null);
-  const [inviteMaxUses, setInviteMaxUses] = createSignal<number>(1);
+  // Single "created invite" snapshot — the three fields (url, expiry,
+  // max uses) are always set together by `handleCreate` and always
+  // cleared together by `handleClose`. Collapsing them into one signal
+  // removes the drift risk (an earlier version forgot to reset
+  // `inviteMaxUses` on close, which briefly leaked the previous
+  // invite's usage count into the next result card) and keeps the
+  // "showing the result view" predicate as a single `!== null` check.
+  interface CreatedInvite {
+    url: string;
+    expiresAt: string | null;
+    maxUses: number;
+  }
+  const [createdInvite, setCreatedInvite] = createSignal<CreatedInvite | null>(null);
   const [creating, setCreating] = createSignal(false);
   const [copied, setCopied] = createSignal(false);
   // Management state: the list of existing invites the owner can
@@ -83,8 +93,7 @@ export default function InviteDialog(props: InviteDialogProps) {
       const rows = await api.listInvites(props.sessionId);
       setInvites(rows);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setInvitesError(msg);
+      setInvitesError(errorMessage(e));
     } finally {
       setInvitesLoading(false);
     }
@@ -109,15 +118,16 @@ export default function InviteDialog(props: InviteDialogProps) {
         expiresInMinutes: ttl === null ? undefined : ttl,
       });
       const url = `${location.origin}/join/${invite.token}`;
-      setInviteUrl(url);
-      setInviteExpiresAt(invite.expires_at);
-      setInviteMaxUses(invite.max_uses);
+      setCreatedInvite({
+        url,
+        expiresAt: invite.expires_at,
+        maxUses: invite.max_uses,
+      });
       // Refresh the management list so the newly-minted row appears
       // the moment the owner navigates back from the copy-link view.
       void loadInvites();
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      toast.error(t('invite.failed', { msg }));
+      toast.error(t('invite.failed', { msg: errorMessage(e) }));
     } finally {
       setCreating(false);
     }
@@ -134,8 +144,7 @@ export default function InviteDialog(props: InviteDialogProps) {
       setInvites((rows) => rows.filter((r) => r.token_sha256 !== tokenSha256));
       void loadInvites();
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      toast.error(t('invite.manage_revoke_failed', { msg }));
+      toast.error(t('invite.manage_revoke_failed', { msg: errorMessage(e) }));
       // Fall through to a refresh even on error — a 400 here means
       // the row was already revoked, and the refresh will drop it.
       void loadInvites();
@@ -174,7 +183,7 @@ export default function InviteDialog(props: InviteDialogProps) {
   //   3. If both fail, surface a toast telling the user to copy
   //      manually instead of silently failing.
   const handleCopy = async () => {
-    const url = inviteUrl();
+    const url = createdInvite()?.url;
     if (!url) return;
     // Always select first so the user can manually copy even if
     // every programmatic path fails.
@@ -215,9 +224,17 @@ export default function InviteDialog(props: InviteDialogProps) {
   };
 
   const handleClose = () => {
-    setInviteUrl('');
-    setInviteExpiresAt(null);
+    setCreatedInvite(null);
     setCopied(false);
+    // Two-step revoke is a *transient* confirmation, scoped to the
+    // current open of the dialog. If the owner clicks "Revoke" on a
+    // row and then dismisses the dialog without hitting confirm (ESC,
+    // backdrop click, close button, even navigating away and back),
+    // re-opening the dialog used to show that row still in the
+    // "confirm?" state — as if the revoke was half-applied. Clear
+    // the pending token on close so every fresh open starts from a
+    // clean slate.
+    setPendingRevoke(null);
     props.onClose();
   };
 
@@ -226,14 +243,14 @@ export default function InviteDialog(props: InviteDialogProps) {
       <div class="dialog-backdrop" onClick={handleClose}>
         <div class="dialog" onClick={(e) => e.stopPropagation()}>
           <h3>{t('invite.title')}</h3>
-          <Show when={!inviteUrl()} fallback={
+          <Show when={!createdInvite()} fallback={
             <div class="invite-result">
               <label>{t('invite.link_label')}</label>
               <div class="invite-url-row">
                 <input
                   ref={urlInputRef}
                   type="text"
-                  value={inviteUrl()}
+                  value={createdInvite()!.url}
                   readonly
                   onClick={(e) => e.currentTarget.select()}
                 />
@@ -243,8 +260,11 @@ export default function InviteDialog(props: InviteDialogProps) {
               </div>
               <p class="hint">
                 {t(
-                  inviteMaxUses() === 1 ? 'invite.usable_singular' : 'invite.usable_plural',
-                  { n: String(inviteMaxUses()), when: formatExpiry(t, inviteExpiresAt()) },
+                  createdInvite()!.maxUses === 1 ? 'invite.usable_singular' : 'invite.usable_plural',
+                  {
+                    n: String(createdInvite()!.maxUses),
+                    when: formatExpiry(t, createdInvite()!.expiresAt),
+                  },
                 )}
               </p>
               <p class="hint">{t('invite.share_hint')}</p>

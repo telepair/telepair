@@ -11,8 +11,8 @@ use crate::audit::{AuditEvent, AuditEventType, AuditFilter};
 use crate::error::{Error, Result};
 use crate::permission::Role;
 use crate::session::{
-    CloseReason, InputMode, InviteToken, Participant, Session, SessionListFilter, SessionStatus,
-    User,
+    CloseReason, InputMode, InviteToken, Participant, RedeemIdentity, RedeemOutcome, Session,
+    SessionListFilter, SessionStatus, User,
 };
 use crate::storage::Storage;
 
@@ -553,37 +553,108 @@ impl Storage for SqliteStorage {
             .collect::<Result<Vec<_>>>()
     }
 
+    async fn list_all_sessions(&self, filter: SessionListFilter) -> Result<Vec<Session>> {
+        // Same shape as `list_sessions_for_user` minus the
+        // ownership/participant WHERE — `SessionService` only calls
+        // this after `User::is_admin` is true. Keeping the two
+        // queries as separate SQL strings is deliberate: folding an
+        // `OR ? = 1 /* is_admin */` branch into the user-scoped
+        // query would blur the "did a non-admin accidentally get
+        // admin rows" invariant that code review relies on.
+        //
+        // The SQL is assembled from hardcoded fragments; every `?`
+        // placeholder is bound through sqlx, and no caller-supplied
+        // string ever touches the query text.
+        let mut sql = String::from("SELECT s.* FROM sessions s WHERE 1 = 1");
+        if filter.status.is_some() {
+            sql.push_str(" AND s.status = ?");
+        }
+        if filter.target_name.is_some() {
+            sql.push_str(" AND s.target_name = ?");
+        }
+        sql.push_str(" ORDER BY s.created_at DESC");
+        // Same `LIMIT -1` sentinel as `list_sessions_for_user` so
+        // `offset` without `limit` still parses under SQLite.
+        if filter.limit.is_some() {
+            sql.push_str(" LIMIT ?");
+        } else if filter.offset > 0 {
+            sql.push_str(" LIMIT -1");
+        }
+        if filter.offset > 0 {
+            sql.push_str(" OFFSET ?");
+        }
+
+        let mut q = sqlx::query(&sql);
+        if let Some(status) = filter.status {
+            q = q.bind(status.as_str().to_string());
+        }
+        if let Some(target) = filter.target_name.as_ref() {
+            q = q.bind(target.clone());
+        }
+        if let Some(limit) = filter.limit {
+            q = q.bind(limit);
+        }
+        if filter.offset > 0 {
+            q = q.bind(filter.offset);
+        }
+
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|r| row_to_session(&r))
+            .collect::<Result<Vec<_>>>()
+    }
+
     async fn close_stale_sessions(&self, reason: CloseReason) -> Result<u64> {
         // Boot-time recovery: an unclean shutdown can leave "active"
         // sessions in the DB that no longer map to any running PTY.
         // Close them AND settle their participants in the same tx
         // so `left_at` stays consistent with the sessions row.
+        //
+        // We use `UPDATE … RETURNING id` to capture the exact set of
+        // rows this sweep just closed, then feed those ids into the
+        // participants UPDATE. The older implementation tried to
+        // locate "the sessions we just closed" via
+        // `WHERE status='closed' AND closed_at = ?`, which conflated
+        // "just closed in this sweep" with "historically closed at
+        // the same timestamp string" — any historical row whose
+        // `closed_at` happened to collide with the sweep's `now_str`
+        // would have its participants' `left_at` silently rewritten
+        // to the sweep time, clobbering real history. RETURNING
+        // removes the time-equality heuristic entirely.
         let now_str = now_rfc3339();
         let mut tx = self.pool.begin().await?;
 
-        let result = sqlx::query(
-            "UPDATE sessions SET status = ?, closed_at = ?, closed_reason = ? WHERE status = ?",
+        let closed_ids: Vec<String> = sqlx::query_scalar(
+            "UPDATE sessions SET status = ?, closed_at = ?, closed_reason = ? \
+             WHERE status = ? RETURNING id",
         )
         .bind(SessionStatus::Closed.as_str())
         .bind(&now_str)
         .bind(reason.as_str())
         .bind(SessionStatus::Active.as_str())
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
 
-        sqlx::query(
-            "UPDATE participants SET left_at = ? \
-             WHERE left_at IS NULL AND session_id IN \
-               (SELECT id FROM sessions WHERE status = ? AND closed_at = ?)",
-        )
-        .bind(&now_str)
-        .bind(SessionStatus::Closed.as_str())
-        .bind(&now_str)
-        .execute(&mut *tx)
-        .await?;
+        if !closed_ids.is_empty() {
+            // Bind each id individually — SQLite parameter limits (999
+            // by default) are well above any realistic live-session
+            // count on a single node, so one statement is fine. A
+            // node with enough stale sessions to blow the parameter
+            // limit has bigger problems than this sweep.
+            let placeholders = vec!["?"; closed_ids.len()].join(",");
+            let sql = format!(
+                "UPDATE participants SET left_at = ? \
+                 WHERE left_at IS NULL AND session_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql).bind(&now_str);
+            for id in &closed_ids {
+                q = q.bind(id);
+            }
+            q.execute(&mut *tx).await?;
+        }
 
         tx.commit().await?;
-        Ok(result.rows_affected())
+        Ok(closed_ids.len() as u64)
     }
 
     async fn count_active_sessions_per_target(&self) -> Result<HashMap<String, u32>> {
@@ -647,6 +718,46 @@ impl Storage for SqliteStorage {
         rows.into_iter()
             .map(|r| row_to_participant(&r))
             .collect::<Result<Vec<_>>>()
+    }
+
+    async fn find_active_participant_role(
+        &self,
+        session_id: &str,
+        user_id: Uuid,
+    ) -> Result<Option<Role>> {
+        // Single SELECT-JOIN: both predicates — `p.left_at IS NULL`
+        // and `s.status = 'active'` — are evaluated against the same
+        // MVCC snapshot, so a concurrent `close_session` cannot land
+        // partially visible between them. The two-query version this
+        // replaces (get_session + list_participants) had a narrow but
+        // real TOCTOU window in which a close could commit between
+        // the status read and the participant read. The single-query
+        // shape does not fix the *subsequent* race between this query
+        // and any action the caller takes on the returned value —
+        // callers that need fully-atomic redemption must wrap their
+        // own write in the same transaction (see
+        // `Storage::redeem_invite`).
+        let row = sqlx::query(
+            "SELECT p.role FROM participants p \
+             JOIN sessions s ON s.id = p.session_id \
+             WHERE p.session_id = ? AND p.user_id = ? \
+               AND p.left_at IS NULL AND s.status = 'active'",
+        )
+        .bind(session_id)
+        .bind(user_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => {
+                let role: Role = r
+                    .get::<String, _>("role")
+                    .parse()
+                    .map_err(Error::InvalidInput)?;
+                Ok(Some(role))
+            }
+            None => Ok(None),
+        }
     }
 
     async fn create_invite(
@@ -726,32 +837,237 @@ impl Storage for SqliteStorage {
             .ok_or_else(|| Error::InvalidInput("invalid invite token".into()))
     }
 
-    async fn consume_invite(&self, token: &str) -> Result<InviteToken> {
-        let invite = self.find_invite(token).await?;
+    async fn find_invite_by_sha256(&self, token_sha256: &str) -> Result<Option<InviteToken>> {
+        // Direct PK lookup — the SHA-256 column is the primary key,
+        // so this is an indexed O(1) read regardless of how many
+        // invites a session accumulates.
+        let row = sqlx::query("SELECT * FROM invite_tokens WHERE token_sha256 = ?")
+            .bind(token_sha256)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(row_to_invite).transpose()
+    }
 
-        // Atomic increment with WHERE guard — no separate validity pre-check needed
-        let result = sqlx::query(
-            "UPDATE invite_tokens SET used_count = used_count + 1 \
-             WHERE token_sha256 = ? AND used_count < max_uses \
-             AND (expires_at IS NULL OR expires_at > ?)",
-        )
-        .bind(&invite.token_sha256)
-        .bind(now_rfc3339())
-        .execute(&self.pool)
-        .await?;
+    async fn redeem_invite(
+        &self,
+        token: &str,
+        identity: RedeemIdentity<'_>,
+    ) -> Result<RedeemOutcome> {
+        // One transaction covers: (1) atomic consume that also
+        // requires `sessions.status = 'active'` in the WHERE clause
+        // (closes the TOCTOU window the pre-0.1.2 code had between a
+        // service-layer "session still active?" pre-check and the
+        // participant write), (2) optional guest user INSERT, (3)
+        // participant upsert. Any step can fail and the rolled-back
+        // transaction leaves `used_count` untouched — critical for
+        // the retry story on UNIQUE(name) guest collisions.
+        let sha256_hex = token_sha256(token);
+        let now = Utc::now();
+        let now_str = rfc3339(now);
 
-        if result.rows_affected() == 0 {
-            // Determine why: expired or fully used
+        let mut tx = self.pool.begin().await?;
+
+        // The Existing-identity branch adds a `NOT EXISTS(active
+        // participant for same user)` clause to the UPDATE WHERE.
+        // Without it, two concurrent redeems by the same already-
+        // authenticated caller (e.g. a double-clicked share link)
+        // could each sail past the service-layer pre-check and
+        // each bump `used_count`, even though the participant-row
+        // upsert collapses them into a single membership — leaking
+        // seats on multi-use invites and producing a silent
+        // `used_count / participants` mismatch. The NewGuest
+        // branch cannot race with itself (the guest row does not
+        // exist until this transaction commits) and is left with
+        // the simpler three-predicate guard.
+        let update = match identity {
+            RedeemIdentity::Existing(user_id) => {
+                sqlx::query(
+                    "UPDATE invite_tokens SET used_count = used_count + 1 \
+                     WHERE token_sha256 = ? \
+                       AND used_count < max_uses \
+                       AND (expires_at IS NULL OR expires_at > ?) \
+                       AND EXISTS ( \
+                           SELECT 1 FROM sessions \
+                           WHERE id = invite_tokens.session_id AND status = ? \
+                       ) \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM participants \
+                           WHERE session_id = invite_tokens.session_id \
+                             AND user_id = ? \
+                             AND left_at IS NULL \
+                       )",
+                )
+                .bind(&sha256_hex)
+                .bind(&now_str)
+                .bind(SessionStatus::Active.as_str())
+                .bind(user_id.to_string())
+                .execute(&mut *tx)
+                .await?
+            }
+            RedeemIdentity::NewGuest { .. } => {
+                sqlx::query(
+                    "UPDATE invite_tokens SET used_count = used_count + 1 \
+                     WHERE token_sha256 = ? \
+                       AND used_count < max_uses \
+                       AND (expires_at IS NULL OR expires_at > ?) \
+                       AND EXISTS ( \
+                           SELECT 1 FROM sessions \
+                           WHERE id = invite_tokens.session_id AND status = ? \
+                       )",
+                )
+                .bind(&sha256_hex)
+                .bind(&now_str)
+                .bind(SessionStatus::Active.as_str())
+                .execute(&mut *tx)
+                .await?
+            }
+        };
+
+        if update.rows_affected() == 0 {
+            // Zero-row update means one of the WHERE predicates
+            // failed. Do diagnostic SELECTs (still inside the tx,
+            // so they see the same snapshot) to pick the right
+            // branch. Precedence matches the pre-0.1.2 service-
+            // layer checks: unknown token → 400, session
+            // closed/gone → 410/404, already-member (Existing
+            // only) → idempotent no-op, otherwise expired /
+            // exhausted → 400.
+            let invite_row = sqlx::query("SELECT * FROM invite_tokens WHERE token_sha256 = ?")
+                .bind(&sha256_hex)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let Some(invite_row) = invite_row else {
+                return Err(Error::InvalidInput("invalid invite token".into()));
+            };
+            let invite = row_to_invite(&invite_row)?;
+
+            let session_row = sqlx::query("SELECT status FROM sessions WHERE id = ?")
+                .bind(&invite.session_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            match session_row {
+                None => return Err(Error::SessionNotFound(invite.session_id)),
+                Some(row) => {
+                    let status: String = row.try_get("status")?;
+                    if status != SessionStatus::Active.as_str() {
+                        return Err(Error::SessionClosed(invite.session_id));
+                    }
+                }
+            }
+
+            // Idempotent short path: only reachable via the
+            // Existing-identity branch (the NewGuest UPDATE has no
+            // participants predicate). If the caller is already an
+            // active participant of this session, return a no-op
+            // outcome so the service layer can skip its audit
+            // writes — the original `ParticipantJoined` row is
+            // still the source of truth for "when did they join".
+            // `used_count` is NOT bumped: the returned `invite`
+            // carries the pre-call row as-is.
+            if let RedeemIdentity::Existing(user_id) = identity {
+                let existing = sqlx::query(
+                    "SELECT u.name FROM participants p \
+                     JOIN users u ON u.id = p.user_id \
+                     WHERE p.session_id = ? AND p.user_id = ? AND p.left_at IS NULL",
+                )
+                .bind(&invite.session_id)
+                .bind(user_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some(row) = existing {
+                    let user_name: String = row.try_get("name")?;
+                    tx.commit().await?;
+                    return Ok(RedeemOutcome {
+                        invite,
+                        user_id,
+                        user_name,
+                        issued_token: None,
+                        was_already_member: true,
+                    });
+                }
+            }
+
+            // Session is alive, caller is not already a member —
+            // so the failure must be expiry or exhaustion.
+            // `check_invite_validity` returns the precise message
+            // for each.
             check_invite_validity(&invite)?;
-            // Race condition: another request consumed the last use between our lookup and UPDATE
             return Err(Error::InvalidInput(
                 "invite token has been fully used".into(),
             ));
         }
 
-        Ok(InviteToken {
-            used_count: invite.used_count + 1,
-            ..invite
+        // Re-read the updated invite row to return authoritative
+        // post-consume state (used_count, role, expires_at) without
+        // forcing the caller to track the increment by hand.
+        let invite_row = sqlx::query("SELECT * FROM invite_tokens WHERE token_sha256 = ?")
+            .bind(&sha256_hex)
+            .fetch_one(&mut *tx)
+            .await?;
+        let invite = row_to_invite(&invite_row)?;
+
+        // Resolve the identity. `Existing` paths look up the current
+        // `users.name` so the caller's audit row reflects the truth
+        // in storage even if they passed a stale `User` struct.
+        // `NewGuest` paths INSERT a scoped-session guest — the raw
+        // bearer is surfaced once in `RedeemOutcome.issued_token`.
+        let (user_id, user_name, issued_token) = match identity {
+            RedeemIdentity::Existing(id) => {
+                let row = sqlx::query("SELECT name FROM users WHERE id = ?")
+                    .bind(id.to_string())
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                let name: String = row
+                    .ok_or_else(|| Error::InvalidInput("redeeming user not found".into()))?
+                    .try_get("name")?;
+                (id, name, None)
+            }
+            RedeemIdentity::NewGuest { name } => {
+                let new_id = Uuid::new_v4();
+                let (raw_token, user_sha256) = generate_token();
+                sqlx::query(
+                    "INSERT INTO users \
+                       (id, name, token_sha256, is_admin, scoped_session_id, \
+                        created_at, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(new_id.to_string())
+                .bind(name)
+                .bind(&user_sha256)
+                .bind(false)
+                .bind(&invite.session_id)
+                .bind(&now_str)
+                .bind(&now_str)
+                .execute(&mut *tx)
+                .await?;
+                (new_id, name.to_owned(), Some(raw_token))
+            }
+        };
+
+        // Same upsert semantics as `upsert_participant` — idempotent
+        // on a re-redeem, clears `left_at` if the caller previously
+        // walked out of the session.
+        sqlx::query(
+            "INSERT INTO participants (session_id, user_id, role, joined_at) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT (session_id, user_id) \
+             DO UPDATE SET role = excluded.role, left_at = NULL",
+        )
+        .bind(&invite.session_id)
+        .bind(user_id.to_string())
+        .bind(invite.role.as_str())
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(RedeemOutcome {
+            invite,
+            user_id,
+            user_name,
+            issued_token,
+            was_already_member: false,
         })
     }
 
@@ -850,5 +1166,184 @@ impl Storage for SqliteStorage {
 
         let rows = q.fetch_all(&self.pool).await?;
         rows.iter().map(row_to_audit_event).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::InputMode;
+
+    /// Read the raw `left_at` string for a (session_id, user_id)
+    /// participant row, bypassing the `left_at IS NULL` filter that
+    /// the public `list_participants` API applies. Tests need this to
+    /// assert that a boot-time sweep did NOT overwrite a participant's
+    /// historical `left_at` — the public API hides `left_at` once
+    /// it's set, so it can't distinguish "untouched" from "rewritten
+    /// to a new timestamp".
+    async fn raw_left_at(pool: &Pool<Sqlite>, session_id: &str, user_id: Uuid) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT left_at FROM participants WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(session_id)
+        .bind(user_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Regression: `close_stale_sessions` must not rewrite the
+    /// `left_at` of a participant whose session was already closed
+    /// before the sweep ran. The pre-fix implementation located
+    /// "sessions we just closed" via
+    /// `WHERE status='closed' AND closed_at = ?`, which conflates
+    /// "closed in this sweep" with "historically closed at a
+    /// colliding timestamp string". Under literal string collision
+    /// the buggy version rewrote the historical participant's
+    /// `left_at` to the sweep's `now`; the RETURNING-based fix keys
+    /// the second UPDATE off the exact row ids it just touched, so
+    /// no secondary attribute can misidentify a historical row.
+    ///
+    /// This test cannot force the exact nanosecond collision without
+    /// mocking the wall-clock source, so instead it pins the
+    /// structural invariant directly: after the sweep, the
+    /// historical participant row is bit-for-bit unchanged. Any
+    /// future re-introduction of a time-equality heuristic would
+    /// still be caught by a code-review pass; this test locks down
+    /// the post-sweep data shape under the common path.
+    #[tokio::test]
+    async fn close_stale_sessions_only_touches_just_closed_participants() {
+        let store = SqliteStorage::new_memory().await.unwrap();
+        let (alice, _) = store.create_user("alice", false).await.unwrap();
+
+        // Historical closed session with a deterministic `left_at`
+        // stamp. We overwrite `closed_at` and `left_at` to a fixed
+        // value so the assertion below is exact-string equality, not
+        // a fuzzy "some timestamp near now" check.
+        let s_old = store
+            .create_session_with_owner(alice.id, "shell", InputMode::Serialized)
+            .await
+            .unwrap();
+        store
+            .close_session(&s_old.id, CloseReason::Owner)
+            .await
+            .unwrap();
+        let stamped = "2099-01-01T00:00:00+00:00".to_string();
+        sqlx::query("UPDATE sessions SET closed_at = ? WHERE id = ?")
+            .bind(&stamped)
+            .bind(&s_old.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE participants SET left_at = ? WHERE session_id = ? AND user_id = ?")
+            .bind(&stamped)
+            .bind(&s_old.id)
+            .bind(alice.id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        // New active session that the sweep should actually close.
+        let s_new = store
+            .create_session_with_owner(alice.id, "shell", InputMode::Serialized)
+            .await
+            .unwrap();
+
+        let closed = store
+            .close_stale_sessions(CloseReason::Startup)
+            .await
+            .unwrap();
+        assert_eq!(closed, 1, "only the one active session should be swept");
+
+        // The historical row is untouched: same closed_at, same
+        // left_at, both still the `stamped` string.
+        let after_old_left = raw_left_at(&store.pool, &s_old.id, alice.id).await;
+        assert_eq!(
+            after_old_left.as_deref(),
+            Some(stamped.as_str()),
+            "sweep must not rewrite left_at on sessions it did not itself close"
+        );
+
+        // Sanity: the new session's participant got its `left_at`
+        // stamped by this sweep (proves the second UPDATE still
+        // runs under the RETURNING-driven id set).
+        let after_new_left = raw_left_at(&store.pool, &s_new.id, alice.id).await;
+        assert!(
+            after_new_left.is_some(),
+            "sweep must still settle the participants it did just close"
+        );
+    }
+
+    /// Pins the atomic guarantee of
+    /// [`Storage::find_active_participant_role`]: when the session is
+    /// closed, the lookup returns `None` for a former participant,
+    /// EVEN THOUGH the participant row still exists (the history
+    /// view reads it). Previously the invite-redeem short path
+    /// reassembled the same check out of two independent queries
+    /// (`get_session` + `list_participants`), which could disagree
+    /// across a concurrent close. Routing the short path through
+    /// this method makes the check one statement, so the closed-row
+    /// case cannot leak back as "Some(role)".
+    #[tokio::test]
+    async fn find_active_participant_role_returns_none_for_closed_session() {
+        let store = SqliteStorage::new_memory().await.unwrap();
+        let (alice, _) = store.create_user("alice", false).await.unwrap();
+        let session = store
+            .create_session_with_owner(alice.id, "shell", InputMode::Serialized)
+            .await
+            .unwrap();
+
+        // Sanity: active session returns the owner's role.
+        let active = store
+            .find_active_participant_role(&session.id, alice.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            active,
+            Some(Role::Owner),
+            "active-session owner lookup must return Some(Owner)"
+        );
+
+        // Close the session — this flips `status` to 'closed' and
+        // stamps `left_at` on every participant in one transaction.
+        store
+            .close_session(&session.id, CloseReason::Owner)
+            .await
+            .unwrap();
+
+        // After close, the same lookup must return None. Either
+        // predicate (`left_at IS NULL` or `s.status = 'active'`)
+        // alone is enough to filter it out; the test runs through
+        // the JOIN so both arms are exercised.
+        let after = store
+            .find_active_participant_role(&session.id, alice.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            after, None,
+            "closed-session participant lookup must return None"
+        );
+    }
+
+    /// Companion case: a stranger must never see `Some(role)` for a
+    /// session they never joined, regardless of status. Locks down
+    /// the "user_id = ?" predicate so a future refactor that drops
+    /// it (e.g. collapsing to `WHERE session_id = ?`) would be
+    /// caught.
+    #[tokio::test]
+    async fn find_active_participant_role_returns_none_for_non_member() {
+        let store = SqliteStorage::new_memory().await.unwrap();
+        let (alice, _) = store.create_user("alice", false).await.unwrap();
+        let (bob, _) = store.create_user("bob", false).await.unwrap();
+        let session = store
+            .create_session_with_owner(alice.id, "shell", InputMode::Serialized)
+            .await
+            .unwrap();
+
+        let got = store
+            .find_active_participant_role(&session.id, bob.id)
+            .await
+            .unwrap();
+        assert_eq!(got, None, "non-member lookup must return None");
     }
 }

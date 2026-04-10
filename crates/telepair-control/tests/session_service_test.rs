@@ -203,3 +203,152 @@ async fn list_sessions_for_user_target_filter_narrows_results() {
     assert_eq!(shell_only.len(), 1);
     assert_eq!(shell_only[0].id, shell.id);
 }
+
+#[tokio::test]
+async fn list_sessions_visible_to_admin_sees_every_session() {
+    // The Dashboard Sessions tab and the admin targets deep-link
+    // both need admins to see every session in the system, not just
+    // the ones the admin happens to own or have joined. Without
+    // this, the "N active sessions" count on the admin targets card
+    // and the list shown after the deep-link would silently diverge
+    // — an operator could click a card showing "5 active" and see
+    // an empty list because none of those sessions belonged to them.
+    let (svc, store, auth) = setup().await;
+    let alice = seed_user(&store, &auth, "alice").await;
+    let bob = seed_user(&store, &auth, "bob").await;
+    let (_, admin_token) = store.create_user("root", true).await.unwrap();
+    let admin = auth.validate(&admin_token).await.unwrap();
+
+    // Alice owns two sessions; Bob owns one. The admin owns nothing.
+    svc.create_session(&alice, "shell", InputMode::Serialized)
+        .await
+        .unwrap();
+    svc.create_session(&alice, "shell", InputMode::Serialized)
+        .await
+        .unwrap();
+    svc.create_session(&bob, "shell", InputMode::Serialized)
+        .await
+        .unwrap();
+
+    // Admin visibility: all three rows, regardless of ownership.
+    let admin_view = svc
+        .list_sessions_visible_to(&admin, SessionListFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        admin_view.len(),
+        3,
+        "admins must see every session in the system"
+    );
+
+    // Non-admin visibility: only the rows they actually own or
+    // participate in. Alice sees her two, Bob sees his one.
+    let alice_view = svc
+        .list_sessions_visible_to(&alice, SessionListFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(alice_view.len(), 2);
+    assert!(alice_view.iter().all(|s| s.owner_id == alice.id));
+
+    let bob_view = svc
+        .list_sessions_visible_to(&bob, SessionListFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(bob_view.len(), 1);
+    assert_eq!(bob_view[0].owner_id, bob.id);
+}
+
+#[tokio::test]
+async fn list_sessions_visible_to_admin_honours_filter() {
+    // The filter (target_name / status / limit) must still apply
+    // under the admin branch — admin privilege widens the visible
+    // set but does not disable query predicates.
+    let (svc, store, auth) = setup().await;
+    let alice = seed_user(&store, &auth, "alice").await;
+    let (_, admin_token) = store.create_user("root", true).await.unwrap();
+    let admin = auth.validate(&admin_token).await.unwrap();
+
+    svc.create_session(&alice, "shell", InputMode::Serialized)
+        .await
+        .unwrap();
+    svc.create_session(&alice, "other", InputMode::Serialized)
+        .await
+        .unwrap();
+
+    let shell_only = svc
+        .list_sessions_visible_to(
+            &admin,
+            SessionListFilter {
+                target_name: Some("shell".into()),
+                ..SessionListFilter::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(shell_only.len(), 1);
+    assert_eq!(shell_only[0].target_name, "shell");
+}
+
+#[tokio::test]
+async fn close_session_as_owner_happy_path_marks_session_closed() {
+    // The HTTP `DELETE /api/sessions/:id` handler used to inline a
+    // `get_session + owner check + close_session` triple, which made
+    // it possible for a future contributor to add a code path that
+    // bypassed the owner check (or stamped a different CloseReason).
+    // The wrapper consolidates the rule. Verify the happy path:
+    // owner → session.status flips to Closed with reason Owner.
+    let (svc, store, auth) = setup().await;
+    let owner = seed_user(&store, &auth, "owner").await;
+    let session = svc
+        .create_session(&owner, "shell", InputMode::Serialized)
+        .await
+        .unwrap();
+
+    svc.close_session_as_owner(&owner, &session.id)
+        .await
+        .unwrap();
+
+    let after = svc.get_session_required(&session.id).await.unwrap();
+    assert_eq!(after.status, SessionStatus::Closed);
+    assert_eq!(after.closed_reason, Some(CloseReason::Owner));
+}
+
+#[tokio::test]
+async fn close_session_as_owner_rejects_non_owner_and_missing() {
+    // Both error variants must round-trip to the same HTTP statuses
+    // the inline check produced (404 / 403). The gateway lifts these
+    // through `Error::http_status` and the assertions below pin
+    // *that* mapping by matching the variants directly — that way a
+    // future change to `http_status()` cannot silently turn the 403
+    // into a generic 500.
+    let (svc, store, auth) = setup().await;
+    let owner = seed_user(&store, &auth, "owner").await;
+    let stranger = seed_user(&store, &auth, "stranger").await;
+    let session = svc
+        .create_session(&owner, "shell", InputMode::Serialized)
+        .await
+        .unwrap();
+
+    // Wrong user → PermissionDenied → 403, and the session must NOT
+    // have been closed as a side effect.
+    let err = svc
+        .close_session_as_owner(&stranger, &session.id)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        telepair_core::error::Error::PermissionDenied(_)
+    ));
+    let still_alive = svc.get_session_required(&session.id).await.unwrap();
+    assert_eq!(still_alive.status, SessionStatus::Active);
+
+    // Nonexistent session → SessionNotFound → 404.
+    let err = svc
+        .close_session_as_owner(&owner, "no-such-session")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        telepair_core::error::Error::SessionNotFound(_)
+    ));
+}

@@ -116,6 +116,34 @@ impl SessionService {
         Ok(())
     }
 
+    /// Owner-initiated close, atomic with the ownership check. The
+    /// HTTP `DELETE /api/sessions/:id` handler used to inline the
+    /// "fetch session, compare owner_id, then close" sequence — which
+    /// duplicated the policy already encoded in [`Self::require_owner`]
+    /// and silently drifted the moment any other call site needed the
+    /// same shape. Routing the handler through this wrapper means
+    /// "who can close a session" lives in exactly one place; if the
+    /// rule ever widens (e.g. admins can yank other users' sessions)
+    /// the change happens here, not scattered across the gateway.
+    ///
+    /// Always uses `CloseReason::Owner` and passes the actor through
+    /// to the audit emit so the timeline reads "alice ended session
+    /// X" instead of an actorless `session.closed`. Reaper / startup
+    /// callers stay on the bare [`Self::close_session`] entry point
+    /// because they have no actor and stamp their own reason.
+    pub async fn close_session_as_owner(&self, user: &User, session_id: &str) -> Result<()> {
+        // `require_owner` already returns the right error variants:
+        // missing → SessionNotFound (404), wrong owner → PermissionDenied
+        // (403). We discard the returned `Session` because the inner
+        // `close_session` re-fetches it for the audit `duration_s`
+        // calculation; doing one extra read costs nothing meaningful
+        // on a path that fires once per session lifetime, and avoids
+        // a parallel mutable-borrow detour through the storage layer.
+        self.require_owner(user, session_id).await?;
+        self.close_session(session_id, CloseReason::Owner, Some(user))
+            .await
+    }
+
     /// Bulk-close every still-active session, used by the boot-time
     /// startup cleanup. Always passes through as `CloseReason::Startup`
     /// at the CLI call site; exposed on the service so test fixtures
@@ -145,6 +173,12 @@ impl SessionService {
     /// active or closed, newest first — the shape the Dashboard
     /// Sessions tab wants. Callers that specifically need "what am
     /// I in right now" should pass [`SessionListFilter::active_only`].
+    ///
+    /// This is the **user-scoped** variant; it never returns rows
+    /// the user did not own or participate in. For the admin-scoped
+    /// "see every session in the system" view, route through
+    /// [`Self::list_sessions_visible_to`] so the admin branch is
+    /// picked based on `User::is_admin`.
     pub async fn list_sessions_for_user(
         &self,
         user_id: Uuid,
@@ -153,11 +187,51 @@ impl SessionService {
         self.storage.list_sessions_for_user(user_id, filter).await
     }
 
-    /// Count how many currently-active sessions exist per target
-    /// name. Backs the admin targets page ("N active sessions on
-    /// this target" deep link) without forcing the HTTP handler to
-    /// reach into raw storage — that path is reserved for
-    /// bootstrap and test fixtures only. Targets with zero rows
+    /// List sessions visible to `user`, dispatching on admin status:
+    ///
+    /// - `user.is_admin == true` → every session in the system,
+    ///   filtered only by `filter`. This is what backs the admin
+    ///   targets deep-link ("N active sessions on target X") and
+    ///   the Dashboard Sessions tab for admins, so the count shown
+    ///   on the admin card and the list shown after the deep-link
+    ///   always match.
+    /// - `user.is_admin == false` → the user-scoped variant, i.e.
+    ///   only rows they owned or participated in.
+    ///
+    /// Guest/scoped tokens are still non-admin by construction
+    /// (see `User::is_guest`), so a guest calling this method sees
+    /// only their own session. The gateway continues to enforce
+    /// `require_unscoped` separately on handlers that must reject
+    /// guests entirely; this method is safe to expose to everyone.
+    pub async fn list_sessions_visible_to(
+        &self,
+        user: &User,
+        filter: SessionListFilter,
+    ) -> Result<Vec<Session>> {
+        if user.is_admin {
+            self.storage.list_all_sessions(filter).await
+        } else {
+            self.storage.list_sessions_for_user(user.id, filter).await
+        }
+    }
+
+    /// Count how many sessions are marked `status='active'` in the
+    /// DB, grouped by `target_name`. Backs the admin targets page
+    /// ("N active sessions on this target" deep link) because the
+    /// deep link opens the sessions-list view, which also reads
+    /// from the DB — so the display count must match what the
+    /// linked list will show.
+    ///
+    /// **Do not use this for safety-gating reloads or anything
+    /// else that must answer "is there a live PTY right now".**
+    /// The DB row can briefly remain `active` after its PTY has
+    /// exited (reaper hasn't run yet, or the cleanup branch of the
+    /// PTY loop hasn't landed its close) and the hot-reload guard
+    /// used to trip on that window. For the "live shell exists"
+    /// question, walk the hub via
+    /// `SessionHub::count_live_sessions_per_target` instead —
+    /// defined in the gateway crate, so this control-layer method
+    /// can't name it as an intra-doc link. Targets with zero rows
     /// are omitted from the map; callers look up absent targets
     /// as zero.
     pub async fn active_session_counts_per_target(
@@ -218,6 +292,28 @@ impl SessionService {
 
     pub async fn list_participants(&self, session_id: &str) -> Result<Vec<Participant>> {
         self.storage.list_participants(session_id).await
+    }
+
+    /// Atomic "is this user currently a participant of an active
+    /// session" lookup. Returns `Some(role)` iff the user has an
+    /// active (non-`left_at`) participant row AND the session is
+    /// still `Active`, both as-of the same DB snapshot. Backs the
+    /// invite-redeem existing-member short path so that branch is
+    /// free of the TOCTOU race the two-query version had.
+    ///
+    /// See [`Storage::find_active_participant_role`] for the exact
+    /// guarantee and its boundary (it does not prevent a concurrent
+    /// close from landing *after* the query; callers that need
+    /// fully-atomic redemption must wrap their write in a single
+    /// transaction, as `Storage::redeem_invite` already does).
+    pub async fn find_active_participant_role(
+        &self,
+        session_id: &str,
+        user_id: Uuid,
+    ) -> Result<Option<Role>> {
+        self.storage
+            .find_active_participant_role(session_id, user_id)
+            .await
     }
 
     /// Register (or reuse) a participant row for `user_id` in the given
