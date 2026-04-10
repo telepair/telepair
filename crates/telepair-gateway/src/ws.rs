@@ -15,7 +15,7 @@ use telepair_core::permission::Role;
 use telepair_core::protocol::{
     ClientMessage, ServerMessage, close_code_for, error_codes, input_denied,
 };
-use telepair_core::session::InputMode;
+use telepair_core::session::{CloseReason, InputMode};
 
 use crate::session_hub::{PtyCommand, SessionAttachment};
 use crate::state::AppState;
@@ -47,9 +47,18 @@ pub async fn ws_handler(
 
 /// Close a session row whose WS-phase launch failed so it doesn't
 /// linger as "active" on the owner's dashboard with no hub entry for
-/// the idle reaper to find.
+/// the idle reaper to find. The history chip reads "Error" because
+/// this path is exclusively about "launch broke mid-handshake" —
+/// nothing the owner did.
 async fn cleanup_orphan_session(state: &AppState, session_id: &str) {
-    if let Err(err) = state.sessions.close_session(session_id).await {
+    // No actor: the close is server-initiated after a mid-handshake
+    // launch failure, not something the owner asked for. Audit will
+    // render it as "reason=error, actor=none".
+    if let Err(err) = state
+        .sessions
+        .close_session(session_id, CloseReason::Error, None)
+        .await
+    {
         tracing::error!(
             session = %session_id,
             error = %err,
@@ -226,7 +235,9 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         .unwrap_or_else(|| if is_owner { Role::Owner } else { Role::Viewer });
 
     let hub = &state.hub;
-    let (cmd, args, env) = match state.targets.resolve(&session.target_name) {
+    // `load()` is wait-free; `resolve` returns owned strings so the
+    // guard drops before we hand the tuple to `start_or_join`.
+    let (cmd, args, env) = match state.targets.load().resolve(&session.target_name) {
         Some(resolved) => resolved,
         None => {
             cleanup_orphan_session(&state, &session_id).await;

@@ -121,12 +121,12 @@ async function main() {
 
     // ── Create invite tokens via REST ───────────────────────────────────────────
     const operatorInvite = await apiPost<{ token: string }>(
-      `/sessions/${sessionId}/invite`,
+      `/sessions/${sessionId}/invites`,
       { role: 'operator', max_uses: 1 },
       adminToken,
     );
     const viewerInvite = await apiPost<{ token: string }>(
-      `/sessions/${sessionId}/invite`,
+      `/sessions/${sessionId}/invites`,
       { role: 'viewer', max_uses: 1 },
       adminToken,
     );

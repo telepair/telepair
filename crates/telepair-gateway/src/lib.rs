@@ -108,6 +108,7 @@ pub fn build_router_with_options(
 
     let api = Router::new()
         .route("/api/health", get(http::health))
+        .route("/api/auth/whoami", get(http::whoami))
         .route("/api/targets", get(http::list_targets))
         .route(
             "/api/sessions",
@@ -115,10 +116,26 @@ pub fn build_router_with_options(
         )
         .route("/api/sessions/{session_id}", delete(http::close_session))
         .route(
-            "/api/sessions/{session_id}/invite",
-            post(http::create_invite),
+            "/api/sessions/{session_id}/audit",
+            get(http::list_session_audit),
+        )
+        .route(
+            "/api/sessions/{session_id}/invites",
+            post(http::create_invite).get(http::list_session_invites),
+        )
+        .route(
+            "/api/sessions/{session_id}/invites/{token_sha256}",
+            delete(http::revoke_session_invite),
         )
         .route("/api/invite/redeem", post(http::redeem_invite))
+        // Admin-only target management. Both handlers gate on
+        // `is_admin` after `extract_user`, so unauthenticated callers
+        // still get 401 from the shared extractor and non-admin
+        // callers get 403. Kept under `/api/admin/*` so reverse
+        // proxies that want to isolate admin traffic can match on
+        // the prefix.
+        .route("/api/admin/targets", get(http::list_admin_targets))
+        .route("/api/admin/targets/reload", post(http::reload_targets))
         .route("/ws/session/{session_id}", get(ws::ws_handler))
         .layer(cors)
         .with_state(state);

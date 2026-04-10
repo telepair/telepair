@@ -13,6 +13,7 @@ use telepair_control::session_service::SessionService;
 use telepair_core::error::Result;
 use telepair_core::permission::Role;
 use telepair_core::protocol::{ParticipantInfo, ServerMessage};
+use telepair_core::session::CloseReason;
 
 /// Color palette for participant cursors / identifiers.
 const COLORS: &[&str] = &[
@@ -303,7 +304,18 @@ impl SessionHub {
             // etc.) and drop the "already closed" case to debug so it
             // stays out of production dashboards.
             sessions_arc.write().await.remove(&session_id_owned);
-            match session_service_clone.close_session(&session_id_owned).await {
+            // PTY-loop cleanup is the belt-and-suspenders close path:
+            // the HTTP handler or the reaper usually reaches the row
+            // first (carrying `Owner` or `Reaper`) and this call then
+            // no-ops on `SessionNotFound`. When it DOES get there
+            // first (e.g. the PTY exited on its own), `Reaper` is the
+            // closest fit — the session went idle and a sweeper
+            // reclaimed it. Adding a dedicated variant would double
+            // the UI chip count without new signal.
+            match session_service_clone
+                .close_session(&session_id_owned, CloseReason::Reaper, None)
+                .await
+            {
                 Ok(()) => {}
                 Err(telepair_core::error::Error::SessionNotFound(_)) => {
                     tracing::debug!(
@@ -580,7 +592,10 @@ impl SessionHub {
                     // enough (the second call returns SessionNotFound
                     // because the row is already closed), and we'd
                     // rather double-log than leak an open row.
-                    if let Err(e) = session_service.close_session(&id).await {
+                    if let Err(e) = session_service
+                        .close_session(&id, CloseReason::Reaper, None)
+                        .await
+                    {
                         tracing::debug!(session = %id, "reaper close_session: {e}");
                     }
                 }

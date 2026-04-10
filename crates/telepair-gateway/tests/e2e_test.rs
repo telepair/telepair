@@ -9,7 +9,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use telepair_core::permission::Role;
 use telepair_core::protocol::ServerMessage;
-use telepair_core::session::{InputMode, SessionStatus};
+use telepair_core::session::{CloseReason, InputMode, SessionStatus};
 use telepair_core::storage::Storage;
 use telepair_gateway::session_hub::ReaperConfig;
 use telepair_gateway::state::AppState;
@@ -511,7 +511,11 @@ async fn e2e_session_close_disconnects_all() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Close the session (same path as DELETE /api/sessions/{id})
-    state.sessions.close_session(&session_id).await.unwrap();
+    state
+        .sessions
+        .close_session(&session_id, CloseReason::Owner, None)
+        .await
+        .unwrap();
     state.hub.stop_session(&session_id).await;
 
     // Both connections should close
@@ -900,7 +904,11 @@ async fn e2e_close_session_settles_all_participants() {
 
     // Close the session via the same storage path DELETE /api/sessions
     // and the reaper both use.
-    state.storage.close_session(&session_id).await.unwrap();
+    state
+        .storage
+        .close_session(&session_id, CloseReason::Owner)
+        .await
+        .unwrap();
 
     // After close, list_participants (which filters on left_at IS NULL)
     // should return zero rows for this session. left_at was written

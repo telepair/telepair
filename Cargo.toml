@@ -67,6 +67,13 @@ futures = "0.3"
 # Zero-copy byte buffers (shared with axum/hyper via same version)
 bytes = "1"
 
+# Lock-free Arc swap — backs the hot-reload target engine so admin
+# POST /api/admin/targets/reload can atomically replace the loaded
+# targets without blocking concurrent readers. `load()` is wait-free
+# and returns a guard that derefs to the inner Arc, so session-create
+# and WS handshake paths take no lock on the happy path.
+arc-swap = "1"
+
 # Testing
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.26"

@@ -1,12 +1,30 @@
 // web/src/stores/session.ts
 import { createSignal } from 'solid-js';
-import { api, ApiError } from '../lib/api';
+import { api, ApiError, type ListSessionsOptions } from '../lib/api';
 import { auth } from './auth';
-import type { TargetInfo, Session, InputMode } from '../lib/protocol';
+import type { TargetInfo, Session, InputMode, SessionStatus } from '../lib/protocol';
+
+/** Tab value for the Dashboard sessions section. 'all' is distinct
+ *  from 'undefined' because the UI has an explicit "All" chip — we
+ *  want to serialize it to the backend as "no status filter", which
+ *  `api.listSessions` already handles. */
+export type SessionsFilter = SessionStatus | 'all';
 
 const [targets, setTargets] = createSignal<TargetInfo[]>([]);
 const [sessions, setSessions] = createSignal<Session[]>([]);
 const [loading, setLoading] = createSignal(false);
+// The filter the last refresh ran with. Exposed so the Dashboard can
+// reflect the active tab without threading it through component props
+// — switching tabs calls `fetchSessions(nextFilter)` and the tab
+// highlight follows this signal.
+const [currentFilter, setCurrentFilter] = createSignal<SessionsFilter>('active');
+// Optional target-name filter applied on top of the status filter.
+// Empty string = no target filter. Populated by the Dashboard when
+// the URL carries `?target=<name>` — typically a deep link from the
+// admin targets page clicking "N active sessions" on a target card.
+// Kept as its own signal (not folded into `currentFilter`) so the tab
+// row and the target chip can render independently.
+const [currentTargetFilter, setCurrentTargetFilter] = createSignal('');
 
 async function fetchTargets() {
   setLoading(true);
@@ -44,18 +62,47 @@ async function fetchTargets() {
   }
 }
 
-async function fetchSessions() {
+async function fetchSessions(
+  filter: SessionsFilter = currentFilter(),
+  targetName: string = currentTargetFilter(),
+) {
+  setCurrentFilter(filter);
+  setCurrentTargetFilter(targetName);
+  const opts: ListSessionsOptions =
+    filter === 'all' ? { status: 'all' } : { status: filter };
+  if (targetName) {
+    opts.targetName = targetName;
+  }
   try {
-    const data = await api.listSessions();
+    const data = await api.listSessions(opts);
     setSessions(data);
   } catch {
-    // ignore — dashboard still usable without sessions list
+    // On failure, drop any rows from the previous filter. Leaving
+    // them in place would render (say) active rows under the Closed
+    // tab because the Closed fetch 500'd mid-switch — an empty list
+    // is strictly better than showing the wrong bucket.
+    setSessions([]);
   }
+}
+
+/**
+ * Clear the target-name filter and refetch the current status tab.
+ * Used by the Dashboard's "Clear filter" chip — without this, the
+ * user would have to navigate to `/` with no search params to drop
+ * the filter, which is a non-obvious interaction.
+ */
+async function clearTargetFilter() {
+  await fetchSessions(currentFilter(), '');
 }
 
 async function createSession(targetName: string, inputMode?: InputMode): Promise<Session> {
   const session = await api.createSession(targetName, inputMode);
-  setSessions((prev) => [...prev, session]);
+  // Only surface newly-created sessions on tabs that would show them
+  // — inserting them into the list while the user is viewing "Closed"
+  // makes the freshly-minted row pop onto the wrong tab for a blink.
+  if (currentFilter() !== 'closed') {
+    setSessions((prev) => [...prev, session]);
+  }
   return session;
 }
 
@@ -67,8 +114,11 @@ export const sessionStore = {
   targets,
   sessions,
   loading,
+  currentFilter,
+  currentTargetFilter,
   fetchTargets,
   fetchSessions,
+  clearTargetFilter,
   createSession,
   refresh,
 };

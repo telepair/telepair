@@ -21,6 +21,7 @@ futures = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 bytes = { workspace = true }
+arc-swap = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }

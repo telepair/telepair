@@ -2,6 +2,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use telepair_core::permission::Role;
+use telepair_core::session::CloseReason;
 use telepair_core::storage::Storage;
 use telepair_gateway::build_router;
 use telepair_gateway::state::AppState;
@@ -41,7 +42,7 @@ async fn mint_invite(app: &axum::Router, owner_token: &str, session_id: &str) ->
     let resp = app
         .clone()
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Authorization", format!("Bearer {owner_token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"role":"viewer","max_uses":1}"#))
@@ -93,7 +94,7 @@ async fn create_and_redeem_invite() {
     let resp = app
         .clone()
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Authorization", format!("Bearer {owner_token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"role":"operator","max_uses":3}"#))
@@ -146,7 +147,7 @@ async fn create_invite_still_requires_auth() {
     let resp = app
         .clone()
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"role":"viewer"}"#))
                 .unwrap(),
@@ -191,7 +192,7 @@ async fn redeem_without_auth_issues_guest_token() {
     let resp = app
         .clone()
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Authorization", format!("Bearer {owner_token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"role":"operator","max_uses":1}"#))
@@ -266,7 +267,7 @@ async fn redeem_with_auth_reuses_existing_user() {
     let resp = app
         .clone()
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Authorization", format!("Bearer {owner_token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"role":"viewer","max_uses":1}"#))
@@ -321,7 +322,7 @@ async fn redeem_by_owner_does_not_burn_invite_uses() {
     let resp = app
         .clone()
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Authorization", format!("Bearer {owner_token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"role":"operator","max_uses":1}"#))
@@ -400,7 +401,7 @@ async fn redeem_by_existing_participant_does_not_burn_invite_uses() {
     let resp = app
         .clone()
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Authorization", format!("Bearer {owner_token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"role":"operator","max_uses":2}"#))
@@ -490,7 +491,7 @@ async fn guest_token_cannot_list_targets() {
     let resp = app
         .clone()
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Authorization", format!("Bearer {owner_token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"role":"viewer","max_uses":1}"#))
@@ -554,7 +555,7 @@ async fn guest_token_cannot_create_session() {
     let resp = app
         .clone()
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Authorization", format!("Bearer {owner_token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"role":"operator","max_uses":1}"#))
@@ -615,7 +616,7 @@ async fn guest_token_is_scoped_to_redeemed_session() {
     let resp = app
         .clone()
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Authorization", format!("Bearer {owner_token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"role":"viewer","max_uses":1}"#))
@@ -711,7 +712,7 @@ async fn redeem_issues_distinct_guest_per_redemption() {
     let resp = app
         .clone()
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Authorization", format!("Bearer {owner_token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"role":"viewer","max_uses":3}"#))
@@ -800,7 +801,7 @@ async fn create_invite_with_expires_in_minutes_populates_expires_at() {
     let resp = app
         .clone()
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Authorization", format!("Bearer {owner_token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(
@@ -849,7 +850,7 @@ async fn create_invite_rejects_absolute_expires_at_in_the_past() {
 
     let resp = app
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Authorization", format!("Bearer {owner_token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(body))
@@ -871,7 +872,7 @@ async fn create_invite_rejects_excessive_max_uses() {
 
     let resp = app
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Authorization", format!("Bearer {owner_token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"role":"viewer","max_uses":10000}"#))
@@ -893,7 +894,7 @@ async fn create_invite_rejects_zero_max_uses_with_400() {
 
     let resp = app
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Authorization", format!("Bearer {owner_token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"role":"viewer","max_uses":0}"#))
@@ -1000,7 +1001,7 @@ async fn redeem_exhausted_invite_rejected() {
     let resp = app
         .clone()
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Authorization", format!("Bearer {owner_token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"role":"operator","max_uses":1}"#))
@@ -1073,7 +1074,7 @@ async fn redeem_invite_on_closed_session_rejected() {
     let resp = app
         .clone()
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Authorization", format!("Bearer {owner_token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"role":"operator","max_uses":5}"#))
@@ -1087,7 +1088,11 @@ async fn redeem_invite_on_closed_session_rejected() {
     let raw_token = invite_body["token"].as_str().unwrap().to_owned();
 
     // Close the session out-of-band (same path DELETE /api/sessions/:id uses).
-    state.sessions.close_session(&session_id).await.unwrap();
+    state
+        .sessions
+        .close_session(&session_id, CloseReason::Owner, None)
+        .await
+        .unwrap();
 
     // Try to redeem — should be rejected with 410 Gone.
     let joiner_token = state.create_test_user("joiner_after_close").await;
@@ -1141,12 +1146,16 @@ async fn create_invite_on_closed_session_returns_gone() {
 
     // Close the session out-of-band so the next request hits a
     // genuinely closed row, same path the DELETE handler uses.
-    state.sessions.close_session(&session_id).await.unwrap();
+    state
+        .sessions
+        .close_session(&session_id, CloseReason::Owner, None)
+        .await
+        .unwrap();
 
     let resp = app
         .clone()
         .oneshot(
-            Request::post(format!("/api/sessions/{session_id}/invite"))
+            Request::post(format!("/api/sessions/{session_id}/invites"))
                 .header("Authorization", format!("Bearer {owner_token}"))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"role":"viewer","max_uses":1}"#))
@@ -1175,4 +1184,275 @@ async fn create_invite_on_closed_session_returns_gone() {
             "rejected create_invite must not return a token field, got: {body}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Invite management — GET list + DELETE revoke
+// ---------------------------------------------------------------------------
+
+/// Happy path for the management dialog: mint three invites, list
+/// them, assert all three come back with the owner-only fields the UI
+/// needs (token_prefix, remaining_uses, role, session_id).
+#[tokio::test]
+async fn list_session_invites_returns_all_invites() {
+    let (_, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    // Mint three invites with different roles so ordering is observable.
+    let _a = mint_invite(&app, &owner_token, &session_id).await;
+    let _b = mint_invite(&app, &owner_token, &session_id).await;
+    let _c = mint_invite(&app, &owner_token, &session_id).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/sessions/{session_id}/invites"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(rows.len(), 3, "all three invites must list");
+
+    // Each row must carry the UI-facing fields and MUST NOT leak the
+    // raw bearer token.
+    for row in &rows {
+        assert!(row["token_sha256"].is_string());
+        assert_eq!(
+            row["token_prefix"].as_str().unwrap().len(),
+            8,
+            "token_prefix is 8 chars of the sha for a stable UI label"
+        );
+        assert_eq!(row["session_id"], session_id);
+        assert!(row["max_uses"].is_number());
+        assert!(row["used_count"].is_number());
+        assert!(row["remaining_uses"].is_number());
+        assert!(
+            row.get("token").is_none(),
+            "raw token MUST NOT appear in list response"
+        );
+    }
+}
+
+/// Non-owner callers must not be able to enumerate another session's
+/// invites, even if they're authenticated as a real user.
+#[tokio::test]
+async fn list_session_invites_rejects_non_owner() {
+    let (state, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+    let stranger_token = state.create_test_user("stranger").await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/sessions/{session_id}/invites"))
+                .header("Authorization", format!("Bearer {stranger_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+/// Unauthenticated GET must be 401, not 403 — the handler does auth
+/// before owner check and this distinction matters for client retry
+/// logic.
+#[tokio::test]
+async fn list_session_invites_rejects_missing_auth() {
+    let (_, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/sessions/{session_id}/invites"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// DELETE happy path: mint an invite, list it to get its sha, revoke
+/// it, verify list is empty and that redeem on the raw token fails.
+#[tokio::test]
+async fn revoke_session_invite_hard_deletes() {
+    let (_, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+    let raw = mint_invite(&app, &owner_token, &session_id).await;
+
+    // Pull the row to get its token_sha256.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/sessions/{session_id}/invites"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+    let sha = rows[0]["token_sha256"].as_str().unwrap().to_owned();
+
+    // Revoke.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/sessions/{session_id}/invites/{sha}"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // List is empty now.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/sessions/{session_id}/invites"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+    assert!(rows.is_empty(), "revoke must remove the row from listings");
+
+    // And the raw token fails redeem with 400 (the invite is gone).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/invite/redeem")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::json!({ "token": raw }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Revoking an already-revoked invite (or an unknown sha) returns 400
+/// — the UI treats this as "already gone" and refreshes its state.
+#[tokio::test]
+async fn revoke_session_invite_twice_is_bad_request() {
+    let (_, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+    mint_invite(&app, &owner_token, &session_id).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/sessions/{session_id}/invites"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+    let sha = rows[0]["token_sha256"].as_str().unwrap().to_owned();
+
+    // First revoke — succeeds.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/sessions/{session_id}/invites/{sha}"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Second revoke — "already gone".
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/sessions/{session_id}/invites/{sha}"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Cross-session probe: stranger has their own session, tries to
+/// revoke an invite that belongs to someone else's session via their
+/// own path. Must read as 400 (invite not found in *this* session),
+/// not leak that the invite exists elsewhere.
+#[tokio::test]
+async fn revoke_session_invite_rejects_cross_session_probe() {
+    let (state, app, owner_a_token) = setup().await;
+    let session_a = create_session(&app, &owner_a_token).await;
+    mint_invite(&app, &owner_a_token, &session_a).await;
+
+    // Get session A's invite sha (with owner A's credentials).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/sessions/{session_a}/invites"))
+                .header("Authorization", format!("Bearer {owner_a_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+    let sha_a = rows[0]["token_sha256"].as_str().unwrap().to_owned();
+
+    // Second user creates their own session; then tries to DELETE
+    // session A's invite via their own path.
+    let owner_b_token = state.create_test_user("owner-b").await;
+    let session_b = create_session(&app, &owner_b_token).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/sessions/{session_b}/invites/{sha_a}"))
+                .header("Authorization", format!("Bearer {owner_b_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // 400 (invalid input — "not found in this session"). If the
+    // service ever started leaking a distinction between "invite
+    // exists elsewhere" and "invite doesn't exist", that's a
+    // regression.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Owner A's invite must still be intact — the stranger's probe
+    // must not have side effects.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/sessions/{session_a}/invites"))
+                .header("Authorization", format!("Bearer {owner_a_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(rows.len(), 1, "cross-session probe must not delete");
 }

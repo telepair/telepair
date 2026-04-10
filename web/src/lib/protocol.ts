@@ -54,6 +54,21 @@ export type InputMode = 'serialized' | 'multiplexed';
 
 export type SessionStatus = 'active' | 'closed';
 
+/**
+ * Reason a session moved from `active` to `closed`. Mirrors the
+ * `CloseReason` enum in `crates/telepair-core/src/session.rs` — the
+ * server serializes it as a lowercase string and the history view
+ * renders each variant as a distinct chip, so a new variant on the
+ * backend MUST be added here at the same time or the UI will show
+ * it as `Unknown`.
+ *
+ * - `owner`   – the owner clicked Close in the session page.
+ * - `reaper`  – the idle reaper closed it after no participants were left.
+ * - `startup` – server restart cleaned up an orphaned active row.
+ * - `error`   – WS-phase launch failure (target vanished, PTY spawn failed, etc.).
+ */
+export type CloseReason = 'owner' | 'reaper' | 'startup' | 'error';
+
 export interface Session {
   id: string;
   owner_id: string;
@@ -62,6 +77,12 @@ export interface Session {
   status: SessionStatus;
   created_at: string;
   closed_at: string | null;
+  /**
+   * Populated only for closed rows. `null` on a session closed before
+   * the v0.1.1 upgrade added the column, so the UI has to tolerate
+   * `null` even on `status === 'closed'` entries.
+   */
+  closed_reason?: CloseReason | null;
 }
 
 export interface ParticipantInfo {
@@ -156,4 +177,108 @@ export interface RedeemResult {
    * token in that case.
    */
   token: string | null;
+}
+
+/**
+ * One row of the per-session audit timeline. Mirrors `AuditEvent` in
+ * `crates/telepair-core/src/audit.rs`. The server returns rows newest
+ * first (`ts DESC`), capped at 500.
+ *
+ * `event_type` is the dotted-lowercase form (`session.created`,
+ * `participant.joined`, …) — the same string the CLI `--type` flag
+ * accepts and the same column value stored in `audit_events.event_type`.
+ * The list of variants is intentionally finite; an unknown value most
+ * likely means the frontend is older than the backend it's talking to,
+ * so the UI renders unknown types verbatim instead of throwing.
+ *
+ * `actor_id` and `actor_name` are nullable independently:
+ *   - `actor_id` is null for events that happened without an
+ *     authenticated identity (e.g. invite redemption by an anonymous
+ *     visitor — the row is stamped with `actor_name='guest'` and a
+ *     freshly minted user id, but pre-redeem rows have neither).
+ *   - `actor_name` is a denormalized snapshot taken at insertion time;
+ *     renaming a user later does NOT rewrite history.
+ *
+ * `detail` is an opaque JSON value (object, string, number, or null).
+ * The shape varies per event type — see the matching variant comments
+ * in `crates/telepair-core/src/audit.rs::AuditEventType`. The UI does
+ * not assume a specific shape; it pretty-prints the JSON on demand and
+ * extracts the few well-known keys (`role`, `reason`) lazily.
+ */
+export interface AuditEvent {
+  id: number | null;
+  ts: string;
+  actor_id: string | null;
+  actor_name: string | null;
+  event_type: string;
+  session_id: string | null;
+  detail: unknown;
+}
+
+/**
+ * Sanitized view of a single invite row for the owner-facing
+ * management dialog. Mirrors `InviteSummary` in
+ * `crates/telepair-control/src/invite_service.rs` — the backend
+ * deliberately does NOT leak the raw bearer token here. The UI uses
+ * `token_prefix` (first 8 chars of the sha) as a stable per-row label
+ * and `token_sha256` as the DELETE path parameter when revoking.
+ */
+export interface InviteSummary {
+  token_sha256: string;
+  token_prefix: string;
+  session_id: string;
+  role: Role;
+  max_uses: number;
+  used_count: number;
+  /** `max_uses - used_count`, clamped to zero. Precomputed server-side so every client renders the same number. */
+  remaining_uses: number;
+  expires_at: string | null;
+  created_at: string | null;
+}
+
+/**
+ * Env var presence marker for the admin-targets detail view. The
+ * server deliberately NEVER returns the resolved value — leaking
+ * `PGPASSWORD=...` through an HTTP API would widen the blast radius
+ * beyond the "anyone who can write targets.yaml can exfiltrate env"
+ * trust boundary we already accept. The UI renders `set: true` as a
+ * filled chip and `set: false` as a hollow chip so an admin can spot
+ * a missing variable at a glance.
+ */
+export interface AdminTargetEnvKey {
+  key: string;
+  set: boolean;
+}
+
+/**
+ * One row returned by `GET /api/admin/targets`. Mirrors
+ * `AdminTargetInfo` in `crates/telepair-gateway/src/http.rs`. Unlike
+ * the public `TargetInfo`, this carries the full config (command,
+ * args, shell) plus the runtime `active_sessions` count — everything
+ * the admin page needs to render a complete detail card and a
+ * per-target deep link into the session history view.
+ */
+export interface AdminTargetInfo {
+  name: string;
+  display: string;
+  /** `virtual` (from targets.yaml) or `local` (the built-in local-shell target). */
+  type: 'virtual' | 'local' | string;
+  command: string | null;
+  args: string[];
+  shell: string | null;
+  tags: string[];
+  admin_only: boolean;
+  env: AdminTargetEnvKey[];
+  active_sessions: number;
+}
+
+/**
+ * Success body returned by `POST /api/admin/targets/reload`. `path`
+ * is the absolute path re-read from disk; `targets` is the number of
+ * targets in the new engine. The UI surfaces both in the success
+ * toast so the admin can confirm they reloaded the file they meant to.
+ */
+export interface ReloadTargetsResult {
+  path: string;
+  targets: number;
 }
