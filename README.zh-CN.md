@@ -12,8 +12,11 @@ telepair 是一个开源的 Web 终端协作工具。在任意机器上运行它
 
 - **实时协作** — 多人共处同一个终端会话,输出实时流式同步
 - **基于角色的权限** — Owner(所有者)、Operator(操作者)、Viewer(观察者)三种角色,控制谁能输入、改窗口大小,或仅围观
-- **邀请链接** — 发一个链接,让别人以指定角色加入你的会话
-- **虚拟目标(Virtual Targets)** — 在 YAML 配置里把命令(SSH、psql、htop 等)注册为命名目标,一键拉起
+- **邀请链接** — 发一个链接,让别人以指定角色加入你的会话;所有者可以在会话内列出所有邀请、查看剩余次数,并随时撤销
+- **会话历史** — 每个已关闭的会话都会落到 `已关闭` 标签页,展示关闭原因(所有者 / 空闲清理 / 启动清理 / 错误)、时长以及每行的审计时间线
+- **管理员目标管理** — 仅管理员可见的 `/admin/targets` 页面,列出每个目标的完整配置(命令 / 参数 / 环境变量键列表,已脱敏)和当前活跃会话数,支持一键热重载 `targets.yaml`
+- **审计日志** — 只追加的 `audit_events` 表,记录登录、会话创建 / 关闭、参与者加入 / 离开、邀请发放 / 兑换 / 撤销、目标访问事件;可通过 `telepair admin audit` CLI 或应用内会话时间线查询
+- **虚拟目标(Virtual Targets)** — 在 YAML 配置里把命令(SSH、psql、htop 等)注册为命名目标,一键拉起,无需重启即可热重载
 - **内置聊天** — 终端旁边自带聊天侧栏,协作沟通不离场
 - **单一二进制** — 一个可执行文件同时跑 agent、control、gateway 三个角色;集群化是已规划的 future work
 - **Web 前端** — SolidJS + xterm.js,无需安装任何客户端
@@ -97,8 +100,11 @@ telepair 是一个 Cargo workspace,由可组合的角色构成:
 telepair [OPTIONS] [COMMAND]
 
 Commands:
-  admin    Admin operations (token recovery, user management)
-           e.g. `telepair admin show-token` prints the saved admin token
+  admin    Admin operations
+           - `telepair admin show-token`  prints the saved admin token
+           - `telepair admin audit`       query the append-only audit log
+                                          (--last, --session, --actor,
+                                           --type, --format, --limit)
 
 Options:
       --host <HOST>                Server bind address [default: 0.0.0.0]
@@ -152,7 +158,7 @@ telepair 的所有数据放在 `~/.telepair/`:
 
 ```
 ~/.telepair/
-├── telepair.db       # SQLite 数据库(users、sessions、participants、invites)
+├── telepair.db       # SQLite 数据库(users、sessions、participants、invites、audit_events)
 └── targets.yaml      # 虚拟目标定义(可选)
 ```
 
@@ -170,13 +176,13 @@ telepair 的所有数据放在 `~/.telepair/`:
 ## 开发
 
 ```bash
-# 后端测试(107 项)
+# 后端测试(209 项)
 cargo test --workspace
 
-# 前端单元测试(112 项)
+# 前端单元测试(136 项)
 cd web && npm test
 
-# 浏览器 E2E 测试(36 项,需要运行中的 server + Chromium)
+# 浏览器 E2E 测试(43 项,需要运行中的 server + Chromium)
 cd web && npx playwright install chromium    # 仅首次需要
 cd web && npm run e2e                        # server 自动起或复用 :7700
 

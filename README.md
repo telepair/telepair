@@ -12,8 +12,11 @@ telepair is an open-source web terminal collaboration tool. Run it on any machin
 
 - **Real-time collaboration** — multiple users in one terminal session with live output streaming
 - **Role-based permissions** — Owner, Operator, and Viewer roles control who can type, resize, or just watch
-- **Invite links** — share a link to let others join your session with a specific role
-- **Virtual targets** — define named commands (SSH, psql, htop, etc.) as launchable targets via YAML config
+- **Invite links** — share a link to let others join your session with a specific role; owners can list, see remaining uses, and revoke every invite from the in-session dialog
+- **Session history** — every closed session lands on a `Closed` tab with its close reason (owner, reaper, startup, error), duration, and a per-row audit timeline
+- **Admin target management** — admin-only `/admin/targets` page lists every target with full config, redacted env keys, per-target active-session counts, and a one-click `targets.yaml` hot reload
+- **Audit log** — append-only `audit_events` table captures logins, session create/close, participant join/leave, invite mint/redeem/revoke, and target access events; queryable via `telepair admin audit` or the in-app session timeline
+- **Virtual targets** — define named commands (SSH, psql, htop, etc.) as launchable targets via YAML config, hot-reloadable without a restart
 - **Built-in chat** — sidebar chat alongside the terminal for coordination
 - **Single binary** — one executable runs agent, control, and gateway in one process; clustering is planned future work
 - **Web UI** — SolidJS frontend with xterm.js, no client install required
@@ -97,8 +100,11 @@ telepair today ships as a single-node binary: agent, control, and gateway run in
 telepair [OPTIONS] [COMMAND]
 
 Commands:
-  admin    Admin operations (token recovery, user management)
-           e.g. `telepair admin show-token` prints the saved admin token
+  admin    Admin operations
+           - `telepair admin show-token`  prints the saved admin token
+           - `telepair admin audit`       query the append-only audit log
+                                          (--last, --session, --actor,
+                                           --type, --format, --limit)
 
 Options:
       --host <HOST>                Server bind address [default: 0.0.0.0]
@@ -152,7 +158,7 @@ telepair stores its data in `~/.telepair/`:
 
 ```
 ~/.telepair/
-├── telepair.db       # SQLite database (users, sessions, participants, invites)
+├── telepair.db       # SQLite database (users, sessions, participants, invites, audit_events)
 └── targets.yaml      # Virtual target definitions (optional)
 ```
 
@@ -170,13 +176,13 @@ telepair stores its data in `~/.telepair/`:
 ## Development
 
 ```bash
-# Run backend tests (107 tests)
+# Run backend tests (209 tests)
 cargo test --workspace
 
-# Run frontend unit tests (112 tests)
+# Run frontend unit tests (136 tests)
 cd web && npm test
 
-# Run browser E2E tests (36 tests, requires running server + Chromium)
+# Run browser E2E tests (43 tests, requires running server + Chromium)
 cd web && npx playwright install chromium    # first time only
 cd web && npm run e2e                        # server auto-starts or reuses :7700
 

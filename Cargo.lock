@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "telepair"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2130,7 +2130,7 @@ dependencies = [
 
 [[package]]
 name = "telepair-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "futures",
@@ -2144,7 +2144,7 @@ dependencies = [
 
 [[package]]
 name = "telepair-control"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "serde",
@@ -2158,7 +2158,7 @@ dependencies = [
 
 [[package]]
 name = "telepair-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "hex",
@@ -2177,7 +2177,7 @@ dependencies = [
 
 [[package]]
 name = "telepair-gateway"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "axum",

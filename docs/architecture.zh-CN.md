@@ -22,13 +22,14 @@ telepair-cli
 
 | 模块 | 用途 |
 |------|------|
-| `session.rs` | 领域类型:`User`、`Session`、`Participant`、`InviteToken`、`InputMode`、`SessionStatus` |
+| `session.rs` | 领域类型:`User`、`Session`、`Participant`、`InviteToken`、`InputMode`、`SessionStatus`、`CloseReason` |
 | `permission.rs` | `Role` 枚举(Owner/Operator/Viewer),带能力方法(`can_input`、`can_resize`、`can_manage`) |
 | `protocol.rs` | `ClientMessage` / `ServerMessage` 枚举(JSON,`#[serde(tag = "type")]`);PTY 输出作为原始二进制 WS 帧发送 |
-| `storage.rs` | 异步 `Storage` trait —— users、sessions、participants、invite tokens 的 CRUD |
-| `storage/sqlite.rs` | 基于 sqlx 的 `SqliteStorage` 实现 |
+| `storage.rs` | 异步 `Storage` trait —— users、sessions、participants、invite tokens、audit events 的 CRUD |
+| `storage/sqlite.rs` | 基于 sqlx 的 `SqliteStorage` 实现,启动时通过 `run_migrations()` 幂等追加新列 / 新表 |
 | `auth.rs` | `TokenAuthProvider` —— token 使用 SHA-256 哈希校验(原始 token 在创建时返回一次,之后不再持久化) |
 | `target.rs` | `Target` 和 `TargetKind` 定义 |
+| `audit.rs` | `AuditEvent`、`AuditEventType`、`AuditSink` trait —— 只追加的事件日志,支撑 `telepair admin audit` 和应用内会话时间线 |
 | `error.rs` | `Error` 枚举(Auth、NotFound、Storage、Internal) |
 
 ### telepair-agent
@@ -42,12 +43,13 @@ telepair-cli
 
 ### telepair-control
 
-协调核心抽象的业务逻辑服务层。
+协调核心抽象的业务逻辑服务层。从 0.1.1 起,这是生产代码中**唯一**直接触碰 `Storage` trait 的层次 —— gateway 的每一次读写都走 service。HTTP handler 与 WebSocket hub 里因此不再残留业务规则,service 也可以脱离 HTTP 基础设施做单元测试。
 
 | 模块 | 用途 |
 |------|------|
-| `session_service.rs` | `SessionService` —— 创建/关闭会话,管理参与者,委托给 Storage |
-| `target_service.rs` | `TargetService` —— 包装 TargetEngine,提供目标列表和解析能力 |
+| `session_service.rs` | `SessionService` —— 会话生命周期(`create_session`、`close_session(reason)`)、参与者查询(`list_participants`、`list_sessions_for_user`)、授权辅助(`require_owner`)以及跨层聚合查询(如 `active_session_counts_per_target`)。会话创建 / 关闭以及启动清理都会在这里发审计事件。 |
+| `invite_service.rs` | `InviteService` —— 邀请生命周期(`create`、`redeem`、`list_for_session`、`revoke`)。`MAX_INVITE_USES` / TTL 校验、跨会话 scoped-guest 检查、兑换成功后的 guest mint 都收敛在这里,并发出 `invite.minted` / `invite.redeemed` / `invite.revoked` 审计事件。 |
+| `target_service.rs` | `TargetService` —— 包装 `TargetEngine`,提供目标列表和解析能力。 |
 
 ### telepair-gateway
 
@@ -56,10 +58,10 @@ telepair-cli
 | 模块 | 用途 |
 |------|------|
 | `lib.rs` | Axum 路由设置与路由定义 |
-| `state.rs` | `AppState` —— 共享应用状态(storage、auth、services、session hubs) |
-| `http.rs` | REST handler:health、targets、sessions、invites |
-| `ws.rs` | WebSocket handler —— 认证、角色校验、消息分发、PTY I/O 桥接 |
-| `session_hub.rs` | `SessionHub` —— 单会话状态:PTY 进程、已连接参与者、广播通道 |
+| `state.rs` | `AppState` —— 共享应用状态:storage、auth、`SessionService`、`InviteService`、`Arc<ArcSwap<TargetEngine>>`(用于原子化的目标热重载)、`Arc<dyn AuditSink>`、以及 `SessionHub` |
+| `http.rs` | REST handler:health、targets、sessions、invites(list / revoke)、会话历史、会话审计、whoami、admin targets(list + reload)。所有 handler 都走 service —— 生产代码不再直接访问 `.storage()`。 |
+| `ws.rs` | WebSocket handler —— 认证、角色校验、消息分发、PTY I/O 桥接,`participant.joined` / `participant.left` 审计事件发射 |
+| `session_hub.rs` | `SessionHub` —— 单会话状态:PTY 进程、已连接参与者、广播通道。持有 `Arc<SessionService>`(而非裸 Storage),所以空闲清理的关闭也会和所有者主动关闭走同一条审计路径,带 `CloseReason::Reaper`。 |
 
 ### telepair-cli
 
@@ -131,13 +133,32 @@ Browser                     telepair (single process)
 ## 存储 Schema
 
 ```sql
-users (id, name, token_sha256, is_admin, created_at, updated_at)
-sessions (id, owner_id, target_name, input_mode, status, created_at, closed_at)
+users        (id, name, token_sha256, is_admin, scoped_session_id, created_at, updated_at)
+sessions     (id, owner_id, target_name, input_mode, status, closed_reason, created_at, closed_at)
 participants (session_id, user_id, role, joined_at, left_at)
-invite_tokens (token_sha256, session_id, role, max_uses, used_count, expires_at)
+invite_tokens(token_sha256, session_id, role, max_uses, used_count, expires_at)
+audit_events (id, ts, actor_id, actor_name, event_type, session_id, detail)
 ```
 
 所有 ID 都是存为 TEXT 的 UUID。时间戳是 ISO 8601 TEXT。`Storage` trait 是异步且与具体实现无关的 —— v1 的后端是 SQLite。
+
+**Schema 演进(0.1.x)。** 迁移状态保存在单一的 `migrations/001_initial.sql` 中,每次启动都会整份加载。`telepair-core/src/storage/sqlite.rs` 里的 `run_migrations()` 会先执行完整 SQL 文件,再通过 `pragma_table_info` 做一次列存在性检查,以幂等方式给旧库补上 `sessions.closed_reason` 列;`audit_events` 表及其四个索引用 `CREATE TABLE / INDEX IF NOT EXISTS` 达成同样的效果。这让 0.1.x 范围内的原地升级保持可用,而不必引入正式的迁移框架;真正出现 schema 冲突时,pre-1.0 的 "删库重建" 兜底仍然适用。正式迁移框架留给后续 minor 版本。
+
+### 审计事件
+
+`audit_events` 表是只追加(append-only)的。每一行都是一次安全相关状态转移的不可变记录 —— 登录、会话生命周期、参与者加入 / 离开、邀请发放 / 兑换 / 撤销、目标访问被拒绝、以及目标热重载。高频事件(聊天、光标、PTY 字节流)**不**入审计:这类事件会让表爆炸,而且它们承载的信息已经被更粗粒度的事件覆盖。
+
+| 列 | 用途 |
+|----|------|
+| `id` | 自增 i64 主键 —— 稳定的插入顺序,便于分页读取 |
+| `ts` | ISO 8601 UTC 字符串,建立索引用于时间范围查询 |
+| `actor_id` | 触发者的 user id(系统事件和登录失败时为空) |
+| `actor_name` | 发射时刻的用户名快照 —— 用户后续改名不应改写历史 |
+| `event_type` | 形如 `session.created` 或 `invite.revoked` 的标签字符串,通过 `AuditEventType` 的 `#[serde(rename = "...")]` 序列化 |
+| `session_id` | 建立索引 —— 支撑每会话时间线视图以及 `telepair admin audit --session <id>` 过滤 |
+| `detail` | 事件专属字段的 JSON blob:`reason`、`duration_s`、`role`、`max_uses`、`expires_at` 等 |
+
+四个索引覆盖四种查询形态:时间范围(`idx_audit_ts`)、单会话时间线(`idx_audit_session`)、单 actor 历史(`idx_audit_actor`)、按类型扫描(`idx_audit_type`)。写入端有 `SessionService`、`InviteService`、`AuthService` 登录路径、以及 admin targets reload handler;读取端有 `GET /api/sessions/{id}/audit` 和 `telepair admin audit` CLI。
 
 ## 安全模型
 
