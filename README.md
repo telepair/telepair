@@ -179,7 +179,7 @@ telepair stores its data in `~/.telepair/`:
 # Run backend tests (209 tests)
 cargo test --workspace
 
-# Run frontend unit tests (136 tests)
+# Run frontend unit tests (134 tests)
 cd web && npm test
 
 # Run browser E2E tests (43 tests, requires running server + Chromium)

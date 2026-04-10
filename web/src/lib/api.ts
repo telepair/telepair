@@ -29,7 +29,7 @@ export interface ListSessionsOptions {
   limit?: number;
   offset?: number;
 }
-import { auth, readCurrentToken } from '../stores/auth';
+import { auth } from '../stores/auth';
 
 const BASE = '/api';
 
@@ -71,12 +71,14 @@ export function __setAuthExpiredHandler(fn: () => void) {
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  // Always read through the auth store's helper so the sessionStorage
-  // tier wins over the persistent admin fallback. Reading localStorage
-  // directly here would let a tab with a guest sessionStorage entry
-  // get the admin token stamped onto its requests — the cross-tab
-  // identity-bleed bug the two-tier storage is designed to prevent.
-  const token = readCurrentToken();
+  // Read the in-memory signal — the single source of truth for the
+  // current tab's credential. The signal is primed at module init from
+  // sessionStorage/localStorage (via readInitialToken) and updated
+  // synchronously by setToken(), so it is always correct even when
+  // storage writes fail (private browsing, quota exceeded, sandboxed
+  // iframes). Using the signal here keeps REST and WebSocket identity
+  // in lockstep — both read auth.token().
+  const token = auth.token();
   const headers: Record<string, string> = {
     ...options.headers as Record<string, string>,
   };

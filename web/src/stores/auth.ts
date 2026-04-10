@@ -82,30 +82,6 @@ function readInitialToken(): string {
 }
 
 /**
- * Source of truth for the API layer: callers outside this module (e.g.
- * `api.ts::request`) read the current token through this helper instead
- * of touching localStorage directly. Same sessionStorage-first fallback
- * as `readInitialToken` so a brand-new tab whose signal hasn't been
- * primed yet still gets the right identity on its first request.
- *
- * Last-resort fallback to the in-memory signal: `safeSet` swallows
- * `setItem` failures (private mode, quota exceeded, sandboxed iframe),
- * so storage may legitimately be empty even though the user is logged
- * in. Without this fallback, `validateToken()` and the guest invite
- * redeem flow would issue follow-up HTTP requests with no
- * `Authorization` header in those environments while the UI thinks
- * the user is authenticated, producing mysterious "I'm logged in but
- * everything 401s" reports.
- */
-export function readCurrentToken(): string {
-  const tabLocal = safeGet(sessionStore(), STORAGE_KEY);
-  if (tabLocal) return tabLocal;
-  const persistent = safeGet(localStore(), STORAGE_KEY);
-  if (persistent) return persistent;
-  return token();
-}
-
-/**
  * Auth error states are stored as **i18n keys**, not pre-translated
  * strings, so locale switches re-render the error live. The Login page
  * resolves the key through `useI18n().t()` at render time. `null` means

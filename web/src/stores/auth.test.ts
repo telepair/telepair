@@ -31,7 +31,7 @@ vi.stubGlobal('localStorage', {
   removeItem: (key: string) => { delete persistStore[key]; },
 });
 
-const { auth, STORAGE_KEY, readCurrentToken } = await import('./auth');
+const { auth, STORAGE_KEY } = await import('./auth');
 const { __setAuthExpiredHandler } = await import('../lib/api');
 // Neutralise the stale-token redirect: validateToken intentionally
 // probes with api.listTargets() and a 401 response now fires the
@@ -159,39 +159,6 @@ describe('cross-tab isolation', () => {
     auth.setToken('guest-token'); // invite-redeem path, tab-scoped only
     expect(tabStore[STORAGE_KEY]).toBe('guest-token');
     expect(persistStore[STORAGE_KEY]).toBe('admin-token');
-  });
-});
-
-describe('readCurrentToken in storage-restricted environments', () => {
-  // Regression for the storage-failure path Codex flagged: in private
-  // browsing / sandboxed iframes / quota-exhausted contexts, `setItem`
-  // throws and `safeSet` swallows the error. The signal still gets the
-  // new token, so the UI thinks login succeeded — but if
-  // `readCurrentToken` only reads storage, the API layer drops the
-  // `Authorization` header on every follow-up request and the user
-  // sees an inexplicable wall of 401s. The fallback below makes the
-  // signal authoritative when storage is unwritable.
-  it('falls back to the in-memory signal when storage writes silently fail', () => {
-    storageWritesThrow = true;
-
-    auth.setToken('memory-only-token');
-
-    // Both stores stayed empty — `setItem` always threw — but the
-    // signal captured the new token, and `readCurrentToken` should
-    // surface it instead of returning ''.
-    expect(tabStore[STORAGE_KEY]).toBeUndefined();
-    expect(persistStore[STORAGE_KEY]).toBeUndefined();
-    expect(auth.token()).toBe('memory-only-token');
-    expect(readCurrentToken()).toBe('memory-only-token');
-  });
-
-  it('still prefers sessionStorage when both storage and signal hold a value', () => {
-    // Sanity check: the fallback must not regress the existing
-    // sessionStorage-first ordering, which is load-bearing for the
-    // cross-tab isolation guarantee.
-    auth.setToken('signal-token');
-    tabStore[STORAGE_KEY] = 'tab-token';
-    expect(readCurrentToken()).toBe('tab-token');
   });
 });
 

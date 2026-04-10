@@ -179,7 +179,7 @@ telepair 的所有数据放在 `~/.telepair/`:
 # 后端测试(209 项)
 cargo test --workspace
 
-# 前端单元测试(136 项)
+# 前端单元测试(134 项)
 cd web && npm test
 
 # 浏览器 E2E 测试(43 项,需要运行中的 server + Chromium)
