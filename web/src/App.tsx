@@ -21,37 +21,34 @@ function AuthGuard(props: { children: any }) {
 /**
  * Admin-only route gate. Sits *inside* AuthGuard so the login bounce
  * for unauthenticated callers runs first (a non-admin guest with no
- * token should see /login, not the dashboard). The admin flag is
- * three-state:
- *   - `null`: whoami hasn't landed yet — render nothing so the admin
- *     UI doesn't flash in front of a guest whose flag is about to
- *     come back `false`. The whoami call is primed on login and from
- *     the Dashboard's `onMount`; we also kick it from here so a deep
- *     link to `/admin/targets` on a fresh tab reload still resolves.
- *   - `false`: authenticated but not admin → bounce to `/`.
- *   - `true`: render the guarded content.
+ * token should see /login, not the dashboard).
  *
- * Using `Navigate` inside a `Show.fallback` for the "not admin" case
- * keeps the bounce consistent with `AuthGuard` — the router swaps the
- * route instead of the component trying to `useNavigate` from a
- * mount effect, which would race with the first paint.
+ * Blocks rendering until `auth.identityChecked()` flips — set by
+ * `loadIdentity()` once its whoami settles (success OR failure). The
+ * three-state `currentUserIsAdmin()` was the old guard condition, but
+ * it conflated "still fetching" and "fetched and found nothing", so a
+ * transient whoami failure would strand the user on a blank `<div />`
+ * forever with no recovery path.
+ *
+ * After the check settles:
+ *   - `isAdmin === true` → render children.
+ *   - anything else (false, null from a failed whoami) → bounce to
+ *     `/`. The dashboard's `onMount` will retry `loadIdentity` so the
+ *     user gets another chance without being forced through /login.
  */
 function AdminGuard(props: { children: any }) {
   onMount(() => {
-    // Fire-and-forget: loadIdentity is idempotent and swallows errors.
-    // This covers the "hard reload on /admin/targets" path where the
-    // Dashboard's mount hook never ran.
+    // Fire-and-forget: loadIdentity is idempotent and de-duplicated.
+    // Covers the "hard reload on /admin/targets" path where the
+    // Dashboard's mount hook never ran. On success it sets both
+    // `currentUser` and `identityChecked`; on failure it only sets
+    // `identityChecked`, which triggers the redirect below instead
+    // of leaving the page blank indefinitely.
     auth.loadIdentity();
   });
   return (
-    <Show
-      when={auth.currentUserIsAdmin() !== null}
-      fallback={<div />}
-    >
-      <Show
-        when={auth.currentUserIsAdmin() === true}
-        fallback={<Navigate href="/" />}
-      >
+    <Show when={auth.identityChecked()} fallback={<div />}>
+      <Show when={auth.currentUserIsAdmin() === true} fallback={<Navigate href="/" />}>
         {props.children}
       </Show>
     </Show>

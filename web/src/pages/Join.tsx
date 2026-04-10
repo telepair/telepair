@@ -35,6 +35,14 @@ export default function Join() {
       const result = await api.redeemInvite(params.token);
       if (result.token) {
         auth.setToken(result.token);
+        // A token swap invalidates the cached whoami (see
+        // `setToken` for the rationale). Prime the new identity here
+        // so Session.tsx, AdminGuard, and the dashboard owner gate
+        // all see the guest's `is_guest=true` flag on first render —
+        // without this, the session page briefly runs with the
+        // previous user's identity (if any) and the back-button
+        // dispatch picks the wrong branch.
+        await auth.loadIdentity();
       }
       navigate(`/session/${result.session_id}`, { replace: true });
     } catch (e) {

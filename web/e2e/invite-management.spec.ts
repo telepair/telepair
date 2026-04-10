@@ -86,6 +86,31 @@ test.describe('Invite management (list + revoke)', () => {
     await expect(dialog.locator('[data-testid="invite-row"]')).toHaveCount(1, {
       timeout: 5_000,
     });
+
+    // Pending-revoke reset: click "Revoke" on the remaining row to
+    // enter the confirm-state, then close the dialog WITHOUT
+    // confirming. Re-opening must drop the pending state — the
+    // row comes back showing "Revoke", not "Confirm revoke?". A
+    // half-started confirmation leaking across closes was the
+    // v0.1.1 bug this assertion pins.
+    const remaining = dialog.locator('[data-testid="invite-row"]').first();
+    await remaining.locator('[data-testid="invite-revoke"]').click();
+    await expect(
+      remaining.locator('[data-testid="invite-revoke-confirm"]'),
+    ).toBeVisible();
+    await page.locator('.dialog-backdrop').click({ position: { x: 5, y: 5 } });
+    await expect(dialog).toBeHidden();
+
+    dialog = await openInviteDialog(page);
+    const reopened = dialog.locator('[data-testid="invite-row"]').first();
+    await expect(reopened).toBeVisible({ timeout: 5_000 });
+    // The confirm button must NOT be visible — the pending token
+    // from before the close should have been cleared.
+    await expect(
+      reopened.locator('[data-testid="invite-revoke-confirm"]'),
+    ).toHaveCount(0);
+    // The normal "Revoke" entry button is back in the default state.
+    await expect(reopened.locator('[data-testid="invite-revoke"]')).toBeVisible();
   });
 
   test('revoked invite link no longer redeems', async ({ browser }) => {

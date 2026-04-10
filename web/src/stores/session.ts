@@ -85,22 +85,18 @@ async function fetchSessions(
   }
 }
 
-/**
- * Clear the target-name filter and refetch the current status tab.
- * Used by the Dashboard's "Clear filter" chip — without this, the
- * user would have to navigate to `/` with no search params to drop
- * the filter, which is a non-obvious interaction.
- */
-async function clearTargetFilter() {
-  await fetchSessions(currentFilter(), '');
-}
-
 async function createSession(targetName: string, inputMode?: InputMode): Promise<Session> {
   const session = await api.createSession(targetName, inputMode);
-  // Only surface newly-created sessions on tabs that would show them
-  // — inserting them into the list while the user is viewing "Closed"
-  // makes the freshly-minted row pop onto the wrong tab for a blink.
-  if (currentFilter() !== 'closed') {
+  // Only surface newly-created sessions on tabs that would show them:
+  //   1. Not the "Closed" tab — a freshly-minted row is always active.
+  //   2. No target filter OR the filter matches the new session's target
+  //      — if the dashboard is filtered to `?target=alpha` and the user
+  //      creates a `beta` session, the new row must NOT appear in the
+  //      alpha list (it would vanish on the next refetch anyway, but the
+  //      flash is confusing). An empty target filter means "show all".
+  const targetOk =
+    currentTargetFilter() === '' || currentTargetFilter() === targetName;
+  if (currentFilter() !== 'closed' && targetOk) {
     setSessions((prev) => [...prev, session]);
   }
   return session;
@@ -118,7 +114,6 @@ export const sessionStore = {
   currentTargetFilter,
   fetchTargets,
   fetchSessions,
-  clearTargetFilter,
   createSession,
   refresh,
 };

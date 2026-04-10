@@ -194,3 +194,159 @@ describe('readCurrentToken in storage-restricted environments', () => {
     expect(readCurrentToken()).toBe('tab-token');
   });
 });
+
+describe('auth.loadIdentity', () => {
+  // H3 regression: Session.tsx dispatches its back/exit button between
+  // "navigate to dashboard" (real user — keep identity) and "logout +
+  // redirect" (scoped guest — their token is only valid for this one
+  // session and has nowhere else to go). The dispatch reads
+  // `auth.currentUserIsGuest()`, which is populated here from the
+  // whoami response. If loadIdentity drops `is_guest`, a real admin
+  // viewing a session they don't own gets silently logged out on back.
+  it('populates isGuest=true from a guest whoami response', async () => {
+    auth.setToken('guest-token'); // non-persistent — matches redeem flow
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({
+        user_id: 'guest-1',
+        name: 'guest',
+        is_admin: false,
+        is_guest: true,
+      }),
+    );
+    await auth.loadIdentity();
+    expect(auth.currentUserId()).toBe('guest-1');
+    expect(auth.currentUserIsAdmin()).toBe(false);
+    expect(auth.currentUserIsGuest()).toBe(true);
+  });
+
+  it('populates isGuest=false for a long-lived admin identity', async () => {
+    auth.setToken('admin-token', { persist: true });
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({
+        user_id: 'root',
+        name: 'admin',
+        is_admin: true,
+        is_guest: false,
+      }),
+    );
+    await auth.loadIdentity();
+    expect(auth.currentUserId()).toBe('root');
+    expect(auth.currentUserIsAdmin()).toBe(true);
+    expect(auth.currentUserIsGuest()).toBe(false);
+  });
+
+  it('returns null for the role flags before loadIdentity has run', () => {
+    // Pre-whoami state: the dashboard's owner gate and Session.tsx's
+    // back-button dispatch both need a tri-state signal so they can
+    // distinguish "not yet known" from "known to be a non-admin /
+    // non-guest". The signal must be null until the whoami round-trip
+    // completes, not default to false.
+    auth.setToken('any-token');
+    expect(auth.currentUserIsAdmin()).toBeNull();
+    expect(auth.currentUserIsGuest()).toBeNull();
+    expect(auth.currentUserId()).toBe('');
+  });
+
+  // M1 regression: AdminGuard used to block on `currentUserIsAdmin() !== null`
+  // and show a `<div />` forever when whoami failed. The fix adds
+  // `identityChecked`, which flips to `true` once the first fetch
+  // settles — success OR failure — so AdminGuard can redirect to `/`
+  // instead of staying blank. These tests pin the three transitions.
+  it('identityChecked is false before any loadIdentity call', () => {
+    auth.setToken('fresh-token');
+    expect(auth.identityChecked()).toBe(false);
+  });
+
+  it('identityChecked becomes true after a successful whoami', async () => {
+    auth.setToken('admin-token', { persist: true });
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ user_id: 'root', name: 'admin', is_admin: true, is_guest: false }),
+    );
+    expect(auth.identityChecked()).toBe(false);
+    await auth.loadIdentity();
+    expect(auth.identityChecked()).toBe(true);
+    expect(auth.currentUserIsAdmin()).toBe(true);
+  });
+
+  it('identityChecked becomes true even when whoami fails', async () => {
+    // This is the core M1 regression: a transient network error
+    // previously left identityChecked=false (implicitly, since the
+    // signal didn't exist) and AdminGuard would show an empty `<div />`
+    // forever. After the fix, identityChecked flips on any settlement,
+    // so the guard can fall through to the `Navigate href="/"` branch.
+    auth.setToken('admin-token', { persist: true });
+    mockFetch.mockRejectedValueOnce(new Error('network down'));
+    await auth.loadIdentity();
+    expect(auth.identityChecked()).toBe(true);
+    // Identity stays null — the guard's redirect path handles this.
+    expect(auth.currentUserIsAdmin()).toBeNull();
+  });
+
+  // Token-swap regression: before the fix, setToken only cleared the
+  // cached `currentUser` on the empty-string branch. The admin → guest
+  // invite flow in the same tab goes through `auth.setToken(guestToken)`
+  // (not validateToken), so `currentUser` was left pointing at the
+  // previous admin identity. AdminGuard, the dashboard owner gate, and
+  // the Session back-button all read from that cache — they would
+  // happily run as the wrong user until the next tab close. The fix
+  // clears the cache whenever the token value actually changes.
+  it('clears cached identity when setToken swaps the token to a new value', async () => {
+    // Prime: admin logs in and whoami populates the cache.
+    auth.setToken('admin-token', { persist: true });
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ user_id: 'root', name: 'admin', is_admin: true, is_guest: false }),
+    );
+    await auth.loadIdentity();
+    expect(auth.currentUserIsAdmin()).toBe(true);
+    expect(auth.identityChecked()).toBe(true);
+
+    // Same tab follows an invite link — Join.tsx path: setToken with a
+    // fresh guest token, no validateToken round-trip. The stale admin
+    // identity must NOT survive this swap.
+    auth.setToken('guest-token');
+    expect(auth.currentUserIsAdmin()).toBeNull();
+    expect(auth.currentUserIsGuest()).toBeNull();
+    expect(auth.currentUserId()).toBe('');
+    expect(auth.identityChecked()).toBe(false);
+
+    // And the next loadIdentity must actually hit the network — the
+    // in-flight memo also has to have been reset, otherwise a stale
+    // null promise would short-circuit the new fetch.
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ user_id: 'guest-1', name: 'guest', is_admin: false, is_guest: true }),
+    );
+    await auth.loadIdentity();
+    expect(auth.currentUserId()).toBe('guest-1');
+    expect(auth.currentUserIsGuest()).toBe(true);
+  });
+
+  // Idempotence: writing the SAME token twice (e.g. a persist-tier
+  // upgrade from a non-persistent guest to an admin login with the
+  // same token value, or a retry after a transient failure) must not
+  // throw away an already-loaded identity, otherwise every repeat
+  // setToken call forces a needless whoami round-trip.
+  it('does not clear cached identity when setToken writes the same value', async () => {
+    auth.setToken('admin-token');
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ user_id: 'root', name: 'admin', is_admin: true, is_guest: false }),
+    );
+    await auth.loadIdentity();
+    expect(auth.currentUserIsAdmin()).toBe(true);
+
+    auth.setToken('admin-token', { persist: true });
+    expect(auth.currentUserIsAdmin()).toBe(true);
+    expect(auth.currentUserId()).toBe('root');
+    expect(auth.identityChecked()).toBe(true);
+  });
+
+  it('identityChecked resets to false on logout', async () => {
+    auth.setToken('admin-token', { persist: true });
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ user_id: 'root', name: 'admin', is_admin: true, is_guest: false }),
+    );
+    await auth.loadIdentity();
+    expect(auth.identityChecked()).toBe(true);
+    auth.logout();
+    expect(auth.identityChecked()).toBe(false);
+  });
+});

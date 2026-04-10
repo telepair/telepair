@@ -166,8 +166,18 @@ describe('sessionStore.fetchSessions', () => {
   });
 });
 
+const fakeBetaSession = {
+  id: 'sess-2',
+  owner_id: 'u1',
+  target_name: 'prod-db',
+  input_mode: 'serialized',
+  status: 'active',
+  created_at: '2026-04-04T12:01:00Z',
+  closed_at: null,
+};
+
 describe('sessionStore.createSession', () => {
-  it('creates session and appends to list', async () => {
+  it('creates session and appends to list when no target filter', async () => {
     // Clear sessions first
     mockFetch.mockResolvedValueOnce(jsonResponse([]));
     await sessionStore.fetchSessions();
@@ -176,6 +186,36 @@ describe('sessionStore.createSession', () => {
     const result = await sessionStore.createSession('local-shell');
     expect(result.id).toBe('sess-1');
     expect(sessionStore.sessions()).toContainEqual(fakeSession);
+  });
+
+  it('appends new session when its target matches the active filter', async () => {
+    // Filter is alpha (local-shell); creating a local-shell session
+    // should still appear immediately.
+    mockFetch.mockResolvedValueOnce(jsonResponse([]));
+    await sessionStore.fetchSessions('active', 'local-shell');
+
+    mockFetch.mockResolvedValueOnce(jsonResponse(fakeSession, 201));
+    await sessionStore.createSession('local-shell');
+    expect(sessionStore.sessions()).toContainEqual(fakeSession);
+  });
+
+  it('does NOT append new session when its target does not match the active filter', async () => {
+    // L1 regression: if the dashboard is filtered to ?target=local-shell
+    // and the user somehow creates a `prod-db` session (possible if they
+    // use the session store directly or the filter was recently changed),
+    // the new row must not flash into the filtered list. It would vanish
+    // on the next refetch anyway, but the premature insertion is
+    // confusing. The fix checks currentTargetFilter() in createSession.
+    mockFetch.mockResolvedValueOnce(jsonResponse([fakeSession]));
+    await sessionStore.fetchSessions('active', 'local-shell');
+
+    mockFetch.mockResolvedValueOnce(jsonResponse(fakeBetaSession, 201));
+    await sessionStore.createSession('prod-db');
+
+    // List must still contain only the alpha session from the fetch.
+    const ids = sessionStore.sessions().map((s) => s.id);
+    expect(ids).toContain('sess-1');
+    expect(ids).not.toContain('sess-2');
   });
 });
 

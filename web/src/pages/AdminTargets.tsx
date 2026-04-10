@@ -13,7 +13,7 @@
 // hard error (shown in a banner) rather than a silent empty state.
 import { createResource, createSignal, For, Show } from 'solid-js';
 import { useNavigate } from '@solidjs/router';
-import { api, ApiError } from '../lib/api';
+import { api, ApiError, errorMessage } from '../lib/api';
 import type { AdminTargetInfo } from '../lib/protocol';
 import { toast } from '../stores/toast';
 import { useI18n, type Translator } from '../i18n';
@@ -21,28 +21,77 @@ import LocaleSwitcher from '../components/LocaleSwitcher';
 import Banner from '../components/Banner';
 
 /**
- * Parse the structured JSON body that `reloadTargets` returns on 4xx
- * into a `(reason, message)` pair. The backend intentionally uses
- * distinct `reason` codes (`no_targets_path`, `parse_error`) so the
- * UI can pick the right translated message instead of dumping the
- * raw server string. `null` means the body wasn't JSON we understand
- * — the caller then falls back to a generic toast carrying the
- * unparsed text.
+ * One row of the `still_referenced` payload: a target name and the
+ * count of live sessions still pointing at it. Exposed as a named
+ * type so the banner renderer can iterate it without re-deriving
+ * the shape.
  */
-function parseReloadError(
-  raw: string,
-): { reason: string; message: string } | null {
+export interface BlockingTarget {
+  target: string;
+  active_sessions: number;
+}
+
+/**
+ * Parsed shape of the structured JSON body that `reloadTargets`
+ * returns on 4xx. `targets` is only populated for the
+ * `still_referenced` reason — the backend's other reasons
+ * (`no_targets_path`, `parse_error`) leave it undefined. Exported so
+ * the unit tests in `AdminTargets.parseReloadError.test.ts` can
+ * assert the parser's contract without spinning up the page.
+ */
+export interface ParsedReloadError {
+  reason: string;
+  message: string;
+  targets?: BlockingTarget[];
+}
+
+/**
+ * Parse the structured JSON body that `reloadTargets` returns on 4xx
+ * into a typed shape. The backend intentionally uses distinct
+ * `reason` codes (`no_targets_path`, `parse_error`,
+ * `still_referenced`) so the UI can pick the right translated
+ * message instead of dumping the raw server string. `null` means
+ * the body wasn't JSON we understand — the caller then falls back
+ * to a generic toast carrying the unparsed text.
+ *
+ * Exported (rather than module-private) so a sibling unit test can
+ * pin the parser independently of the page render — the
+ * `still_referenced` shape is the load-bearing part of the admin
+ * reload guard's UX, and a future server change that renames a
+ * field would otherwise only blow up at integration time.
+ */
+export function parseReloadError(raw: string): ParsedReloadError | null {
   try {
     const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object') {
-      const reason = typeof parsed.reason === 'string' ? parsed.reason : '';
-      const message = typeof parsed.message === 'string' ? parsed.message : '';
-      if (reason) return { reason, message };
+    if (!parsed || typeof parsed !== 'object') return null;
+    const reason = typeof parsed.reason === 'string' ? parsed.reason : '';
+    if (!reason) return null;
+    const message = typeof parsed.message === 'string' ? parsed.message : '';
+    // `targets` is structurally validated here so downstream
+    // renderers can iterate it without re-checking each row. A
+    // malformed entry (missing fields, wrong types) is dropped
+    // silently — the banner falls back to "no rows", which is
+    // strictly better than a runtime crash inside `<For>`.
+    let targets: BlockingTarget[] | undefined;
+    if (Array.isArray(parsed.targets)) {
+      targets = parsed.targets
+        .filter(
+          (row: unknown): row is BlockingTarget =>
+            !!row &&
+            typeof row === 'object' &&
+            typeof (row as BlockingTarget).target === 'string' &&
+            typeof (row as BlockingTarget).active_sessions === 'number',
+        )
+        .map((row: BlockingTarget) => ({
+          target: row.target,
+          active_sessions: row.active_sessions,
+        }));
     }
+    return { reason, message, targets };
   } catch {
     // Fall through to `null` — caller handles it.
+    return null;
   }
-  return null;
 }
 
 /** Map a `type` field to a short localized label. Unknown kinds are
@@ -72,10 +121,22 @@ export default function AdminTargets() {
     api.listAdminTargets(),
   );
   const [reloading, setReloading] = createSignal(false);
+  // `still_referenced` is the only reload error that needs more than
+  // a single-line toast: it ships a structured list of targets that
+  // are still in use, and the admin needs to see all of them at once
+  // to decide which sessions to close. A toast (transient, single
+  // line) actively hides that information; a persistent banner
+  // pinned above the grid does not. Cleared at the start of every
+  // reload attempt so a previously-blocked page doesn't keep
+  // showing a stale list after the admin successfully reloaded.
+  const [blockingTargets, setBlockingTargets] = createSignal<
+    BlockingTarget[] | null
+  >(null);
 
   const handleReload = async () => {
     if (reloading()) return;
     setReloading(true);
+    setBlockingTargets(null);
     try {
       const result = await api.reloadTargets();
       toast.success(
@@ -101,6 +162,11 @@ export default function AdminTargets() {
             t('admin_targets.reload_failed_parse', { msg: parsed.message }),
             { id: 'admin-targets-reload' },
           );
+        } else if (parsed?.reason === 'still_referenced' && parsed.targets) {
+          // Persistent banner instead of a toast — the row list is
+          // the load-bearing part of the message, and a toast would
+          // dismiss before the admin finished reading it.
+          setBlockingTargets(parsed.targets);
         } else {
           toast.error(
             t('admin_targets.reload_failed_generic', { msg: e.message }),
@@ -108,10 +174,10 @@ export default function AdminTargets() {
           );
         }
       } else {
-        const msg = e instanceof Error ? e.message : String(e);
-        toast.error(t('admin_targets.reload_failed_generic', { msg }), {
-          id: 'admin-targets-reload',
-        });
+        toast.error(
+          t('admin_targets.reload_failed_generic', { msg: errorMessage(e) }),
+          { id: 'admin-targets-reload' },
+        );
       }
     } finally {
       setReloading(false);
@@ -159,12 +225,43 @@ export default function AdminTargets() {
             is in a broken state.
           */}
           <Banner variant="error">
-            {t('admin_targets.load_failed', {
-              msg:
-                targets.error instanceof Error
-                  ? targets.error.message
-                  : String(targets.error),
-            })}
+            {t('admin_targets.load_failed', { msg: errorMessage(targets.error) })}
+          </Banner>
+        </Show>
+
+        <Show when={blockingTargets()}>
+          {/*
+            Reload guard's structured rejection: the new yaml would
+            drop targets that still have live PTYs. We render the
+            full list (target name + active session count) so the
+            admin can decide which sessions to close before
+            retrying. Persistent banner, not a toast — the data
+            density makes "auto-dismiss after 5s" actively hostile.
+          */}
+          <Banner variant="error">
+            <div
+              class="reload-blocked"
+              data-testid="admin-targets-reload-blocked"
+            >
+              <p class="reload-blocked-title">
+                {t('admin_targets.reload_failed_still_referenced_title')}
+              </p>
+              <ul class="reload-blocked-list">
+                <For each={blockingTargets() ?? []}>
+                  {(row) => (
+                    <li data-testid={`admin-targets-blocked-row-${row.target}`}>
+                      {t('admin_targets.reload_failed_still_referenced_row', {
+                        target: row.target,
+                        count: String(row.active_sessions),
+                      })}
+                    </li>
+                  )}
+                </For>
+              </ul>
+              <p class="reload-blocked-hint">
+                {t('admin_targets.reload_failed_still_referenced_hint')}
+              </p>
+            </div>
           </Banner>
         </Show>
 
@@ -176,7 +273,7 @@ export default function AdminTargets() {
           <p class="muted">{t('admin_targets.empty')}</p>
         </Show>
 
-        <Show when={targets() && (targets() ?? []).length > 0}>
+        <Show when={(targets() ?? []).length > 0}>
           <div class="target-grid" data-testid="admin-targets-grid">
             <For each={targets()}>
               {(target) => (
@@ -399,6 +496,31 @@ export default function AdminTargets() {
         .sessions-link[data-active='true']:hover {
           background: var(--accent);
           color: var(--bg-primary);
+        }
+        .reload-blocked {
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+        .reload-blocked-title {
+          font-weight: 600;
+          margin: 0;
+        }
+        .reload-blocked-list {
+          margin: 0;
+          padding-left: 18px;
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+        }
+        .reload-blocked-list li {
+          font-family: var(--font-mono);
+          font-size: 12px;
+        }
+        .reload-blocked-hint {
+          margin: 0;
+          font-size: 12px;
+          opacity: 0.85;
         }
       `}</style>
     </div>

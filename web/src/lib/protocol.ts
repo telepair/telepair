@@ -130,6 +130,26 @@ export const InputDeniedReason = {
 } as const;
 export type InputDeniedReason = (typeof InputDeniedReason)[keyof typeof InputDeniedReason];
 
+/**
+ * Audit event type discriminant, mirroring `AuditEventType::as_str()`
+ * in `crates/telepair-core/src/audit.rs`. The on-disk / on-wire form is
+ * the dotted-lowercase string — this constant pins the exact set so the
+ * frontend's `eventLabel` switch stays exhaustive under TypeScript and
+ * a backend rename surfaces as a compile error instead of a rendered
+ * raw string.
+ */
+export const AuditEventType = {
+  SESSION_CREATED: 'session.created',
+  SESSION_CLOSED: 'session.closed',
+  PARTICIPANT_JOINED: 'participant.joined',
+  INVITE_MINTED: 'invite.minted',
+  INVITE_REDEEMED: 'invite.redeemed',
+  INVITE_REVOKED: 'invite.revoked',
+  TARGET_ACCESS_DENIED: 'target.access_denied',
+  TARGET_RELOADED: 'target.reloaded',
+} as const;
+export type AuditEventType = (typeof AuditEventType)[keyof typeof AuditEventType];
+
 // --- Helpers ---
 
 const textEncoder = new TextEncoder();

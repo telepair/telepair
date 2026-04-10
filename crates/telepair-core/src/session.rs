@@ -217,3 +217,69 @@ pub struct InviteToken {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<DateTime<Utc>>,
 }
+
+impl InviteToken {
+    /// First 8 hex chars of `token_sha256`. Used as a short, stable,
+    /// non-sensitive label in audit detail blobs and the management
+    /// UI. Safe to expose — the full token is never reconstructable
+    /// from its prefix because the DB only ever stored the digest.
+    pub fn token_prefix(&self) -> &str {
+        let n = self.token_sha256.len().min(8);
+        // `token_sha256` is hex-encoded SHA-256, so byte indices and
+        // char indices coincide — no need to walk chars.
+        &self.token_sha256[..n]
+    }
+}
+
+/// Who is redeeming an invite, as seen by
+/// [`crate::storage::Storage::redeem_invite`]. Keeping the "existing
+/// authenticated user" and "fresh scoped guest" paths in one enum
+/// lets the storage layer stay honest about the fact that these two
+/// flows share a single atomic transaction — previously they lived
+/// in the service layer as three separate write calls with a
+/// TOCTOU window and no rollback story.
+#[derive(Debug, Clone, Copy)]
+pub enum RedeemIdentity<'a> {
+    /// Authenticated caller. `Storage::redeem_invite` assumes the row
+    /// exists and looks up the current `users.name` inside the same
+    /// transaction so the audit row reflects the authoritative
+    /// display name even if the caller passed a stale copy.
+    Existing(Uuid),
+    /// Anonymous caller. `Storage::redeem_invite` INSERTs a scoped
+    /// guest row with `scoped_session_id = <invite.session_id>` and
+    /// returns the raw bearer token exactly once (the DB only stores
+    /// its SHA-256 digest). On a UNIQUE(name) collision the caller
+    /// should retry with a new name; the rolled-back transaction
+    /// guarantees the invite's `used_count` is not drained.
+    NewGuest { name: &'a str },
+}
+
+/// Return value of [`crate::storage::Storage::redeem_invite`]. Carries
+/// the consumed invite row (post-increment), the resolved user, and —
+/// for the `NewGuest` path — the raw bearer the caller must return
+/// to the client exactly once.
+#[derive(Debug, Clone)]
+pub struct RedeemOutcome {
+    /// The invite row. For a fresh join this is the post-increment
+    /// state (`used_count += 1`); for the idempotent
+    /// `was_already_member` short path the row is NOT bumped and
+    /// this reflects the pre-call state. Callers use this for audit
+    /// labelling (token prefix, role, session id) without a second
+    /// round trip.
+    pub invite: InviteToken,
+    pub user_id: Uuid,
+    pub user_name: String,
+    /// `Some(raw)` iff a scoped guest was minted inside the same
+    /// transaction. `None` when an authenticated caller joined under
+    /// their existing identity.
+    pub issued_token: Option<String>,
+    /// `true` iff the caller was already an active participant of
+    /// the invite's session when `redeem_invite` ran — the
+    /// Existing-identity branch took its idempotent short path,
+    /// leaving `used_count` untouched. Service-layer callers use
+    /// this flag to skip audit writes so a race-losing double-click
+    /// doesn't log a ghost `InviteRedeemed` + `ParticipantJoined`
+    /// pair. Always `false` for the `NewGuest` path, which cannot
+    /// race with itself.
+    pub was_already_member: bool,
+}

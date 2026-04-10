@@ -171,6 +171,7 @@ export const zh: Dict = {
     event_invite_redeemed: '兑换邀请',
     event_invite_revoked: '撤销邀请',
     event_target_access_denied: '目标访问被拒绝',
+    event_target_reloaded: '目标已重载',
   },
   chat: {
     heading: '聊天',
@@ -207,6 +208,11 @@ export const zh: Dict = {
     reload_failed_generic: '重新加载失败:{{ msg }}',
     reload_failed_parse: 'targets.yaml 格式错误:{{ msg }}',
     reload_failed_no_path: 'telepair 启动时未配置 targets.yaml — 请先配置再重启。',
+    reload_failed_still_referenced_title:
+      '已阻止重新加载:新的 targets.yaml 会移除仍有活跃会话的目标。',
+    reload_failed_still_referenced_hint:
+      '请先关闭下列会话(或在 targets.yaml 中恢复目标)再重试。',
+    reload_failed_still_referenced_row: '{{ target }} — {{ count }} 个活跃会话',
     back_to_dashboard: '← 返回主页',
     loading: '正在加载目标…',
     load_failed: '加载目标失败:{{ msg }}',

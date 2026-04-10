@@ -185,6 +185,7 @@ export const en = {
     event_invite_redeemed: 'Invite redeemed',
     event_invite_revoked: 'Invite revoked',
     event_target_access_denied: 'Target access denied',
+    event_target_reloaded: 'Targets reloaded',
   },
   chat: {
     heading: 'Chat',
@@ -229,6 +230,11 @@ export const en = {
     reload_failed_parse: 'targets.yaml is malformed: {{ msg }}',
     reload_failed_no_path:
       'telepair was started without a targets.yaml — configure one and restart.',
+    reload_failed_still_referenced_title:
+      'Reload blocked: the new targets.yaml would drop targets that still have live sessions.',
+    reload_failed_still_referenced_hint:
+      'Close the sessions below (or restore the target in targets.yaml) and try again.',
+    reload_failed_still_referenced_row: '{{ target }} — {{ count }} active session(s)',
     back_to_dashboard: '← Back to dashboard',
     loading: 'Loading targets…',
     load_failed: 'Failed to load targets: {{ msg }}',

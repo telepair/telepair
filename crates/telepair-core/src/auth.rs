@@ -10,6 +10,17 @@ use crate::storage::{SqliteStorage, Storage};
 /// retry loop so an unexpected DB state can't spin forever.
 const GUEST_NAME_MAX_ATTEMPTS: usize = 5;
 
+/// Generate a fresh `guest-<nanoid8>` candidate. The format is the
+/// single source of truth for scoped-guest names: every call site
+/// (the in-crate `create_guest` retry loop and the out-of-crate
+/// `InviteService::redeem` retry loop) goes through this helper, so
+/// anyone grepping for `guest-` finds exactly one generator. ~47
+/// bits of entropy per call; callers still need a retry loop to
+/// handle the vanishingly rare UNIQUE(name) collision.
+pub fn random_guest_name() -> String {
+    format!("guest-{}", nanoid::nanoid!(8))
+}
+
 pub struct TokenAuthProvider {
     storage: Arc<SqliteStorage>,
 }
@@ -44,7 +55,7 @@ impl TokenAuthProvider {
     pub async fn create_guest(&self, session_id: &str) -> Result<(User, String)> {
         let mut last_err = None;
         for _ in 0..GUEST_NAME_MAX_ATTEMPTS {
-            let name = format!("guest-{}", nanoid::nanoid!(8));
+            let name = random_guest_name();
             match self.storage.create_scoped_guest(&name, session_id).await {
                 Ok(pair) => return Ok(pair),
                 Err(e) => {
@@ -65,7 +76,17 @@ impl TokenAuthProvider {
     }
 }
 
-fn is_unique_violation(err: &Error) -> bool {
+/// Returns `true` iff `err` is the SQLite UNIQUE-constraint violation
+/// we expect from a `users.name` collision. Exported so the invite
+/// service can retry its own `Storage::redeem_invite` transactions
+/// (which INSERT a guest user inside the transaction) without having
+/// to depend on `sqlx` just to write this one `matches!`.
+///
+/// Centralizing this keeps the "UNIQUE-constraint translation" story
+/// in one place: any future storage backend that surfaces UNIQUE
+/// violations through a different error shape will add its arm here
+/// and every caller gets the fix for free.
+pub fn is_unique_violation(err: &Error) -> bool {
     match err {
         Error::Storage(sqlx::Error::Database(db_err)) => {
             // SQLite's UNIQUE-constraint violation is SQLITE_CONSTRAINT_UNIQUE

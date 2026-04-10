@@ -1,8 +1,8 @@
 // web/src/pages/Session.tsx
-import { createSignal, onCleanup, Show } from 'solid-js';
+import { createSignal, onCleanup, onMount, Show } from 'solid-js';
 import { useParams, useNavigate } from '@solidjs/router';
 import { auth } from '../stores/auth';
-import { api } from '../lib/api';
+import { api, errorMessage as fmtError } from '../lib/api';
 import { TelepairSocket } from '../lib/ws';
 import type { ConnectionStatus, ReconnectInfo } from '../lib/ws';
 import { encodeInput, canInput, ErrorCode, InputDeniedReason } from '../lib/protocol';
@@ -303,31 +303,54 @@ export default function SessionPage() {
       // Success — banner will land via WS SESSION_CLOSED. Leave the
       // button in "closing" state so it can't be re-clicked.
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      toast.error(t('session.close_failed', { msg }));
+      toast.error(t('session.close_failed', { msg: fmtError(e) }));
       setClosing(false);
       setCloseArmed(false);
     }
   };
 
-  // Owners have a real dashboard to return to. Non-owners — guests
-  // and invited operators/viewers — do not: a scoped-guest token
-  // 403s on every dashboard route (`require_unscoped` in
-  // `crates/telepair-gateway/src/http.rs::list_targets`), and even
-  // a regular invited user has no business on the owner's
-  // dashboard. Before this fix, both the topbar "← Back" button and
-  // the session-ended banner action navigated to `/`, which left
-  // guests stranded on a broken empty-state page that also leaked
-  // the server-side config path. Route them through logout instead
-  // so they land cleanly on /login and can re-redeem their invite
-  // (or be done).
+  // Return button dispatch: the choice between "back to dashboard"
+  // and "log out" is a property of the CREDENTIAL, not the session
+  // role. A scoped-guest token is only valid for this one session
+  // (`require_unscoped` 403s on every dashboard route), so a guest
+  // has nowhere else to go and must be routed to /login. A real
+  // logged-in user — including an admin who joined someone else's
+  // session as a non-owner to test an invite link, or an operator
+  // who was invited into a peer's session — still has their own
+  // account and dashboard to return to, and must NOT be logged out
+  // on the way back.
+  //
+  // Previously this was keyed off `role() === 'owner'`, which
+  // silently logged out any non-owner real user. That was a
+  // regression against the backend's own `redeem_invite` design:
+  // the handler explicitly preserves an existing identity when a
+  // logged-in caller redeems an invite, exactly so admins can test
+  // their own invite links without spawning throwaway guests.
+  //
+  // `auth.currentUserIsGuest()` returns `null` until the first
+  // successful `whoami`; in that ambiguous state we default to
+  // "navigate to dashboard" because (a) real users are the common
+  // case, and (b) a guest who slips through lands on the dashboard,
+  // whose first data fetch 403s through the global interceptor and
+  // bounces them to /login anyway.
+  const isGuestCredential = () => auth.currentUserIsGuest() === true;
   const goHomeOrLogout = () => {
-    if (role() === 'owner') {
-      navigate('/');
+    if (isGuestCredential()) {
+      auth.logoutAndRedirect();
       return;
     }
-    auth.logoutAndRedirect();
+    navigate('/');
   };
+
+  // Deep-linked session pages may mount with no prior whoami — the
+  // user could have pasted a URL directly into a new tab. Trigger
+  // identity load so the return-button dispatch above reads a
+  // populated `isGuest` rather than falling through to the
+  // null-default. `loadIdentity` is idempotent and de-duped, so
+  // this is safe if Dashboard or AdminGuard already kicked one off.
+  onMount(() => {
+    void auth.loadIdentity();
+  });
 
   // `connect()` is deferred until the Terminal ref fires so the
   // initial `SessionJoin` frame can carry the fit-computed cols/rows;
@@ -348,7 +371,7 @@ export default function SessionPage() {
     <div class="session-page">
       <header class="session-topbar">
         <button class="back-btn" onClick={goHomeOrLogout}>
-          {role() === 'owner' ? t('common.back') : t('common.logout')}
+          {isGuestCredential() ? t('common.logout') : t('common.back')}
         </button>
         <span class="session-label">
           {/* Use `renderTemplate` so the session id stays inside a real
@@ -392,7 +415,9 @@ export default function SessionPage() {
             variant="info"
             role="status"
             action={{
-              label: role() === 'owner' ? t('session.banner_back_to_dashboard') : t('common.logout'),
+              label: isGuestCredential()
+                ? t('common.logout')
+                : t('session.banner_back_to_dashboard'),
               onClick: goHomeOrLogout,
             }}
           >

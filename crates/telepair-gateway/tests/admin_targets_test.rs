@@ -12,6 +12,7 @@
 //! backs `POST .../reload`; other specs use `AppState::new_test()`
 //! which always passes `targets_path: None`.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -23,7 +24,9 @@ use tower::ServiceExt;
 
 use telepair_agent::virtual_target::TargetEngine;
 use telepair_core::audit::{AuditEventType, AuditFilter};
+use telepair_core::session::InputMode;
 use telepair_core::storage::{SqliteStorage, Storage};
+use telepair_gateway::session_hub::PtyLaunch;
 use telepair_gateway::state::AppState;
 use telepair_gateway::{CorsMode, build_router_with_options};
 
@@ -397,4 +400,369 @@ async fn reload_targets_no_path_configured_returns_400() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["reason"], "no_targets_path");
+}
+
+#[tokio::test]
+async fn reload_targets_rejects_drop_of_still_referenced_target() {
+    // Regression test for the v0.1.1 hot-reload finding: if an
+    // admin rewrites targets.yaml to drop a target that still has
+    // a live session, the old code would happily swap the new
+    // engine in — the next WS reconnect on that session would hit
+    // `TARGET_NOT_FOUND` and `cleanup_orphan_session` would stamp
+    // the row as Error, killing the session through the back door.
+    //
+    // The guard must: (1) return 400 with `reason=still_referenced`,
+    // (2) include the offending target and its active-session count,
+    // (3) leave the OLD engine loaded so the live session is still
+    // reachable, (4) NOT touch the DB session row.
+    //
+    // This test pins the **hub-backed** contract: the guard counts
+    // live PTYs in the `SessionHub` (in-memory map), not `status=
+    // 'active'` rows in SQLite. A zombie DB row whose PTY has
+    // already exited must NOT wedge a reload — see
+    // `reload_targets_allows_drop_when_only_stale_db_row_present`
+    // for the companion proof.
+    let (file, path) = write_targets(INITIAL_TARGETS_YAML);
+    let engine = TargetEngine::from_file(&path).expect("parse initial yaml");
+    let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+    let (admin, admin_token) = storage.create_user("admin", true).await.unwrap();
+
+    // Seed a live session on `alpha`: create the DB row, then spawn
+    // a real PTY through the hub so the reload guard's
+    // `count_live_sessions_per_target()` walk sees it. We use
+    // `sleep 300` as the child — cheap to spawn, never tries to
+    // read stdin, and we tear it down via `hub.stop_session` at
+    // the end of the test.
+    let session = storage
+        .create_session_with_owner(admin.id, "alpha", InputMode::Serialized)
+        .await
+        .unwrap();
+
+    let state = AppState::new(storage.clone(), engine, Some(path.clone())).await;
+    state
+        .hub
+        .start_or_join(
+            &session.id,
+            "alpha",
+            PtyLaunch {
+                command: "sleep",
+                args: &["300".to_string()],
+                env: &HashMap::new(),
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .await
+        .expect("spawn live session on alpha");
+    let hub = state.hub.clone();
+    let app = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
+
+    // Rewrite the yaml to drop `alpha` entirely.
+    const DROP_ALPHA_YAML: &str = r#"
+targets:
+  - name: beta
+    display: Beta Only
+    command: printf
+"#;
+    std::fs::write(&path, DROP_ALPHA_YAML).unwrap();
+
+    let app2 = app.clone();
+    let resp = app
+        .oneshot(
+            Request::post("/api/admin/targets/reload")
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["reason"], "still_referenced");
+    let targets = json["targets"].as_array().expect("targets array");
+    assert_eq!(targets.len(), 1, "expected exactly one blocked target");
+    assert_eq!(targets[0]["target"], "alpha");
+    assert_eq!(targets[0]["active_sessions"], 1);
+
+    // Follow-up list MUST still show the original `alpha` — the
+    // guard rolled the swap back, so the old engine (with its
+    // `alpha` entry) stays loaded. This is the real assertion
+    // that live sessions are still reachable through the engine.
+    let resp2 = app2
+        .oneshot(
+            Request::get("/api/admin/targets")
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let body2 = resp2.into_body().collect().await.unwrap().to_bytes();
+    let arr2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+    let names: Vec<&str> = arr2
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"alpha"),
+        "alpha must still be loaded after rejected reload: {names:?}"
+    );
+    assert!(
+        names.contains(&"beta"),
+        "beta must still be loaded after rejected reload: {names:?}"
+    );
+
+    // And the session DB row must still be `active` — the reject
+    // path is purely a handler-level rollback; no session state
+    // touched.
+    let row = storage.get_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(row.status.as_str(), "active");
+
+    // Tear down the live PTY we spawned so the test doesn't leak a
+    // sleep child into the harness runtime.
+    hub.stop_session(&session.id).await;
+
+    drop(file);
+}
+
+#[tokio::test]
+async fn reload_targets_allows_adding_new_target_with_referenced_alive() {
+    // Companion to `reload_targets_rejects_drop_of_still_referenced_target`
+    // — the guard must NOT block reloads that only ADD targets or
+    // tweak a referenced target's metadata. This is the "don't
+    // over-rotate" side of the conservative gate: admins still need
+    // to be able to extend targets.yaml while sessions are live.
+    let (file, path) = write_targets(INITIAL_TARGETS_YAML);
+    let engine = TargetEngine::from_file(&path).expect("parse initial yaml");
+    let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+    let (admin, admin_token) = storage.create_user("admin", true).await.unwrap();
+
+    // Live session on alpha — DB row plus a hub entry backing it,
+    // same pattern as the reject test. The hub is the guard's
+    // source of truth, so we have to spawn a real PTY for the guard
+    // to "see" alpha as referenced.
+    let session = storage
+        .create_session_with_owner(admin.id, "alpha", InputMode::Serialized)
+        .await
+        .unwrap();
+
+    let state = AppState::new(storage.clone(), engine, Some(path.clone())).await;
+    state
+        .hub
+        .start_or_join(
+            &session.id,
+            "alpha",
+            PtyLaunch {
+                command: "sleep",
+                args: &["300".to_string()],
+                env: &HashMap::new(),
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .await
+        .expect("spawn live session on alpha");
+    let hub = state.hub.clone();
+    let app = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
+
+    // New yaml keeps alpha (same name), tweaks its display, adds
+    // `delta`, drops the unreferenced `beta`. All three of these
+    // edits are allowed by the conservative gate.
+    const EXTEND_YAML: &str = r#"
+targets:
+  - name: alpha
+    display: Alpha Tweaked
+    command: echo
+  - name: delta
+    display: Delta
+    command: true
+"#;
+    std::fs::write(&path, EXTEND_YAML).unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/admin/targets/reload")
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "reload with still-referenced alpha preserved must succeed"
+    );
+
+    hub.stop_session(&session.id).await;
+
+    drop(file);
+}
+
+#[tokio::test]
+async fn reload_targets_allows_drop_when_only_stale_db_row_present() {
+    // Complementary regression test for the hub-backed reload
+    // guard: a session that EXITS in DB-land (`status='active'`
+    // with no live PTY in the hub) must NOT block the reload.
+    // This is the scenario the DB-backed guard fumbled — the
+    // reaper's cleanup window or a crashed PTY would leave a
+    // zombie row that made admins unable to rotate targets until
+    // startup cleanup ran.
+    //
+    // Setup: create an `alpha` DB row directly via storage (no
+    // hub entry), then reload a yaml that drops `alpha`. With the
+    // hub-backed count, live_counts for alpha is 0, so the guard
+    // does not reject. We assert the reload succeeds, and the
+    // stale DB row is untouched.
+    let (file, path) = write_targets(INITIAL_TARGETS_YAML);
+    let engine = TargetEngine::from_file(&path).expect("parse initial yaml");
+    let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+    let (admin, admin_token) = storage.create_user("admin", true).await.unwrap();
+
+    // DB-only session on alpha (no hub entry) — simulates a
+    // zombie row whose PTY exited but whose close hasn't landed.
+    let session = storage
+        .create_session_with_owner(admin.id, "alpha", InputMode::Serialized)
+        .await
+        .unwrap();
+
+    let state = AppState::new(storage.clone(), engine, Some(path.clone())).await;
+    let app = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
+
+    // Rewrite yaml to drop alpha — with the old DB-backed guard
+    // this would have returned 400; with the hub-backed guard it
+    // should succeed.
+    const DROP_ALPHA_YAML: &str = r#"
+targets:
+  - name: beta
+    display: Beta Only
+    command: printf
+"#;
+    std::fs::write(&path, DROP_ALPHA_YAML).unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/admin/targets/reload")
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "stale DB row must not wedge reload — guard counts the hub"
+    );
+
+    // Stale row is untouched by the reload path.
+    let row = storage.get_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(row.status.as_str(), "active");
+
+    drop(file);
+}
+
+#[tokio::test]
+async fn reload_targets_rejects_drop_during_create_to_attach_gap() {
+    // Regression test for the v0.1.1 hot-reload race that codex
+    // flagged: between `POST /api/sessions` returning 201 and the
+    // client's WS handshake landing in `start_or_join`, the hub
+    // map has no `LiveSession` for the freshly minted session.
+    // Pre-fix, the reload guard's `count_live_sessions_per_target`
+    // walked an empty hub for the new target, so a concurrent
+    // `POST /api/admin/targets/reload` that dropped the target
+    // happily swapped in the new engine. The next WS attach then
+    // failed `targets.load().resolve(...)` and
+    // `cleanup_orphan_session` stamped the row `Error`, leaving
+    // the owner unable to rejoin a target that, from their POV,
+    // had just been created and acknowledged.
+    //
+    // The fix is `SessionHub::reserve_target`: the create-session
+    // HTTP handler reserves a `SessionEntry::Pending` slot before
+    // returning 201, so the reload guard sees the target as
+    // "still in use" until the WS attach upgrades it. This test
+    // exercises the HTTP path end-to-end and asserts:
+    //   1. POST /api/sessions returns 201
+    //   2. NO WS attach happens (we never call `hub.start_or_join`)
+    //   3. POST /api/admin/targets/reload with a yaml that drops
+    //      the new target returns 400 `still_referenced`
+    //   4. The session DB row is still `active` — reload was
+    //      rolled back, not committed
+    //
+    // Without the reservation this test fails at step 3 with a
+    // 200, and at step 4 the target is gone from the engine
+    // (followup ws attach would orphan the session).
+    let (file, path) = write_targets(INITIAL_TARGETS_YAML);
+    let engine = TargetEngine::from_file(&path).expect("parse initial yaml");
+    let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+    let (_, admin_token) = storage.create_user("admin", true).await.unwrap();
+
+    let state = AppState::new(storage.clone(), engine, Some(path.clone())).await;
+    let app = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
+
+    // Step 1: create a session via the HTTP handler — this is
+    // the only call site that exercises `reserve_target`.
+    let create_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/sessions")
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"target_name":"alpha"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+    let create_body = create_resp.into_body().collect().await.unwrap().to_bytes();
+    let session_json: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
+    let session_id = session_json["id"].as_str().expect("session id").to_string();
+
+    // Step 2: deliberately do NOT attach via WS. The whole point
+    // is that the reservation must protect the gap.
+
+    // Step 3: rewrite yaml to drop alpha and reload.
+    const DROP_ALPHA_YAML: &str = r#"
+targets:
+  - name: beta
+    display: Beta Only
+    command: printf
+"#;
+    std::fs::write(&path, DROP_ALPHA_YAML).unwrap();
+    let reload_resp = app
+        .oneshot(
+            Request::post("/api/admin/targets/reload")
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reload_resp.status(),
+        StatusCode::BAD_REQUEST,
+        "reload must reject — pending reservation should keep alpha referenced"
+    );
+    let reload_body = reload_resp.into_body().collect().await.unwrap().to_bytes();
+    let reload_json: serde_json::Value = serde_json::from_slice(&reload_body).unwrap();
+    assert_eq!(reload_json["reason"], "still_referenced");
+    let blocked = reload_json["targets"].as_array().expect("targets array");
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0]["target"], "alpha");
+    assert_eq!(
+        blocked[0]["active_sessions"], 1,
+        "the pending reservation must count exactly once toward the per-target total"
+    );
+
+    // Step 4: the reject path is purely a handler-level rollback.
+    // The session DB row stays `active`, ready for the WS attach
+    // that's about to arrive.
+    let row = storage.get_session(&session_id).await.unwrap().unwrap();
+    assert_eq!(row.status.as_str(), "active");
+
+    drop(file);
 }
