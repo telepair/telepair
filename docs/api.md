@@ -23,6 +23,34 @@ Check server status. No authentication required.
 { "status": "ok" }
 ```
 
+## Auth
+
+### GET /api/auth/whoami
+
+Return the authenticated caller's identity. Used by the frontend auth store to
+cache `currentUserId` and `is_admin` on boot so the dashboard can gate owner-only
+affordances (audit dialog, close button) without an extra round trip per row.
+
+**Response** `200 OK`
+```json
+{
+  "user_id": "...",
+  "name": "admin",
+  "is_admin": true,
+  "is_guest": false
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `user_id` | string | UUID of the caller |
+| `name` | string | Current display name |
+| `is_admin` | boolean | `true` for admin accounts |
+| `is_guest` | boolean | `true` for invite-minted scoped guests |
+
+**Errors**
+- `401 Unauthorized` — missing or invalid token. Never returns 403: "I am a guest" is still a valid identity worth surfacing.
+
 ## Targets
 
 ### GET /api/targets
@@ -85,7 +113,16 @@ Create a new session. The authenticated user becomes the session owner.
 
 ### GET /api/sessions
 
-List active sessions.
+List sessions visible to the caller. Regular users see sessions they own plus any they joined as a participant; **admin callers see every session in the workspace** (so the admin targets page's `N active sessions` deep link resolves to a non-empty page). Supports filtering by status and target, plus `limit`/`offset` for pagination.
+
+**Query Parameters**
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `status` | string | `active`, `closed`, or `all` (default: `all`). Unknown values fall back to `all` so a typo in the UI's querystring does not blow up the page. |
+| `target_name` | string | Only return sessions launched from this target. Used by the admin targets page's "N active sessions" deep link. |
+| `limit` | integer | Upper bound on rows returned. Missing or non-positive = unlimited. |
+| `offset` | integer | Pagination offset; non-positive values collapse to `0`. |
 
 **Response** `200 OK`
 ```json
@@ -94,13 +131,18 @@ List active sessions.
     "id": "550e8400-...",
     "owner_id": "...",
     "target_name": "local-shell",
-    "input_mode": "serialized",
-    "status": "active",
+    "input_mode": "multiplexed",
+    "status": "closed",
     "created_at": "2026-04-04T12:00:00Z",
-    "closed_at": null
+    "closed_at": "2026-04-04T12:42:00Z",
+    "closed_reason": "owner"
   }
 ]
 ```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `closed_reason` | string \| absent | One of `owner`, `reaper`, `startup`, `error`. Omitted for active rows and for legacy v0.1.0 closed rows created before the column existed. |
 
 ### DELETE /api/sessions/{session_id}
 
@@ -134,21 +176,84 @@ Create an invite link for a session. Only the session owner can create invites.
 | `role` | string | yes | `"operator"` or `"viewer"` |
 | `max_uses` | integer | no | Maximum redemptions (default: 1) |
 
+| `expires_in_minutes` | integer | no | TTL in minutes. Mutually exclusive with `expires_at`; the server resolves it to an absolute UTC timestamp before persisting. **Clamped** to `MAX_INVITE_TTL_MINUTES` (a slider overshoot is treated as a benign UX mistake). |
+| `expires_at` | string (ISO 8601) | no | Absolute expiry. Wins if both `expires_in_minutes` and `expires_at` are set. **Rejected** with `400 invalid_input` if it exceeds `MAX_INVITE_TTL_MINUTES` — the server never silently rewrites an explicit wall-clock pick. |
+
 **Response** `201 Created`
 ```json
 {
   "token": "abc123...",
   "role": "operator",
   "max_uses": 1,
+  "expires_at": "2026-04-04T13:00:00Z",
   "session_id": "550e8400-..."
 }
 ```
 
+The raw `token` is returned **once** — the DB only stores its SHA-256 digest. Capture it now; there is no endpoint to recover it later.
+
 **Errors**
-- `400 Bad Request` — `role` is `owner` (only `operator` / `viewer` can be invited), `max_uses` is zero or negative, or the body is otherwise malformed
+- `400 Bad Request` — `role` is `owner` (only `operator` / `viewer` can be invited), `max_uses` is zero / negative / over the `MAX_INVITE_USES` cap, TTL is non-positive, both `expires_in_minutes` and `expires_at` are in the past, or the body is otherwise malformed
 - `401 Unauthorized` — missing or invalid token
 - `403 Forbidden` — not the session owner
 - `404 Not Found` — session does not exist
+- `410 Gone` — session exists but is already closed
+
+### GET /api/sessions/{session_id}/invites
+
+List every invite ever minted for this session, newest first. Owner-only. Deliberately
+includes expired and exhausted rows so the management dialog can show post-mortem
+state ("these were the invites in flight when the session closed") without a second
+endpoint.
+
+The raw token is **not** returned — only the sha256 digest (used as the revoke path
+parameter) and an 8-char prefix label. There is no way to recover a forgotten link;
+mint a new invite instead.
+
+**Response** `200 OK`
+```json
+[
+  {
+    "token_sha256": "7d2b...a1",
+    "token_prefix": "7d2ba1f4",
+    "session_id": "550e8400-...",
+    "role": "operator",
+    "max_uses": 3,
+    "used_count": 1,
+    "remaining_uses": 2,
+    "expires_at": "2026-04-04T13:00:00Z",
+    "created_at": "2026-04-04T12:00:00Z"
+  }
+]
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `token_sha256` | string | Full SHA-256 digest of the invite token. Opaque label; used as the path parameter on the revoke endpoint. |
+| `token_prefix` | string | First 8 chars of `token_sha256` — short stable identifier for the UI. |
+| `remaining_uses` | integer | Precomputed `max(0, max_uses - used_count)` so every client renders the same number. |
+
+**Errors**
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — not the session owner
+- `404 Not Found` — session does not exist
+
+### DELETE /api/sessions/{session_id}/invites/{token_sha256}
+
+Hard-delete an invite row. Owner-only. The path-parameter session id must match
+what the invite points at — a mismatch surfaces as `404` so a caller cannot probe
+for invites belonging to other sessions. Double-revoke returns `404` ("already
+gone"), which the UI treats as a signal to refresh the list.
+
+Revoked invites cannot be redeemed (the row is gone, so `POST /api/invite/redeem`
+returns `400` on a bad token).
+
+**Response** `204 No Content`
+
+**Errors**
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — not the session owner
+- `404 Not Found` — session does not exist, invite does not exist, or invite belongs to a different session
 
 ### POST /api/invite/redeem
 
@@ -186,3 +291,133 @@ Redeem an invite token to join a session.
 - `400 Bad Request` — the invite token is unknown, expired, or has hit `max_uses` (guest accounts are **not** created on rejected invites, so a bad link never leaves orphan users behind)
 - `404 Not Found` — the invite points at a session that never existed
 - `410 Gone` — the target session has been closed; the invite is not consumed, so the operator can still revoke it or reassign uses to a new session
+
+## Session Audit
+
+### GET /api/sessions/{session_id}/audit
+
+Return the audit events that touched this session, newest first. Owner-only —
+uses the same 403/404 gate as `GET /api/sessions/{id}/invites`. Closed sessions
+are still readable (the whole point of a history view), so the ownership check
+does not require an active session.
+
+Capped at 500 rows (no pagination surface yet — real session footprints are
+orders of magnitude below this). See [Architecture — Audit events](architecture.md#audit-events)
+for the event taxonomy and write paths.
+
+**Response** `200 OK`
+```json
+[
+  {
+    "id": 12,
+    "ts": "2026-04-04T12:10:05Z",
+    "actor_id": "...",
+    "actor_name": "admin",
+    "event_type": "session.closed",
+    "session_id": "550e8400-...",
+    "detail": {
+      "reason": "owner",
+      "duration_s": 600
+    }
+  }
+]
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | integer | Monotonic insertion order — stable pagination cursor when we eventually need it. |
+| `ts` | string (ISO 8601) | Emit time, UTC. |
+| `actor_id` | string \| null | UUID of the initiator. `null` for system events and failed logins. |
+| `actor_name` | string \| null | Denormalized display name snapshot — a later rename does not rewrite history. |
+| `event_type` | string | Tagged string: `session.created`, `session.closed`, `participant.joined`, `participant.left`, `invite.minted`, `invite.redeemed`, `invite.revoked`, `auth.login_success`, `auth.login_failed`, `target.access_denied`, `target.reloaded`. |
+| `session_id` | string \| null | `null` for events without a session (logins, target reload). |
+| `detail` | object | Event-specific JSON blob. For example, `session.closed` carries `{reason, duration_s}`; `invite.minted` carries `{role, max_uses, expires_at}`. |
+
+**Errors**
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — not the session owner
+- `404 Not Found` — session does not exist
+
+## Admin
+
+The `/api/admin/*` routes require an admin bearer token. Non-admins get `403`.
+Guest tokens cannot reach these routes — the caller is authenticated but out of
+scope.
+
+### GET /api/admin/targets
+
+Return every target currently loaded by the in-memory `TargetEngine`, including
+the raw command / args / shell strings, env key presence, and the per-target
+active session count.
+
+**Security note:** env values are **never** serialized. Each key is returned as
+`{"key": "PGPASSWORD", "set": true|false}`, where `set` reflects whether
+`std::env::var(key)` would succeed right now on the server process. Telepair
+already trusts whoever can write `targets.yaml`, but exposing resolved secrets
+through an HTTP API would widen the blast radius beyond that implicit trust.
+
+**Response** `200 OK`
+```json
+[
+  {
+    "name": "production-db",
+    "display": "Production DB",
+    "type": "virtual",
+    "command": "psql",
+    "args": ["-h", "db.internal", "-U", "readonly", "production"],
+    "shell": null,
+    "tags": ["database", "production"],
+    "admin_only": true,
+    "env": [
+      { "key": "PGPASSWORD", "set": true }
+    ],
+    "active_sessions": 2
+  }
+]
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | `virtual` for yaml-defined targets, `local` for the built-in default shell. |
+| `command` | string \| null | Literal command string from `targets.yaml`. `${VAR}` placeholders are preserved verbatim — interpolation happens at spawn time. |
+| `args` | string[] | Literal argv tail with `${VAR}` placeholders preserved. |
+| `shell` | string \| null | Override shell for `local`-kind targets. |
+| `admin_only` | boolean | Mirrors the `admin_only: true` flag in the yaml config. |
+| `env` | array | Sorted-by-key list of `{key, set}` pairs. Values are never included. |
+| `active_sessions` | integer | Live count from one grouped `SELECT` on `sessions` — matches the chip on the admin UI. |
+
+Results are sorted by `name` so the admin UI does not shuffle between polls.
+
+**Errors**
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — caller is authenticated but not an admin
+
+### POST /api/admin/targets/reload
+
+Re-read `targets.yaml` from disk and atomically install the resulting
+`TargetEngine` into application state. The swap uses `arc_swap` so in-flight
+requests complete against the old engine and subsequent requests see the new
+one — there is no lock window.
+
+Emits a `target.reloaded` audit event on success with `{path, targets}` in the
+detail blob.
+
+**Response** `200 OK`
+```json
+{
+  "path": "/home/admin/.telepair/targets.yaml",
+  "targets": 4
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `path` | string | Absolute path that was re-read. |
+| `targets` | integer | New target count after the swap. |
+
+**Errors**
+- `400 Bad Request` with body `{ "reason": "no_targets_path", "message": "..." }` — the server was started without a `targets.yaml` path, so there is nothing to reload. The old engine stays loaded.
+- `400 Bad Request` with body `{ "reason": "parse_error", "message": "...", "path": "..." }` — the file on disk is now malformed. The old engine stays loaded and the `message` carries the parse error verbatim so the admin can fix the yaml.
+- `400 Bad Request` with body `{ "reason": "still_referenced", "message": "...", "targets": [{ "target": "...", "active_sessions": N }, ...] }` — the new `targets.yaml` would drop one or more targets that still have live sessions in the hub. The old engine stays loaded and the `targets` array lists exactly which targets are blocking the reload with their live session counts, so the operator can close those sessions (or restore the target in yaml) and retry. Admin UI renders this as a persistent banner instead of a one-shot toast.
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — caller is authenticated but not an admin

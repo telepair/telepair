@@ -22,13 +22,14 @@ The foundation crate. Contains no business logic — only shared abstractions.
 
 | Module | Purpose |
 |--------|---------|
-| `session.rs` | Domain types: `User`, `Session`, `Participant`, `InviteToken`, `InputMode`, `SessionStatus` |
+| `session.rs` | Domain types: `User`, `Session`, `Participant`, `InviteToken`, `InputMode`, `SessionStatus`, `CloseReason` |
 | `permission.rs` | `Role` enum (Owner/Operator/Viewer) with capability methods (`can_input`, `can_resize`, `can_manage`) |
 | `protocol.rs` | `ClientMessage`/`ServerMessage` enums (JSON, `#[serde(tag = "type")]`); PTY output is sent as raw binary WS frames |
-| `storage.rs` | Async `Storage` trait — CRUD for users, sessions, participants, invite tokens |
-| `storage/sqlite.rs` | `SqliteStorage` implementation using sqlx |
+| `storage.rs` | Async `Storage` trait — CRUD for users, sessions, participants, invite tokens, audit events |
+| `storage/sqlite.rs` | `SqliteStorage` implementation using sqlx, with boot-time `run_migrations()` that handles idempotent column / table additions |
 | `auth.rs` | `TokenAuthProvider` — SHA-256 hashed token validation (raw token returned once at creation, never persisted) |
 | `target.rs` | `Target` and `TargetKind` definitions |
+| `audit.rs` | `AuditEvent`, `AuditEventType`, and `AuditSink` trait — append-only event log backing `telepair admin audit` and the in-app session timeline |
 | `error.rs` | `Error` enum (Auth, NotFound, Storage, Internal) |
 
 ### telepair-agent
@@ -42,12 +43,13 @@ Manages PTY processes and virtual target resolution.
 
 ### telepair-control
 
-Business logic services that coordinate core abstractions.
+Business logic services that coordinate core abstractions. As of 0.1.1 this is the **only** layer that touches the `Storage` trait in production code — the gateway goes through services for every read and write. This keeps HTTP handlers and the WebSocket hub free of business rules and makes the services unit-testable without any HTTP plumbing.
 
 | Module | Purpose |
 |--------|---------|
-| `session_service.rs` | `SessionService` — create/close sessions, manage participants, delegate to Storage |
-| `target_service.rs` | `TargetService` — wraps TargetEngine, provides target listing and resolution |
+| `session_service.rs` | `SessionService` — session lifecycle (`create_session`, `close_session(reason)`), participant queries (`list_participants`, `list_sessions_for_user`), authorization helpers (`require_owner`), and cross-layer aggregates like `active_session_counts_per_target`. Emits audit events for create/close and the startup sweep. |
+| `invite_service.rs` | `InviteService` — invite lifecycle (`create`, `redeem`, `list_for_session`, `revoke`). Owns `MAX_INVITE_USES` / TTL validation, the cross-session scoped-guest check, and the guest mint-on-success path. Emits `invite.minted` / `invite.redeemed` / `invite.revoked` audit events. |
+| `target_service.rs` | `TargetService` — wraps `TargetEngine`, provides target listing and resolution. |
 
 ### telepair-gateway
 
@@ -56,10 +58,10 @@ The client-facing layer. Runs the HTTP server, WebSocket upgrade, and serves the
 | Module | Purpose |
 |--------|---------|
 | `lib.rs` | Axum router setup, route definitions |
-| `state.rs` | `AppState` — shared application state (storage, auth, services, session hubs) |
-| `http.rs` | REST handlers: health, targets, sessions, invites |
-| `ws.rs` | WebSocket handler — auth, role enforcement, message routing, PTY I/O bridge |
-| `session_hub.rs` | `SessionHub` — per-session state: PTY process, connected participants, broadcast channels |
+| `state.rs` | `AppState` — shared application state: storage, auth, `SessionService`, `InviteService`, `Arc<ArcSwap<TargetEngine>>` (for atomic target hot-reload), `Arc<dyn AuditSink>`, and the `SessionHub` |
+| `http.rs` | REST handlers: health, targets, sessions, invites (list / revoke), session history, session audit, whoami, admin targets (list + reload). All handlers go through services — no `.storage()` access in production code. |
+| `ws.rs` | WebSocket handler — auth, role enforcement, message routing, PTY I/O bridge, `participant.joined` / `participant.left` audit emits |
+| `session_hub.rs` | `SessionHub` — per-session state: PTY process, connected participants, broadcast channels. Holds `Arc<SessionService>` (not raw Storage) so the reaper closure emits `CloseReason::Reaper` through the same audit path as owner-initiated closes. |
 
 ### telepair-cli
 
@@ -131,13 +133,32 @@ Separation ensures high-frequency terminal output does not starve collaboration 
 ## Storage Schema
 
 ```sql
-users (id, name, token_sha256, is_admin, created_at, updated_at)
-sessions (id, owner_id, target_name, input_mode, status, created_at, closed_at)
+users        (id, name, token_sha256, is_admin, scoped_session_id, created_at, updated_at)
+sessions     (id, owner_id, target_name, input_mode, status, closed_reason, created_at, closed_at)
 participants (session_id, user_id, role, joined_at, left_at)
-invite_tokens (token_sha256, session_id, role, max_uses, used_count, expires_at)
+invite_tokens(token_sha256, session_id, role, max_uses, used_count, expires_at)
+audit_events (id, ts, actor_id, actor_name, event_type, session_id, detail)
 ```
 
 All IDs are UUIDs stored as TEXT. Timestamps are ISO 8601 TEXT. The `Storage` trait is async and implementation-agnostic — SQLite is the v1 backend.
+
+**Schema evolution (0.1.x).** Migration state is kept in a single `migrations/001_initial.sql` file that is loaded on every boot. The loader (`run_migrations()` in `telepair-core/src/storage/sqlite.rs`) applies the full file, then performs a column-existence check (`pragma_table_info`) to idempotently add the `sessions.closed_reason` column on upgraded databases — the `audit_events` table and its four indexes use `CREATE TABLE / INDEX IF NOT EXISTS` for the same reason. This keeps in-place upgrades working within the 0.1.x line without introducing a formal migration framework; the pre-1.0 "delete the DB" fallback still applies on genuine schema conflicts. A proper migration framework is planned for a later minor bump.
+
+### Audit events
+
+The `audit_events` table is append-only. Every row is a single immutable record of a security-meaningful state transition — logins, session lifecycle, participant joins / leaves, invite mint / redeem / revoke, target access denials, and target hot-reloads. High-frequency events (chat messages, cursor updates, PTY bytes) are **not** audited: the table would explode and none of them carry security-meaningful state that isn't already covered by the coarser events.
+
+| Column | Purpose |
+|--------|---------|
+| `id` | Autoincrement i64 primary key — stable insertion order for paginated reads |
+| `ts` | ISO 8601 UTC string, indexed for time-range queries |
+| `actor_id` | User id of the initiator (nullable for system events and failed logins) |
+| `actor_name` | Denormalized snapshot of the user name at emit time — a later user rename must not rewrite history |
+| `event_type` | Tagged string like `session.created` or `invite.revoked` — serialized via `AuditEventType`'s `#[serde(rename = "...")]` |
+| `session_id` | Indexed — supports the per-session timeline view and the `telepair admin audit --session <id>` filter |
+| `detail` | JSON blob with event-specific fields: `reason`, `duration_s`, `role`, `max_uses`, `expires_at`, etc. |
+
+Four indexes cover the four query shapes: time-range (`idx_audit_ts`), per-session timeline (`idx_audit_session`), per-actor history (`idx_audit_actor`), and type-filtered scans (`idx_audit_type`). The table is written to from `SessionService`, `InviteService`, the login path in `AuthService`, and the admin targets reload handler; reads happen from `GET /api/sessions/{id}/audit` and the `telepair admin audit` CLI.
 
 ## Security Model
 
