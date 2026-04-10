@@ -4,13 +4,13 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use telepair_control::invite_service::{CreateInviteParams, CreateInviteResult, RedeemResult};
 use telepair_core::error::Error;
 use telepair_core::permission::Role;
 use telepair_core::session::{InputMode, Session, User};
-use telepair_core::storage::Storage;
 
 use crate::state::AppState;
 
@@ -66,6 +66,10 @@ fn require_unscoped(user: &User) -> Result<(), ApiError> {
 /// Run auth extraction and session lookup concurrently, then verify the
 /// authenticated user owns the session. Shaves one DB-query latency off
 /// each authenticated single-session endpoint.
+///
+/// Both halves go through `SessionService` so the ownership rule lives
+/// exactly once, in one place: [`SessionService::require_owner`] emits
+/// the right 404/403 distinction so the HTTP layer stays transport-only.
 async fn extract_owned_session(
     state: &AppState,
     headers: &HeaderMap,
@@ -73,9 +77,11 @@ async fn extract_owned_session(
 ) -> Result<Session, ApiError> {
     let (user_res, session_res) = tokio::join!(
         extract_user(state, headers),
-        state.sessions.storage().get_session(session_id),
+        state.sessions.get_session(session_id),
     );
     let user = user_res?;
+    // `session_res` is `Result<Option<Session>>`; surface any storage
+    // error through `?` (→ 500) and collapse `None` to 404.
     let session = session_res?.ok_or(ApiError(StatusCode::NOT_FOUND))?;
     if session.owner_id != user.id {
         return Err(ApiError(StatusCode::FORBIDDEN));
@@ -218,90 +224,48 @@ fn default_max_uses() -> i32 {
     1
 }
 
-/// Hard cap on invite `max_uses`. An invite that can be redeemed 10k
-/// times is not an invite, it's a public URL — reject those at the
-/// HTTP layer so a typo in the UI can't produce one by accident.
-const MAX_INVITE_USES: i32 = 100;
-
-/// Hard cap on invite TTL. Week-long invites are already pushing it;
-/// month-long invites are a credential-handling mistake waiting to
-/// happen. Any request asking for longer is clamped to this value.
-const MAX_INVITE_TTL_MINUTES: i64 = 7 * 24 * 60;
-
 pub async fn create_invite(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(session_id): Path<String>,
     body: Result<Json<CreateInviteRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let session = extract_owned_session(&state, &headers, &session_id).await?;
-
-    // State-machine gate: a closed session must not grow new
-    // invites. Without this check the handler happily mints a token
-    // that `redeem_invite` will reject with 410 (see
-    // `redeem_invite`'s status check below) — i.e. the API returns
-    // `201 Created` for an object that is guaranteed to be useless,
-    // leaving zombie invite rows in the DB and a broken share-link
-    // in the owner's hands. Mirror the redeem-side gate so the two
-    // halves of the lifecycle agree on what "alive" means.
-    if session.status != telepair_core::session::SessionStatus::Active {
-        return Err(ApiError(StatusCode::GONE));
-    }
+    // Auth first so unauthenticated callers get 401 instead of 400.
+    let user = extract_user(&state, &headers).await?;
 
     // Axum's default JSON rejection is 422; every other handler in this
     // file remaps to 400 so clients get a consistent "you sent garbage"
     // signal regardless of which field was wrong.
     let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
 
-    // Only operator and viewer roles can be invited
-    if body.role == Role::Owner {
-        return Err(ApiError(StatusCode::BAD_REQUEST));
-    }
-
-    if body.max_uses < 1 || body.max_uses > MAX_INVITE_USES {
-        return Err(ApiError(StatusCode::BAD_REQUEST));
-    }
-
-    // Resolve expiry: absolute timestamp wins over TTL, both are
-    // optional, negative/huge TTLs are clamped rather than rejected so
-    // a slider or number-field overshoot produces a useful invite.
-    let expires_at = match (body.expires_at, body.expires_in_minutes) {
-        (Some(at), _) => {
-            if at <= Utc::now() {
-                return Err(ApiError(StatusCode::BAD_REQUEST));
-            }
-            Some(at)
-        }
-        (None, Some(minutes)) if minutes > 0 => {
-            let clamped = minutes.min(MAX_INVITE_TTL_MINUTES);
-            Some(Utc::now() + Duration::minutes(clamped))
-        }
-        (None, Some(_)) => {
-            // Zero or negative TTL is not a thing — reject loudly rather
-            // than silently creating a "never-expires" invite.
-            return Err(ApiError(StatusCode::BAD_REQUEST));
-        }
-        (None, None) => None,
-    };
-
-    let role = body.role;
-
-    let (invite, raw_token) = state
-        .sessions
-        .storage()
-        .create_invite(&session_id, role, body.max_uses, expires_at)
+    // Everything else — ownership, alive gate, role/max_uses/TTL
+    // validation, token mint — lives inside `InviteService::create`.
+    // The HTTP layer is pure transport + serialization.
+    let result = state
+        .invites
+        .create(
+            &user,
+            &session_id,
+            CreateInviteParams {
+                role: body.role,
+                max_uses: body.max_uses,
+                expires_in_minutes: body.expires_in_minutes,
+                expires_at: body.expires_at,
+            },
+        )
         .await?;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "token": raw_token,
-            "role": invite.role,
-            "max_uses": invite.max_uses,
-            "expires_at": invite.expires_at,
-            "session_id": session_id,
-        })),
-    ))
+    Ok((StatusCode::CREATED, Json(invite_response(&result))))
+}
+
+fn invite_response(r: &CreateInviteResult) -> serde_json::Value {
+    serde_json::json!({
+        "token": r.token,
+        "role": r.role,
+        "max_uses": r.max_uses,
+        "expires_at": r.expires_at,
+        "session_id": r.session_id,
+    })
 }
 
 #[derive(Deserialize)]
@@ -358,85 +322,18 @@ pub async fn redeem_invite(
     // old 422 made bogus redeems look like a server crash.
     let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
 
-    // Look up the invite first (no state change) so we can validate
-    // the session is still alive before burning a use on a closed
-    // session. Without this check, redeeming against a closed session
-    // would decrement `max_uses` and insert a ghost participant — the
-    // invite counter drains and nothing useful happens.
-    let storage = state.sessions.storage();
-    let preview = storage.find_invite(&body.token).await?;
+    // Everything else — preview, scoped-guest check, closed-session
+    // gate, existing-member no-op, atomic consume, guest mint,
+    // participant upsert — lives inside `InviteService::redeem`. The
+    // HTTP layer translates the `RedeemResult` into the wire shape.
+    let result = state.invites.redeem(existing_user, &body.token).await?;
+    Ok(Json(redeem_response(&result)))
+}
 
-    // Scoped-guest cross-session redeem: a guest whose token was
-    // issued for session A must not be able to redeem an invite for
-    // session B and pivot their identity. If the authenticated caller
-    // is scoped, the invite's target session must match their scope
-    // — otherwise reject outright with 403. (They can still reach the
-    // intended session by opening the invite link in a fresh tab
-    // without credentials, which mints a new, correctly-scoped
-    // guest.) Must fire before `consume_invite` so we don't burn a
-    // use on a rejected attempt.
-    if let Some(ref user) = existing_user
-        && let Some(ref scope) = user.scoped_session_id
-        && preview.session_id != *scope
-    {
-        return Err(ApiError(StatusCode::FORBIDDEN));
-    }
-    let session = storage
-        .get_session(&preview.session_id)
-        .await?
-        .ok_or(ApiError(StatusCode::NOT_FOUND))?;
-    if session.status != telepair_core::session::SessionStatus::Active {
-        // Gone / closed — fail without consuming the invite so the
-        // operator can still retract it or reuse uses on a new session.
-        return Err(ApiError(StatusCode::GONE));
-    }
-
-    // If the authenticated caller is already a member of this session
-    // (owner or any role), treat the redeem as a no-op that **does
-    // not** consume the invite. Before this check, an owner clicking
-    // their own share link to sanity-check it would silently burn one
-    // of the `max_uses` and often drop the invite to zero remaining
-    // uses before any guest saw it.
-    if let Some(ref user) = existing_user {
-        let participants = storage.list_participants(&preview.session_id).await?;
-        if let Some(existing) = participants.iter().find(|p| p.user_id == user.id) {
-            return Ok(Json(serde_json::json!({
-                "session_id": preview.session_id,
-                "role": existing.role,
-                "token": serde_json::Value::Null,
-            })));
-        }
-    }
-
-    // Now consume atomically. This validates expiry, max_uses, and
-    // increments used_count in one transaction. A session close that
-    // races in between the check above and this call is possible but
-    // harmless — the participant insert below just won't be visible
-    // because the stopped session's in-memory hub entry is gone.
-    let invite = storage.consume_invite(&body.token).await?;
-
-    // Decide which user joins: reuse the authenticated caller, or
-    // mint a fresh guest. Guests are only created **after** the
-    // invite was successfully consumed, so a rejected invite can
-    // never leave an orphan user behind. The guest's credentials are
-    // scoped to `invite.session_id` so the resulting bearer token
-    // cannot be used to hit account-level routes or connect to any
-    // other session's WS endpoint.
-    let (user, issued_token) = match existing_user {
-        Some(u) => (u, None),
-        None => {
-            let (guest, raw_token) = state.auth.create_guest(&invite.session_id).await?;
-            (guest, Some(raw_token))
-        }
-    };
-
-    storage
-        .upsert_participant(&invite.session_id, user.id, invite.role)
-        .await?;
-
-    Ok(Json(serde_json::json!({
-        "session_id": invite.session_id,
-        "role": invite.role,
-        "token": issued_token,
-    })))
+fn redeem_response(r: &RedeemResult) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": r.session_id,
+        "role": r.role,
+        "token": r.issued_token,
+    })
 }

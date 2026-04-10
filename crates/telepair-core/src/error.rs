@@ -6,6 +6,14 @@ pub enum Error {
     Auth(String),
     #[error("session not found: {0}")]
     SessionNotFound(String),
+    /// The session exists in storage but is no longer accepting new
+    /// participants / invites / state changes. Maps to `410 Gone` so
+    /// the caller learns "the resource used to be here but is now
+    /// permanent-retired" rather than the ambiguous 404 "was it ever
+    /// here?". Used by `InviteService::create` / `redeem` and the REST
+    /// `create_invite` handler.
+    #[error("session closed: {0}")]
+    SessionClosed(String),
     #[error("target not found: {0}")]
     TargetNotFound(String),
     #[error("permission denied: {0}")]
@@ -35,6 +43,7 @@ impl Error {
             Error::Auth(_) => 401,
             Error::PermissionDenied(_) => 403,
             Error::SessionNotFound(_) | Error::TargetNotFound(_) => 404,
+            Error::SessionClosed(_) => 410,
             Error::InvalidInput(_) | Error::Json(_) => 400,
             Error::Storage(_) | Error::Io(_) | Error::Yaml(_) => 500,
         }

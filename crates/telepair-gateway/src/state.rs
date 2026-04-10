@@ -1,26 +1,47 @@
 use std::sync::Arc;
 
 use telepair_agent::virtual_target::TargetEngine;
+use telepair_control::invite_service::InviteService;
 use telepair_control::session_service::SessionService;
 use telepair_core::auth::TokenAuthProvider;
 use telepair_core::storage::{SqliteStorage, Storage};
 
 use crate::session_hub::{ReaperConfig, SessionHub};
 
+/// Shared state handed to every Axum handler. Holds the services
+/// (auth, sessions, invites) that implement business logic, plus the
+/// live [`SessionHub`] and target registry.
+///
+/// The `storage` field is kept **only** for bootstrap + test fixture
+/// seeding (see [`AppState::create_test_user`]). Production handlers
+/// under `crates/telepair-gateway/src/{http,ws}.rs` must never reach
+/// into `state.storage` — business rules live in the services. The
+/// CI grep for `state\.storage` in those files is the enforcement
+/// contract.
 #[derive(Clone)]
 pub struct AppState {
     pub auth: Arc<TokenAuthProvider>,
     pub sessions: Arc<SessionService>,
+    pub invites: Arc<InviteService>,
     pub targets: Arc<TargetEngine>,
     pub hub: Arc<SessionHub>,
+    /// Raw storage handle retained for bootstrap and test fixtures
+    /// only. Do **not** read/write in HTTP/WS handlers — route
+    /// through `sessions` / `invites` instead.
+    pub storage: Arc<SqliteStorage>,
 }
 
 impl AppState {
     pub async fn new(storage: Arc<SqliteStorage>, engine: TargetEngine) -> Self {
         let auth = Arc::new(TokenAuthProvider::new(storage.clone()));
         let sessions = Arc::new(SessionService::new(storage.clone()));
+        let invites = Arc::new(InviteService::new(
+            storage.clone(),
+            sessions.clone(),
+            auth.clone(),
+        ));
         let targets = Arc::new(engine);
-        let hub = Arc::new(SessionHub::new(storage.clone()));
+        let hub = Arc::new(SessionHub::new(sessions.clone()));
         // Production: start the idle-session reaper so orphaned PTYs
         // don't leak when all clients disconnect. The JoinHandle is
         // intentionally detached — the task lives for the process
@@ -33,8 +54,10 @@ impl AppState {
         Self {
             auth,
             sessions,
+            invites,
             targets,
             hub,
+            storage,
         }
     }
 
@@ -46,23 +69,30 @@ impl AppState {
         // reaper spawn it explicitly.
         let auth = Arc::new(TokenAuthProvider::new(storage.clone()));
         let sessions = Arc::new(SessionService::new(storage.clone()));
+        let invites = Arc::new(InviteService::new(
+            storage.clone(),
+            sessions.clone(),
+            auth.clone(),
+        ));
         let targets = Arc::new(engine);
-        let hub = Arc::new(SessionHub::new(storage.clone()));
+        let hub = Arc::new(SessionHub::new(sessions.clone()));
         Self {
             auth,
             sessions,
+            invites,
             targets,
             hub,
+            storage,
         }
     }
 
+    /// Test helper: seed a non-admin user and return their raw token.
+    /// Production handlers MUST NOT call this — it exists only so
+    /// integration tests can skip the `POST /api/auth` round-trip
+    /// when they just need an authenticated identity to attach to
+    /// a request.
     pub async fn create_test_user(&self, name: &str) -> String {
-        let (_, token) = self
-            .sessions
-            .storage()
-            .create_user(name, false)
-            .await
-            .unwrap();
+        let (_, token) = self.storage.create_user(name, false).await.unwrap();
         token
     }
 }
