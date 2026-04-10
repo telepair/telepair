@@ -163,8 +163,7 @@ async fn create_owned_session(state: &AppState, username: &str) -> (String, Stri
     let token = state.create_test_user(username).await;
     let user = state.auth.validate(&token).await.unwrap();
     let session = state
-        .sessions
-        .storage()
+        .storage
         .create_session_with_owner(user.id, "local-shell", InputMode::Serialized)
         .await
         .unwrap();
@@ -181,8 +180,7 @@ async fn add_participant(
     let token = state.create_test_user(username).await;
     let user = state.auth.validate(&token).await.unwrap();
     state
-        .sessions
-        .storage()
+        .storage
         .upsert_participant(session_id, user.id, role)
         .await
         .unwrap();
@@ -414,8 +412,7 @@ async fn e2e_multiplexed_operator_can_type() {
     let owner_token = state.create_test_user("alice").await;
     let owner = state.auth.validate(&owner_token).await.unwrap();
     let session = state
-        .sessions
-        .storage()
+        .storage
         .create_session_with_owner(owner.id, "local-shell", InputMode::Multiplexed)
         .await
         .unwrap();
@@ -459,8 +456,7 @@ async fn e2e_late_joiner_receives_scrollback() {
     let owner_token = state.create_test_user("alice").await;
     let owner = state.auth.validate(&owner_token).await.unwrap();
     let session = state
-        .sessions
-        .storage()
+        .storage
         .create_session_with_owner(owner.id, "local-shell", InputMode::Multiplexed)
         .await
         .unwrap();
@@ -774,8 +770,7 @@ async fn e2e_reaper_kills_idle_session() {
 
     // The row should now be marked `closed` in the DB.
     let reloaded = state
-        .sessions
-        .storage()
+        .storage
         .get_session(&session_id)
         .await
         .expect("storage get_session failed")
@@ -850,12 +845,7 @@ async fn e2e_invitee_reconnects_after_transient_disconnect() {
 
     // DB state check: the invitee's row must still be active. If the
     // old eager-remove logic ever sneaks back in, this fires.
-    let participants_before_rejoin = state
-        .sessions
-        .storage()
-        .list_participants(&session_id)
-        .await
-        .unwrap();
+    let participants_before_rejoin = state.storage.list_participants(&session_id).await.unwrap();
     assert!(
         participants_before_rejoin
             .iter()
@@ -905,32 +895,17 @@ async fn e2e_close_session_settles_all_participants() {
         add_participant(&state, &session_id, "carol", Role::Viewer).await;
 
     // Sanity: all three are active before close.
-    let before = state
-        .sessions
-        .storage()
-        .list_participants(&session_id)
-        .await
-        .unwrap();
+    let before = state.storage.list_participants(&session_id).await.unwrap();
     assert_eq!(before.len(), 3);
 
     // Close the session via the same storage path DELETE /api/sessions
     // and the reaper both use.
-    state
-        .sessions
-        .storage()
-        .close_session(&session_id)
-        .await
-        .unwrap();
+    state.storage.close_session(&session_id).await.unwrap();
 
     // After close, list_participants (which filters on left_at IS NULL)
     // should return zero rows for this session. left_at was written
     // atomically with the sessions status update.
-    let after = state
-        .sessions
-        .storage()
-        .list_participants(&session_id)
-        .await
-        .unwrap();
+    let after = state.storage.list_participants(&session_id).await.unwrap();
     assert!(
         after.is_empty(),
         "close_session should settle left_at for every active participant; still active: {:?}",
@@ -977,8 +952,7 @@ async fn e2e_reaper_skips_reconnected_session() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let reloaded = state
-        .sessions
-        .storage()
+        .storage
         .get_session(&session_id)
         .await
         .unwrap()

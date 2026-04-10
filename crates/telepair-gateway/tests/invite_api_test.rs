@@ -245,12 +245,7 @@ async fn redeem_without_auth_issues_guest_token() {
 
     // And the guest should be recorded as a participant on the session
     // so the WS handshake's NOT_PARTICIPANT check lets them in.
-    let participants = state
-        .sessions
-        .storage()
-        .list_participants(&session_id)
-        .await
-        .unwrap();
+    let participants = state.storage.list_participants(&session_id).await.unwrap();
     assert!(
         participants.iter().any(|p| p.user_id == guest_user.id),
         "guest should be listed as an active participant"
@@ -759,12 +754,7 @@ async fn redeem_issues_distinct_guest_per_redemption() {
     );
 
     // And all three must be listed as active participants.
-    let participants = state
-        .sessions
-        .storage()
-        .list_participants(&session_id)
-        .await
-        .unwrap();
+    let participants = state.storage.list_participants(&session_id).await.unwrap();
     for id in &guest_ids {
         assert!(
             participants.iter().any(|p| p.user_id == *id),
@@ -940,8 +930,7 @@ async fn redeem_expired_invite_rejected() {
     // Create an invite that already expired (expires_at in the past)
     let expired = chrono::Utc::now() - chrono::Duration::hours(1);
     let (_invite, raw_token) = state
-        .sessions
-        .storage()
+        .storage
         .create_invite(&session_id, Role::Operator, 5, Some(expired))
         .await
         .unwrap();
@@ -965,12 +954,7 @@ async fn redeem_expired_invite_rejected() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     // Verify no participant was added
-    let participants = state
-        .sessions
-        .storage()
-        .list_participants(&session_id)
-        .await
-        .unwrap();
+    let participants = state.storage.list_participants(&session_id).await.unwrap();
     assert!(
         participants.iter().all(|p| p.role != Role::Operator),
         "expired invite should not add a participant"
@@ -1065,12 +1049,7 @@ async fn redeem_exhausted_invite_rejected() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     // Verify joiner2 was NOT added as a participant
-    let participants = state
-        .sessions
-        .storage()
-        .list_participants(&session_id)
-        .await
-        .unwrap();
+    let participants = state.storage.list_participants(&session_id).await.unwrap();
     let operator_count = participants
         .iter()
         .filter(|p| p.role == Role::Operator)
@@ -1133,22 +1112,12 @@ async fn redeem_invite_on_closed_session_rejected() {
 
     // Verify the invite use counter is still 0 (not burned) and no
     // ghost participant was added.
-    let invite = state
-        .sessions
-        .storage()
-        .find_invite(&raw_token)
-        .await
-        .unwrap();
+    let invite = state.storage.find_invite(&raw_token).await.unwrap();
     assert_eq!(
         invite.used_count, 0,
         "rejected redemption must not burn an invite use"
     );
-    let participants = state
-        .sessions
-        .storage()
-        .list_participants(&session_id)
-        .await
-        .unwrap();
+    let participants = state.storage.list_participants(&session_id).await.unwrap();
     assert!(
         participants.iter().all(|p| p.role != Role::Operator),
         "no ghost operator participant should exist after rejected redeem"

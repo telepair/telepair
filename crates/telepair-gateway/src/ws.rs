@@ -16,7 +16,6 @@ use telepair_core::protocol::{
     ClientMessage, ServerMessage, close_code_for, error_codes, input_denied,
 };
 use telepair_core::session::InputMode;
-use telepair_core::storage::Storage;
 
 use crate::session_hub::{PtyCommand, SessionAttachment};
 use crate::state::AppState;
@@ -161,10 +160,9 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
 
     // Run session lookup and participant listing concurrently — both depend
     // only on session_id and account for ~half the handshake DB time.
-    let storage = state.sessions.storage();
     let (session_res, participants_res) = tokio::join!(
-        storage.get_session(&session_id),
-        storage.list_participants(&session_id),
+        state.sessions.get_session(&session_id),
+        state.sessions.list_participants(&session_id),
     );
 
     let session = match session_res {

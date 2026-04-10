@@ -9,10 +9,10 @@ use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
 use telepair_agent::pty::PtyManager;
+use telepair_control::session_service::SessionService;
 use telepair_core::error::Result;
 use telepair_core::permission::Role;
 use telepair_core::protocol::{ParticipantInfo, ServerMessage};
-use telepair_core::storage::{SqliteStorage, Storage};
 
 /// Color palette for participant cursors / identifiers.
 const COLORS: &[&str] = &[
@@ -159,14 +159,18 @@ struct LiveSession {
 
 pub struct SessionHub {
     sessions: Arc<RwLock<HashMap<String, LiveSession>>>,
-    storage: Arc<SqliteStorage>,
+    /// Handle back to the control layer so PTY cleanup and the reaper
+    /// can close sessions through the service (and pick up any
+    /// service-level side effects like future audit events) instead
+    /// of reaching past it into raw storage.
+    session_service: Arc<SessionService>,
 }
 
 impl SessionHub {
-    pub fn new(storage: Arc<SqliteStorage>) -> Self {
+    pub fn new(session_service: Arc<SessionService>) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            storage,
+            session_service,
         }
     }
 
@@ -215,7 +219,7 @@ impl SessionHub {
         let output_tx_clone = output_tx.clone();
         let session_id_owned = session_id.to_string();
         let sessions_arc = self.sessions.clone();
-        let storage_clone = self.storage.clone();
+        let session_service_clone = self.session_service.clone();
         let scrollback_for_pty = scrollback.clone();
 
         // PTY I/O loop -- single task owns the PtyManager
@@ -299,7 +303,7 @@ impl SessionHub {
             // etc.) and drop the "already closed" case to debug so it
             // stays out of production dashboards.
             sessions_arc.write().await.remove(&session_id_owned);
-            match storage_clone.close_session(&session_id_owned).await {
+            match session_service_clone.close_session(&session_id_owned).await {
                 Ok(()) => {}
                 Err(telepair_core::error::Error::SessionNotFound(_)) => {
                     tracing::debug!(
@@ -506,7 +510,7 @@ impl SessionHub {
     /// lifetime).
     pub fn spawn_reaper(self: &Arc<Self>, config: ReaperConfig) -> JoinHandle<()> {
         let sessions = self.sessions.clone();
-        let storage = self.storage.clone();
+        let session_service = self.session_service.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(config.check_interval);
             // Skip missed ticks instead of bursting — if the reaper was
@@ -576,7 +580,7 @@ impl SessionHub {
                     // enough (the second call returns SessionNotFound
                     // because the row is already closed), and we'd
                     // rather double-log than leak an open row.
-                    if let Err(e) = storage.close_session(&id).await {
+                    if let Err(e) = session_service.close_session(&id).await {
                         tracing::debug!(session = %id, "reaper close_session: {e}");
                     }
                 }

@@ -19,8 +19,7 @@ async fn owned_session(state: &AppState, username: &str) -> (String, Uuid, Sessi
     let token = state.create_test_user(username).await;
     let user = state.auth.validate(&token).await.unwrap();
     let session = state
-        .sessions
-        .storage()
+        .storage
         .create_session_with_owner(user.id, "local-shell", InputMode::Serialized)
         .await
         .unwrap();
@@ -185,12 +184,7 @@ async fn ws_closed_session_rejected() {
     let (token, _user_id, session) = owned_session(&state, "tester").await;
 
     // Close the session
-    state
-        .sessions
-        .storage()
-        .close_session(&session.id)
-        .await
-        .unwrap();
+    state.storage.close_session(&session.id).await.unwrap();
 
     let (mut ws, _) = connect_async(ws_url(&addr, &session.id))
         .await
@@ -284,8 +278,7 @@ async fn ws_scoped_guest_rejected_from_other_session() {
     // must still catch it.
     let (guest_a, guest_a_token) = state.auth.create_guest(&session_a.id).await.unwrap();
     state
-        .sessions
-        .storage()
+        .storage
         .upsert_participant(&session_b.id, guest_a.id, Role::Viewer)
         .await
         .unwrap();
@@ -331,8 +324,7 @@ async fn ws_scoped_guest_accepted_for_own_session() {
 
     let (guest, guest_token) = state.auth.create_guest(&session.id).await.unwrap();
     state
-        .sessions
-        .storage()
+        .storage
         .upsert_participant(&session.id, guest.id, Role::Viewer)
         .await
         .unwrap();
@@ -419,8 +411,7 @@ async fn ws_closes_session_when_target_resolve_fails() {
     // this happens when targets.yaml is hot-edited between session
     // creation and WS join; simulating it by hand is the same shape.
     let session = state
-        .sessions
-        .storage()
+        .storage
         .create_session_with_owner(user.id, "ghost-target", InputMode::Serialized)
         .await
         .unwrap();
@@ -451,8 +442,7 @@ async fn ws_closes_session_when_target_resolve_fails() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let fetched = state
-        .sessions
-        .storage()
+        .storage
         .get_session(&session.id)
         .await
         .unwrap()
