@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use telepair_core::permission::Role;
 use telepair_core::protocol::ServerMessage;
-use telepair_core::session::{InputMode, Session};
+use telepair_core::session::{CloseReason, InputMode, Session};
 use telepair_core::storage::Storage;
 use telepair_gateway::state::AppState;
 
@@ -184,7 +184,11 @@ async fn ws_closed_session_rejected() {
     let (token, _user_id, session) = owned_session(&state, "tester").await;
 
     // Close the session
-    state.storage.close_session(&session.id).await.unwrap();
+    state
+        .storage
+        .close_session(&session.id, CloseReason::Owner)
+        .await
+        .unwrap();
 
     let (mut ws, _) = connect_async(ws_url(&addr, &session.id))
         .await

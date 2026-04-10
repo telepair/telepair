@@ -14,10 +14,11 @@ use telepair_control::invite_service::{
     CreateInviteParams, InviteService, MAX_INVITE_TTL_MINUTES, MAX_INVITE_USES,
 };
 use telepair_control::session_service::SessionService;
+use telepair_core::audit::AuditSink;
 use telepair_core::auth::TokenAuthProvider;
 use telepair_core::error::Error;
 use telepair_core::permission::Role;
-use telepair_core::session::{InputMode, Session, User};
+use telepair_core::session::{CloseReason, InputMode, Session, User};
 use telepair_core::storage::{SqliteStorage, Storage};
 
 struct Fixture {
@@ -29,9 +30,10 @@ struct Fixture {
 
 async fn setup() -> Fixture {
     let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
-    let sessions = Arc::new(SessionService::new(storage.clone()));
+    let audit = Arc::new(AuditSink::new(storage.clone()));
+    let sessions = Arc::new(SessionService::new(storage.clone(), audit.clone()));
     let auth = Arc::new(TokenAuthProvider::new(storage.clone()));
-    let invites = InviteService::new(storage.clone(), sessions.clone(), auth.clone());
+    let invites = InviteService::new(storage.clone(), sessions.clone(), auth.clone(), audit);
     Fixture {
         invites,
         sessions,
@@ -47,7 +49,7 @@ async fn seed_user(fx: &Fixture, name: &str) -> User {
 
 async fn seed_session(fx: &Fixture, owner: &User) -> Session {
     fx.sessions
-        .create_session(owner.id, "local-shell", InputMode::Multiplexed)
+        .create_session(owner, "local-shell", InputMode::Multiplexed)
         .await
         .unwrap()
 }
@@ -220,7 +222,10 @@ async fn create_against_closed_session_returns_gone() {
     let fx = setup().await;
     let owner = seed_user(&fx, "owner").await;
     let session = seed_session(&fx, &owner).await;
-    fx.sessions.close_session(&session.id).await.unwrap();
+    fx.sessions
+        .close_session(&session.id, CloseReason::Owner, Some(&owner))
+        .await
+        .unwrap();
 
     let err = fx
         .invites
@@ -334,7 +339,10 @@ async fn redeem_against_closed_session_returns_gone_without_burn() {
         .await
         .unwrap();
 
-    fx.sessions.close_session(&session.id).await.unwrap();
+    fx.sessions
+        .close_session(&session.id, CloseReason::Owner, Some(&owner))
+        .await
+        .unwrap();
 
     let err = fx.invites.redeem(None, &created.token).await.unwrap_err();
     assert!(matches!(err, Error::SessionClosed(_)));
@@ -344,4 +352,187 @@ async fn redeem_against_closed_session_returns_gone_without_burn() {
     // session or retract it cleanly.
     let preview = fx.invites.preview(&created.token).await.unwrap();
     assert_eq!(preview.used_count, 0);
+}
+
+// ---------------------------------------------------------------------------
+// InviteService::list_for_session / ::revoke
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_for_session_returns_all_invites_with_remaining_uses() {
+    let fx = setup().await;
+    let owner = seed_user(&fx, "owner").await;
+    let session = seed_session(&fx, &owner).await;
+
+    // Mint three invites, consume one partially so remaining_uses is
+    // interesting (2 remaining out of 3).
+    let a = fx
+        .invites
+        .create(&owner, &session.id, default_params(Role::Operator))
+        .await
+        .unwrap();
+    let _b = fx
+        .invites
+        .create(&owner, &session.id, default_params(Role::Viewer))
+        .await
+        .unwrap();
+    let _c = fx
+        .invites
+        .create(&owner, &session.id, default_params(Role::Viewer))
+        .await
+        .unwrap();
+
+    // Burn one use on invite A.
+    fx.invites.redeem(None, &a.token).await.unwrap();
+
+    let rows = fx
+        .invites
+        .list_for_session(&owner, &session.id)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+
+    // Every row carries a computed `remaining_uses`. Pick out the
+    // row we burned a use on and verify the arithmetic.
+    let consumed_row = rows
+        .iter()
+        .find(|r| r.used_count == 1)
+        .expect("consumed row present");
+    assert_eq!(consumed_row.max_uses, 3);
+    assert_eq!(consumed_row.remaining_uses, 2);
+    assert_eq!(consumed_row.token_prefix.len(), 8);
+    assert!(consumed_row.created_at.is_some());
+}
+
+#[tokio::test]
+async fn list_for_session_rejects_non_owner() {
+    let fx = setup().await;
+    let owner = seed_user(&fx, "owner").await;
+    let stranger = seed_user(&fx, "stranger").await;
+    let session = seed_session(&fx, &owner).await;
+
+    let err = fx
+        .invites
+        .list_for_session(&stranger, &session.id)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::PermissionDenied(_)));
+}
+
+#[tokio::test]
+async fn list_for_session_works_on_closed_session() {
+    // Post-mortem use case: an admin wants to see who was invited
+    // to a session that has since been closed. `list_for_session`
+    // uses `require_owner`, not `require_active_owned`, so this path
+    // must still return rows.
+    let fx = setup().await;
+    let owner = seed_user(&fx, "owner").await;
+    let session = seed_session(&fx, &owner).await;
+    fx.invites
+        .create(&owner, &session.id, default_params(Role::Operator))
+        .await
+        .unwrap();
+
+    fx.sessions
+        .close_session(&session.id, CloseReason::Owner, Some(&owner))
+        .await
+        .unwrap();
+
+    let rows = fx
+        .invites
+        .list_for_session(&owner, &session.id)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+}
+
+#[tokio::test]
+async fn revoke_hard_deletes_and_blocks_future_redeem() {
+    let fx = setup().await;
+    let owner = seed_user(&fx, "owner").await;
+    let session = seed_session(&fx, &owner).await;
+    let created = fx
+        .invites
+        .create(&owner, &session.id, default_params(Role::Operator))
+        .await
+        .unwrap();
+
+    let rows = fx
+        .invites
+        .list_for_session(&owner, &session.id)
+        .await
+        .unwrap();
+    let sha = rows[0].token_sha256.clone();
+
+    fx.invites.revoke(&owner, &session.id, &sha).await.unwrap();
+
+    // Row is gone from listings.
+    let rows = fx
+        .invites
+        .list_for_session(&owner, &session.id)
+        .await
+        .unwrap();
+    assert!(rows.is_empty());
+
+    // And the raw token no longer redeems — the whole point.
+    let err = fx.invites.redeem(None, &created.token).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput(_)));
+}
+
+#[tokio::test]
+async fn revoke_rejects_non_owner() {
+    let fx = setup().await;
+    let owner = seed_user(&fx, "owner").await;
+    let stranger = seed_user(&fx, "stranger").await;
+    let session = seed_session(&fx, &owner).await;
+    fx.invites
+        .create(&owner, &session.id, default_params(Role::Operator))
+        .await
+        .unwrap();
+
+    let rows = fx
+        .invites
+        .list_for_session(&owner, &session.id)
+        .await
+        .unwrap();
+    let sha = rows[0].token_sha256.clone();
+
+    let err = fx
+        .invites
+        .revoke(&stranger, &session.id, &sha)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::PermissionDenied(_)));
+}
+
+#[tokio::test]
+async fn revoke_cross_session_pretends_not_found() {
+    // Probing for another session's invites must read as 404, not
+    // "wrong session". We check that by asking `revoke` for a real
+    // token_sha256 but with the wrong session_id in the URL.
+    let fx = setup().await;
+    let owner_a = seed_user(&fx, "owner-a").await;
+    let owner_b = seed_user(&fx, "owner-b").await;
+    let session_a = seed_session(&fx, &owner_a).await;
+    let session_b = seed_session(&fx, &owner_b).await;
+
+    // Mint an invite in session A.
+    fx.invites
+        .create(&owner_a, &session_a.id, default_params(Role::Operator))
+        .await
+        .unwrap();
+    let rows = fx
+        .invites
+        .list_for_session(&owner_a, &session_a.id)
+        .await
+        .unwrap();
+    let sha_a = rows[0].token_sha256.clone();
+
+    // Owner B tries to revoke it via their own session id.
+    let err = fx
+        .invites
+        .revoke(&owner_b, &session_b.id, &sha_a)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidInput(_)));
 }

@@ -22,7 +22,7 @@ targets:
 async fn setup() -> (axum::Router, String, String) {
     let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
     let engine = TargetEngine::from_yaml(TARGETS_YAML).unwrap();
-    let state = AppState::new(storage.clone(), engine).await;
+    let state = AppState::new(storage.clone(), engine, None).await;
 
     let (_, user_token) = storage.create_user("regular", false).await.unwrap();
     let (_, admin_token) = storage.create_user("admin", true).await.unwrap();

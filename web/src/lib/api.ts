@@ -1,5 +1,34 @@
 // web/src/lib/api.ts
-import type { TargetInfo, Session, InviteInfo, RedeemResult, Role, InputMode } from './protocol';
+import type {
+  TargetInfo,
+  Session,
+  SessionStatus,
+  InviteInfo,
+  InviteSummary,
+  AuditEvent,
+  RedeemResult,
+  Role,
+  InputMode,
+  AdminTargetInfo,
+  ReloadTargetsResult,
+} from './protocol';
+
+/**
+ * Optional filter for `api.listSessions`. Introduced alongside the
+ * v0.1.1 session-history view so the dashboard can toggle
+ * Active / Closed / All without the server returning the whole
+ * history on every refresh.
+ *
+ * Omit `status` (or pass `'all'`) to get both active and closed rows.
+ * `targetName` narrows the result to a single virtual target — used by
+ * the "N active sessions" deep link from the admin targets page.
+ */
+export interface ListSessionsOptions {
+  status?: SessionStatus | 'all';
+  targetName?: string;
+  limit?: number;
+  offset?: number;
+}
 import { auth, readCurrentToken } from '../stores/auth';
 
 const BASE = '/api';
@@ -81,17 +110,68 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return resp.json();
 }
 
+/**
+ * Caller identity returned by `GET /api/auth/whoami`. The auth store
+ * caches `user_id` so the dashboard can compare it against
+ * `session.owner_id` when deciding whether to open the owner-only
+ * audit dialog — without this comparison, non-owner participants would
+ * see closed rows in their history list (since `list_sessions_for_user`
+ * returns "owned OR joined") and clicking through would deterministi
+ * cally hit a 403 from `/audit`.
+ */
+export interface WhoamiResponse {
+  user_id: string;
+  name: string;
+  is_admin: boolean;
+  is_guest: boolean;
+}
+
 export const api = {
   health(): Promise<{ status: string }> {
     return request('/health');
+  },
+
+  /**
+   * Read the authenticated caller's identity. Returns 401 on missing
+   * or invalid bearer (which the global interceptor turns into a
+   * /login bounce); never 403, since "I am a guest" is still a valid
+   * identity to surface.
+   */
+  whoami(): Promise<WhoamiResponse> {
+    return request('/auth/whoami');
   },
 
   listTargets(): Promise<TargetInfo[]> {
     return request('/targets');
   },
 
-  listSessions(): Promise<Session[]> {
-    return request('/sessions');
+  /**
+   * List sessions visible to the caller. The server decides the
+   * visibility: regular users see the sessions they own or are a
+   * participant of; admins see everything. Without any options this
+   * returns the legacy "active only" list — we keep that as the
+   * default so all the pre-0.1.1 callers (terminal banner, reconnect
+   * logic, etc.) carry on unchanged.
+   */
+  listSessions(opts: ListSessionsOptions = {}): Promise<Session[]> {
+    const params = new URLSearchParams();
+    // `all` maps to "no filter" — the server treats an absent status
+    // as "all statuses", so we deliberately skip the param in that
+    // case rather than forwarding the literal string.
+    if (opts.status && opts.status !== 'all') {
+      params.set('status', opts.status);
+    }
+    if (opts.targetName) {
+      params.set('target_name', opts.targetName);
+    }
+    if (opts.limit != null) {
+      params.set('limit', String(opts.limit));
+    }
+    if (opts.offset != null) {
+      params.set('offset', String(opts.offset));
+    }
+    const qs = params.toString();
+    return request(qs ? `/sessions?${qs}` : '/sessions');
   },
 
   createSession(target_name: string, input_mode?: InputMode): Promise<Session> {
@@ -123,7 +203,7 @@ export const api = {
     role: Role,
     opts: { maxUses?: number; expiresInMinutes?: number } = {},
   ): Promise<InviteInfo> {
-    return request(`/sessions/${sessionId}/invite`, {
+    return request(`/sessions/${sessionId}/invites`, {
       method: 'POST',
       body: JSON.stringify({
         role,
@@ -138,6 +218,76 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ token }),
     });
+  },
+
+  /**
+   * Owner-only. List every invite ever minted for `sessionId`, active
+   * and expired/exhausted alike — the management dialog wants the full
+   * history and renders state chips per row. The response deliberately
+   * omits raw bearer tokens; callers label rows by `token_prefix` (8
+   * hex chars) and revoke by `token_sha256`.
+   */
+  listInvites(sessionId: string): Promise<InviteSummary[]> {
+    return request(`/sessions/${sessionId}/invites`);
+  },
+
+  /**
+   * Owner-only. Hard-delete an invite row by its SHA-256 digest.
+   * Returns 204 on success, 400 on "already gone", 403 when the
+   * caller does not own the session. The UI refreshes its list on
+   * every response so a concurrent revoke from another owner tab
+   * converges on its own.
+   */
+  revokeInvite(sessionId: string, tokenSha256: string): Promise<void> {
+    return request(`/sessions/${sessionId}/invites/${tokenSha256}`, {
+      method: 'DELETE',
+    });
+  },
+
+  /**
+   * Owner-only. Read the audit timeline for `sessionId`, newest first.
+   * The endpoint stays open after the session is closed (the whole
+   * point of the history view is reading what happened on a closed
+   * session), so the caller does not need to special-case status
+   * transitions. Capped server-side at 500 rows; pagination will land
+   * if a real session ever needs it.
+   */
+  listSessionAudit(sessionId: string): Promise<AuditEvent[]> {
+    return request(`/sessions/${sessionId}/audit`);
+  },
+
+  /**
+   * Admin-only. Full target list with command / args / env presence
+   * and per-target active session counts. Env values are never
+   * returned by the server — see `AdminTargetEnvKey` for the security
+   * rationale. Regular users get 403; unauthenticated calls get 401
+   * and the global interceptor bounces them to /login.
+   */
+  listAdminTargets(): Promise<AdminTargetInfo[]> {
+    return request('/admin/targets');
+  },
+
+  /**
+   * Admin-only. Re-read `targets.yaml` from disk and atomically swap
+   * the in-memory target engine. Three failure modes the caller must
+   * distinguish — the server returns structured JSON on 400 rather
+   * than a bare HTTP status so the UI can pick the right message:
+   *
+   * - 400 `reason=no_targets_path`: operator never configured a yaml
+   *   file. The UI should tell them to set `--targets` and restart.
+   * - 400 `reason=parse_error`: the file on disk is malformed now.
+   *   The UI should surface the parse error verbatim so they can fix
+   *   it without opening a terminal.
+   * - 200: the engine was swapped. The old pointer is dropped lazily
+   *   by ArcSwap once all in-flight readers release it.
+   *
+   * The ApiError thrown for 400/403/401 carries the raw response body
+   * as its message; the AdminTargets page parses it and picks the
+   * right toast. We keep this helper thin (no error shape transform)
+   * so the caller retains full control over the branching.
+   */
+  reloadTargets(): Promise<ReloadTargetsResult> {
+    return request('/admin/targets/reload', { method: 'POST' });
   },
 };
 

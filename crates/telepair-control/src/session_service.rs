@@ -1,9 +1,12 @@
 use std::sync::Arc;
 use uuid::Uuid;
 
+use telepair_core::audit::{AuditEvent, AuditEventType, AuditSink};
 use telepair_core::error::{Error, Result};
 use telepair_core::permission::Role;
-use telepair_core::session::{InputMode, Participant, Session, SessionStatus, User};
+use telepair_core::session::{
+    CloseReason, InputMode, Participant, Session, SessionListFilter, SessionStatus, User,
+};
 use telepair_core::storage::{SqliteStorage, Storage};
 
 /// Session-layer business rules: create, close, lookup, ownership
@@ -20,34 +23,147 @@ use telepair_core::storage::{SqliteStorage, Storage};
 /// directly.
 pub struct SessionService {
     storage: Arc<SqliteStorage>,
+    audit: Arc<AuditSink>,
 }
 
 impl SessionService {
-    pub fn new(storage: Arc<SqliteStorage>) -> Self {
-        Self { storage }
+    pub fn new(storage: Arc<SqliteStorage>, audit: Arc<AuditSink>) -> Self {
+        Self { storage, audit }
     }
 
     // -- Session lifecycle ---------------------------------------------------
 
     pub async fn create_session(
         &self,
-        owner_id: Uuid,
+        owner: &User,
         target_name: &str,
         input_mode: InputMode,
     ) -> Result<Session> {
         // Atomic: session row + owner participant row land together or
         // not at all. See `Storage::create_session_with_owner`.
-        self.storage
-            .create_session_with_owner(owner_id, target_name, input_mode)
-            .await
+        let session = self
+            .storage
+            .create_session_with_owner(owner.id, target_name, input_mode)
+            .await?;
+
+        // Audit the lifecycle event after the storage write has
+        // succeeded — no point recording a session that never
+        // existed. `record` is log-and-swallow, so a transient audit
+        // outage does not fail the user-visible create call. We also
+        // emit an implicit `participant.joined` for the owner so the
+        // timeline reads naturally ("alice created session sess-X /
+        // alice joined as Owner") without requiring a second explicit
+        // upsert call.
+        self.audit
+            .record(
+                AuditEvent::new(AuditEventType::SessionCreated)
+                    .with_actor(owner.id, owner.name.clone())
+                    .with_session(session.id.clone())
+                    .with_detail(serde_json::json!({
+                        "target_name": target_name,
+                        "input_mode": input_mode.as_str(),
+                    })),
+            )
+            .await;
+        self.audit
+            .record(
+                AuditEvent::new(AuditEventType::ParticipantJoined)
+                    .with_actor(owner.id, owner.name.clone())
+                    .with_session(session.id.clone())
+                    .with_detail(serde_json::json!({ "role": Role::Owner.as_str() })),
+            )
+            .await;
+        Ok(session)
     }
 
-    pub async fn close_session(&self, session_id: &str) -> Result<()> {
-        self.storage.close_session(session_id).await
+    /// Close a session, stamping the given `reason` into the history
+    /// row so the UI can show "owner closed" vs "reaper timed out"
+    /// vs "server restart". Every close path in the codebase routes
+    /// through this method — inline `.storage().close_session(...)`
+    /// calls would lose the reason and silently backfill `None`.
+    ///
+    /// `actor` is the user who triggered the close when there is one
+    /// (owner clicking "end session"), or `None` for server-initiated
+    /// paths (reaper, startup sweep). The audit event keeps the
+    /// distinction so the history view can render "Owner alice ended"
+    /// vs "Timed out after N minutes".
+    pub async fn close_session(
+        &self,
+        session_id: &str,
+        reason: CloseReason,
+        actor: Option<&User>,
+    ) -> Result<()> {
+        // Snapshot the pre-close row so the audit `duration_s` can
+        // use the authoritative `created_at` from the DB rather than
+        // whatever the caller might cache. `get_session` is cheap and
+        // runs against the same connection pool as the close.
+        let pre = self.storage.get_session(session_id).await?;
+        self.storage.close_session(session_id, reason).await?;
+
+        // Best-effort audit after the transaction committed.
+        let mut event = AuditEvent::new(AuditEventType::SessionClosed).with_session(session_id);
+        if let Some(user) = actor {
+            event = event.with_actor(user.id, user.name.clone());
+        }
+        let duration_s = pre
+            .as_ref()
+            .map(|s| (chrono::Utc::now() - s.created_at).num_seconds());
+        event = event.with_detail(serde_json::json!({
+            "reason": reason.as_str(),
+            "duration_s": duration_s,
+        }));
+        self.audit.record(event).await;
+        Ok(())
     }
 
-    pub async fn list_sessions_for_user(&self, user_id: Uuid) -> Result<Vec<Session>> {
-        self.storage.list_sessions_for_user(user_id).await
+    /// Bulk-close every still-active session, used by the boot-time
+    /// startup cleanup. Always passes through as `CloseReason::Startup`
+    /// at the CLI call site; exposed on the service so test fixtures
+    /// can reach it without talking to storage directly. Emits one
+    /// synthetic `session.closed` audit row carrying the bulk count
+    /// rather than one-per-session — the history timeline would
+    /// otherwise be flooded on every restart against a DB that had
+    /// been running for weeks.
+    pub async fn close_stale_sessions(&self, reason: CloseReason) -> Result<u64> {
+        let closed = self.storage.close_stale_sessions(reason).await?;
+        if closed > 0 {
+            self.audit
+                .record(AuditEvent::new(AuditEventType::SessionClosed).with_detail(
+                    serde_json::json!({
+                        "reason": reason.as_str(),
+                        "bulk": true,
+                        "count": closed,
+                    }),
+                ))
+                .await;
+        }
+        Ok(closed)
+    }
+
+    /// List sessions visible to `user_id`, filtered by `filter`.
+    /// Default filter = every session the user owned or joined,
+    /// active or closed, newest first — the shape the Dashboard
+    /// Sessions tab wants. Callers that specifically need "what am
+    /// I in right now" should pass [`SessionListFilter::active_only`].
+    pub async fn list_sessions_for_user(
+        &self,
+        user_id: Uuid,
+        filter: SessionListFilter,
+    ) -> Result<Vec<Session>> {
+        self.storage.list_sessions_for_user(user_id, filter).await
+    }
+
+    /// Count how many currently-active sessions exist per target
+    /// name. Backs the admin targets page ("N active sessions on
+    /// this target" deep link) without forcing the HTTP handler to
+    /// reach into raw storage — that path is reserved for
+    /// bootstrap and test fixtures only. Targets with zero rows
+    /// are omitted from the map; callers look up absent targets
+    /// as zero.
+    pub async fn active_session_counts_per_target(
+        &self,
+    ) -> Result<std::collections::HashMap<String, u32>> {
+        self.storage.count_active_sessions_per_target().await
     }
 
     // -- Session lookup ------------------------------------------------------

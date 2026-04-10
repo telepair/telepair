@@ -122,6 +122,20 @@ export type AuthErrorKey =
 const [token, setTokenSignal] = createSignal(readInitialToken());
 const [validating, setValidating] = createSignal(false);
 const [errorKey, setErrorKey] = createSignal<AuthErrorKey>(null);
+// Cached caller identity. Empty string when unknown — populated
+// lazily by `loadIdentity()` from `/api/auth/whoami` so the dashboard
+// can compare it against `session.owner_id` to decide whether a
+// closed-row click should open the owner-only audit dialog. Without
+// this signal the dashboard had no way to tell "session I own" from
+// "session I merely joined", and clicking the latter would 403 the
+// audit fetch and surface as a confusing in-dialog error.
+const [currentUserId, setCurrentUserId] = createSignal('');
+// Role snapshot for the same caller. `null` while loadIdentity is
+// pending so route guards that depend on it can fail-closed (treat
+// "unknown" as "not admin") without flashing the admin UI to a
+// guest on the first paint. Populated by the same whoami call as
+// `currentUserId`, so the two always lands together.
+const [currentUserIsAdmin, setCurrentUserIsAdmin] = createSignal<boolean | null>(null);
 
 export interface SetTokenOptions {
   /**
@@ -145,9 +159,39 @@ function setToken(value: string, options: SetTokenOptions = {}) {
     // from localStorage.
     safeRemove(sessionStore(), STORAGE_KEY);
     safeRemove(localStore(), STORAGE_KEY);
+    // Identity is bound to the credential — when the credential goes
+    // away, the cached id must too. Otherwise the next login (e.g.
+    // admin → guest invite → admin) would observe a stale id from
+    // the previous session and mis-gate the dashboard's owner check.
+    // The admin flag rides on the same lifecycle: a stale `true` here
+    // would leak the admin gear icon to a subsequent guest session.
+    setCurrentUserId('');
+    setCurrentUserIsAdmin(null);
   }
   setTokenSignal(value);
   setErrorKey(null);
+}
+
+/**
+ * Fetch and cache the caller's identity from `/api/auth/whoami`.
+ * Idempotent: returns immediately if `currentUserId` is already set
+ * or no token is in scope, so callers can fire it from any mount
+ * without worrying about double-fetches. Failures are swallowed —
+ * the next protected request will surface the real error through
+ * the global 401 interceptor, and the dashboard's owner-gate falls
+ * back to "no rows are owned" which is the safer side of the call.
+ */
+async function loadIdentity(): Promise<void> {
+  if (currentUserId() || !token()) return;
+  try {
+    const me = await api.whoami();
+    setCurrentUserId(me.user_id);
+    setCurrentUserIsAdmin(me.is_admin);
+  } catch {
+    // Non-fatal: see comment above. Specifically NOT calling
+    // `logoutAndRedirect` here — a transient network blip during
+    // dashboard mount must not bounce the user back to /login.
+  }
 }
 
 async function validateToken(t: string): Promise<boolean> {
@@ -158,6 +202,12 @@ async function validateToken(t: string): Promise<boolean> {
   setToken(t, { persist: true });
   try {
     await api.listTargets();
+    // Prime the cached identity right after the credential check —
+    // the dashboard's owner gate runs on first paint, so deferring
+    // this to a separate `loadIdentity()` call would race with the
+    // first session-row click. Best-effort: a transient whoami
+    // failure must not turn a successful login into a failed one.
+    await loadIdentity();
     return true;
   } catch (e) {
     setToken('');
@@ -202,8 +252,11 @@ export const auth = {
   token,
   validating,
   errorKey,
+  currentUserId,
+  currentUserIsAdmin,
   setToken,
   validateToken,
+  loadIdentity,
   logout,
   logoutAndRedirect,
   isAuthenticated,

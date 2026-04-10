@@ -1,6 +1,6 @@
-import { createSignal, Show } from 'solid-js';
+import { createEffect, createSignal, For, Show } from 'solid-js';
 import { api } from '../lib/api';
-import type { Role, InputMode } from '../lib/protocol';
+import type { InviteSummary, Role, InputMode } from '../lib/protocol';
 import { toast } from '../stores/toast';
 import { useI18n, type Translator, type TranslationKey } from '../i18n';
 
@@ -62,10 +62,43 @@ export default function InviteDialog(props: InviteDialogProps) {
   const [inviteMaxUses, setInviteMaxUses] = createSignal<number>(1);
   const [creating, setCreating] = createSignal(false);
   const [copied, setCopied] = createSignal(false);
+  // Management state: the list of existing invites the owner can
+  // audit and revoke. Loaded when the dialog opens and after every
+  // successful create / revoke so the two surfaces never diverge.
+  const [invites, setInvites] = createSignal<InviteSummary[]>([]);
+  const [invitesLoading, setInvitesLoading] = createSignal(false);
+  const [invitesError, setInvitesError] = createSignal<string | null>(null);
+  // Two-step revoke confirmation — same UX shape as "close session"
+  // so owners don't accidentally kill a live link by misclicking.
+  const [pendingRevoke, setPendingRevoke] = createSignal<string | null>(null);
   // Ref to the readonly <input> so the execCommand fallback can
   // select it — picking text from an unfocused input is a no-op on
   // most browsers.
   let urlInputRef: HTMLInputElement | undefined;
+
+  const loadInvites = async () => {
+    setInvitesLoading(true);
+    setInvitesError(null);
+    try {
+      const rows = await api.listInvites(props.sessionId);
+      setInvites(rows);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setInvitesError(msg);
+    } finally {
+      setInvitesLoading(false);
+    }
+  };
+
+  // Re-load whenever the dialog becomes visible. `open` is the signal
+  // the parent flips — we deliberately do NOT clear the list on close
+  // so a fast re-open shows stale-but-useful rows while the refresh
+  // flight is in progress.
+  createEffect(() => {
+    if (props.open) {
+      void loadInvites();
+    }
+  });
 
   const handleCreate = async () => {
     setCreating(true);
@@ -79,12 +112,52 @@ export default function InviteDialog(props: InviteDialogProps) {
       setInviteUrl(url);
       setInviteExpiresAt(invite.expires_at);
       setInviteMaxUses(invite.max_uses);
+      // Refresh the management list so the newly-minted row appears
+      // the moment the owner navigates back from the copy-link view.
+      void loadInvites();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       toast.error(t('invite.failed', { msg }));
     } finally {
       setCreating(false);
     }
+  };
+
+  const handleRevoke = async (tokenSha256: string) => {
+    try {
+      await api.revokeInvite(props.sessionId, tokenSha256);
+      setPendingRevoke(null);
+      toast.success(t('invite.manage_revoke_success'));
+      // Optimistic local drop → immediate visual feedback → then a
+      // full refresh to reconcile with the server (covers the
+      // concurrent-revoke-from-another-tab case).
+      setInvites((rows) => rows.filter((r) => r.token_sha256 !== tokenSha256));
+      void loadInvites();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      toast.error(t('invite.manage_revoke_failed', { msg }));
+      // Fall through to a refresh even on error — a 400 here means
+      // the row was already revoked, and the refresh will drop it.
+      void loadInvites();
+    }
+  };
+
+  const remainingLabel = (row: InviteSummary): string => {
+    if (row.remaining_uses <= 0) return t('invite.manage_exhausted');
+    if (row.expires_at) {
+      const when = new Date(row.expires_at).getTime();
+      if (!Number.isNaN(when) && when <= Date.now()) return t('invite.manage_expired');
+    }
+    return t(
+      row.remaining_uses === 1 ? 'invite.manage_remaining_singular' : 'invite.manage_remaining_plural',
+      { remaining: String(row.remaining_uses), total: String(row.max_uses) },
+    );
+  };
+
+  const roleBadge = (role: Role): string => {
+    if (role === 'operator') return t('invite.manage_role_operator');
+    if (role === 'viewer') return t('invite.manage_role_viewer');
+    return role;
   };
 
   // Copy strategy:
@@ -179,6 +252,80 @@ export default function InviteDialog(props: InviteDialogProps) {
             </div>
           }>
             <div class="invite-form">
+              <div class="invite-manage">
+                <label class="invite-manage-label">
+                  {t('invite.manage_heading')}
+                </label>
+                <Show when={invitesError()}>
+                  <p class="manage-error">
+                    {t('invite.manage_failed', { msg: invitesError() ?? '' })}
+                  </p>
+                </Show>
+                <Show when={invitesLoading() && invites().length === 0}>
+                  <p class="hint">{t('invite.manage_loading')}</p>
+                </Show>
+                <Show when={!invitesLoading() && invites().length === 0}>
+                  <p class="hint">{t('invite.manage_empty')}</p>
+                </Show>
+                <ul class="invite-list" data-testid="invite-list">
+                  <For each={invites()}>
+                    {(row) => (
+                      <li class="invite-row" data-testid="invite-row">
+                        <div class="invite-row-main">
+                          <span
+                            class="invite-row-prefix"
+                            data-testid="invite-prefix"
+                            title={row.token_sha256}
+                          >
+                            {row.token_prefix}
+                          </span>
+                          <span class={`role-badge role-badge-${row.role}`}>
+                            {roleBadge(row.role)}
+                          </span>
+                          <span
+                            class="invite-row-remaining"
+                            data-testid="invite-remaining"
+                          >
+                            {remainingLabel(row)}
+                          </span>
+                        </div>
+                        <Show
+                          when={pendingRevoke() === row.token_sha256}
+                          fallback={
+                            <button
+                              type="button"
+                              class="invite-revoke-btn"
+                              data-testid="invite-revoke"
+                              onClick={() => setPendingRevoke(row.token_sha256)}
+                            >
+                              {t('invite.manage_revoke')}
+                            </button>
+                          }
+                        >
+                          <div class="invite-revoke-confirm">
+                            <button
+                              type="button"
+                              class="invite-revoke-yes"
+                              data-testid="invite-revoke-confirm"
+                              onClick={() => handleRevoke(row.token_sha256)}
+                            >
+                              {t('invite.manage_revoke_confirm')}
+                            </button>
+                            <button
+                              type="button"
+                              class="invite-revoke-no"
+                              onClick={() => setPendingRevoke(null)}
+                            >
+                              {t('invite.manage_revoke_cancel')}
+                            </button>
+                          </div>
+                        </Show>
+                      </li>
+                    )}
+                  </For>
+                </ul>
+              </div>
+
               <label>{t('invite.role_label')}</label>
               <div class="role-options">
                 <button
@@ -264,6 +411,106 @@ export default function InviteDialog(props: InviteDialogProps) {
             .invite-url-row { display: flex; gap: 8px; }
             .invite-url-row input { flex: 1; }
             .hint { font-size: 12px; color: var(--text-secondary); margin-top: 8px; }
+            .invite-manage {
+              margin-bottom: 16px;
+              padding-bottom: 16px;
+              border-bottom: 1px solid var(--border);
+            }
+            .invite-manage-label {
+              margin-top: 0 !important;
+              margin-bottom: 8px !important;
+            }
+            .invite-list {
+              list-style: none;
+              padding: 0;
+              margin: 0;
+              max-height: 150px;
+              overflow-y: auto;
+              display: flex;
+              flex-direction: column;
+              gap: 6px;
+            }
+            .invite-row {
+              display: flex;
+              align-items: center;
+              justify-content: space-between;
+              gap: 8px;
+              padding: 8px 10px;
+              background: var(--bg-tertiary);
+              border-radius: 6px;
+              font-size: 12px;
+            }
+            .invite-row-main {
+              display: flex;
+              align-items: center;
+              gap: 10px;
+              flex: 1;
+              min-width: 0;
+            }
+            .invite-row-prefix {
+              font-family: var(--font-mono, monospace);
+              color: var(--text-secondary);
+              font-size: 11px;
+            }
+            .invite-row-remaining {
+              color: var(--text-secondary);
+              font-size: 11px;
+              margin-left: auto;
+              white-space: nowrap;
+              overflow: hidden;
+              text-overflow: ellipsis;
+            }
+            .role-badge {
+              padding: 2px 8px;
+              border-radius: 999px;
+              font-size: 10px;
+              font-weight: 600;
+              text-transform: uppercase;
+              letter-spacing: 0.03em;
+            }
+            .role-badge-operator { background: rgba(88,166,255,0.15); color: var(--accent); }
+            .role-badge-viewer { background: rgba(148,148,148,0.15); color: var(--text-secondary); }
+            .invite-revoke-btn {
+              padding: 4px 10px;
+              font-size: 11px;
+              background: transparent;
+              color: var(--text-secondary);
+              border: 1px solid var(--border);
+              border-radius: 4px;
+              cursor: pointer;
+            }
+            .invite-revoke-btn:hover {
+              color: var(--danger, #ff6b6b);
+              border-color: var(--danger, #ff6b6b);
+            }
+            .invite-revoke-confirm {
+              display: flex;
+              gap: 4px;
+            }
+            .invite-revoke-yes {
+              padding: 4px 10px;
+              font-size: 11px;
+              background: var(--danger, #ff6b6b);
+              color: white;
+              border: none;
+              border-radius: 4px;
+              cursor: pointer;
+              font-weight: 600;
+            }
+            .invite-revoke-no {
+              padding: 4px 10px;
+              font-size: 11px;
+              background: transparent;
+              color: var(--text-secondary);
+              border: 1px solid var(--border);
+              border-radius: 4px;
+              cursor: pointer;
+            }
+            .manage-error {
+              color: var(--danger, #ff6b6b);
+              font-size: 11px;
+              margin-bottom: 8px;
+            }
           `}</style>
         </div>
       </div>

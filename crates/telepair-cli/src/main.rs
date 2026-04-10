@@ -4,8 +4,13 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+use chrono::{DateTime, Duration, Utc};
+
 use telepair_agent::virtual_target::TargetEngine;
+use telepair_control::session_service::SessionService;
+use telepair_core::audit::{AuditEvent, AuditEventType, AuditFilter, AuditSink};
 use telepair_core::auth::TokenAuthProvider;
+use telepair_core::session::CloseReason;
 use telepair_core::storage::{SqliteStorage, Storage};
 use telepair_gateway::state::AppState;
 
@@ -73,6 +78,86 @@ enum Command {
 enum AdminCommand {
     /// Print the saved admin token from ~/.telepair/admin_token
     ShowToken,
+    /// Query the append-only audit log
+    Audit(AuditArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct AuditArgs {
+    /// Time window ending now, e.g. `30m`, `2h`, `7d`. Default: 24h.
+    /// Mutually exclusive with `--since` / `--until`; specifying both
+    /// `--last` and either side of the absolute window is a parse error.
+    #[arg(long)]
+    last: Option<String>,
+
+    /// Inclusive lower bound, RFC 3339 (e.g. `2026-04-09T00:00:00Z`).
+    #[arg(long, conflicts_with = "last")]
+    since: Option<DateTime<Utc>>,
+
+    /// Exclusive upper bound, RFC 3339. Defaults to now if omitted.
+    #[arg(long, conflicts_with = "last")]
+    until: Option<DateTime<Utc>>,
+
+    /// Filter to rows touching this session id.
+    #[arg(long)]
+    session: Option<String>,
+
+    /// Filter to rows whose actor matches. Accepts a user name (resolved
+    /// via storage) or a raw UUID. Unknown names are a hard error rather
+    /// than returning zero rows — much easier to debug.
+    #[arg(long)]
+    actor: Option<String>,
+
+    /// Filter to specific event types. Repeat for OR semantics, e.g.
+    /// `--type session.created --type session.closed`.
+    #[arg(long = "type", value_name = "EVENT_TYPE")]
+    event_types: Vec<String>,
+
+    /// Maximum number of rows. Default 100 (sane humans, sane tables).
+    #[arg(long, default_value_t = 100)]
+    limit: i64,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = AuditFormat::Table)]
+    format: AuditFormat,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditFormat {
+    Table,
+    Json,
+}
+
+/// Parse `30m`, `2h`, `7d`, `45s` into a positive chrono::Duration.
+/// Intentionally strict: whitespace, plus signs, compound forms like
+/// `1h30m` all rejected — the error message points the operator at the
+/// exact accepted shape instead of silently interpreting `1h30m` as
+/// `1h`.
+fn parse_last_window(s: &str) -> anyhow::Result<Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("--last value is empty; expected e.g. 1h, 24h, 7d");
+    }
+    let split_at = s
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| anyhow::anyhow!("--last value '{s}' missing unit (s|m|h|d)"))?;
+    let (num_str, unit) = s.split_at(split_at);
+    let n: i64 = num_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--last numeric prefix must be a positive integer: {s}"))?;
+    if n <= 0 {
+        anyhow::bail!("--last value must be positive: {s}");
+    }
+    let dur = match unit {
+        "s" => Duration::seconds(n),
+        "m" => Duration::minutes(n),
+        "h" => Duration::hours(n),
+        "d" => Duration::days(n),
+        other => {
+            anyhow::bail!("--last unit must be one of s|m|h|d, got '{other}'");
+        }
+    };
+    Ok(dur)
 }
 
 fn data_dir() -> PathBuf {
@@ -81,7 +166,7 @@ fn data_dir() -> PathBuf {
         .join(".telepair")
 }
 
-fn run_admin_command(cmd: AdminCommand) -> anyhow::Result<()> {
+async fn run_admin_command(cmd: AdminCommand) -> anyhow::Result<()> {
     match cmd {
         AdminCommand::ShowToken => {
             let token_file = data_dir().join("admin_token");
@@ -102,6 +187,147 @@ fn run_admin_command(cmd: AdminCommand) -> anyhow::Result<()> {
             println!("{token}");
             Ok(())
         }
+        AdminCommand::Audit(args) => run_audit_command(args).await,
+    }
+}
+
+async fn run_audit_command(args: AuditArgs) -> anyhow::Result<()> {
+    // Open the DB in the same shape the server does so the CLI sees
+    // exactly the rows the running process writes. Use `mode=rwc` so
+    // operators running `telepair admin audit` against a cold machine
+    // get a clear "nothing happened yet" instead of a connection error;
+    // `mode=rwc` fails if the parent directory is missing so we mkdir
+    // it ourselves, same as the server startup path.
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir)?;
+    let db_path = dir.join("telepair.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+    let storage = Arc::new(SqliteStorage::new(&db_url).await?);
+
+    // Resolve time bounds. `--last` wins and collapses into a (since, now)
+    // pair; otherwise trust `--since`/`--until` verbatim; otherwise default
+    // to the last 24h so a flag-free invocation returns something useful.
+    let now = Utc::now();
+    let (since, until) = if let Some(last) = args.last.as_deref() {
+        let window = parse_last_window(last)?;
+        (Some(now - window), Some(now))
+    } else if args.since.is_some() || args.until.is_some() {
+        (args.since, args.until)
+    } else {
+        (Some(now - Duration::hours(24)), Some(now))
+    };
+
+    // Resolve actor by name if it doesn't parse as a UUID. Unknown
+    // names are a hard error — otherwise a typo silently returns zero
+    // rows and the operator thinks nothing happened.
+    let actor_id = if let Some(ref raw) = args.actor {
+        if let Ok(uuid) = uuid::Uuid::parse_str(raw) {
+            Some(uuid)
+        } else {
+            let user = storage.get_user_by_name(raw).await?.ok_or_else(|| {
+                anyhow::anyhow!("--actor '{raw}' is not a UUID and no user with that name exists")
+            })?;
+            Some(user.id)
+        }
+    } else {
+        None
+    };
+
+    // Event type strings → enum; any typo is a hard error for the same
+    // reason as --actor. We accept the dotted form (session.created)
+    // since that's what the table header prints, and error listing the
+    // full canonical set on mismatch.
+    let mut event_types = Vec::with_capacity(args.event_types.len());
+    for raw in &args.event_types {
+        event_types.push(raw.parse::<AuditEventType>().map_err(|_| {
+            anyhow::anyhow!(
+                "--type '{raw}' unknown; valid types: session.created, session.closed, \
+                 participant.joined, invite.minted, invite.redeemed, invite.revoked, \
+                 target.access_denied"
+            )
+        })?);
+    }
+
+    let filter = AuditFilter {
+        since,
+        until,
+        actor_id,
+        session_id: args.session.clone(),
+        event_types,
+        limit: Some(args.limit),
+        offset: 0,
+    };
+
+    let audit = AuditSink::new(storage);
+    let rows = audit.query(filter).await?;
+
+    match args.format {
+        AuditFormat::Json => print_audit_json(&rows)?,
+        AuditFormat::Table => print_audit_table(&rows),
+    }
+    Ok(())
+}
+
+fn print_audit_json(rows: &[AuditEvent]) -> anyhow::Result<()> {
+    // Array form, not NDJSON — this is a one-shot human/CI read path,
+    // not a streaming firehose. `serde_json::to_writer_pretty` onto
+    // stdout keeps newlines where humans expect them and still pipes
+    // into `jq` cleanly.
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    serde_json::to_writer_pretty(&mut out, rows)?;
+    use std::io::Write;
+    writeln!(out)?;
+    Ok(())
+}
+
+fn print_audit_table(rows: &[AuditEvent]) {
+    if rows.is_empty() {
+        println!("no audit events matched the filter");
+        return;
+    }
+
+    // Fixed column widths keep the output stable across runs so diffs
+    // and grep are meaningful. Actor/session/detail get truncated at
+    // the width rather than wrapping — a terminal that's too narrow
+    // just trims the right edge, same as `ps`.
+    const TS_W: usize = 20;
+    const EVT_W: usize = 22;
+    const ACTOR_W: usize = 18;
+    const SES_W: usize = 14;
+    let header = format!(
+        "{:<TS_W$}  {:<EVT_W$}  {:<ACTOR_W$}  {:<SES_W$}  detail",
+        "timestamp", "event_type", "actor", "session",
+    );
+    println!("{header}");
+    println!("{}", "-".repeat(header.len() + 20));
+    for row in rows {
+        let ts = row.ts.format("%Y-%m-%d %H:%M:%S").to_string();
+        let actor = row.actor_name.as_deref().unwrap_or("-");
+        let session = row.session_id.as_deref().unwrap_or("-");
+        let detail = if row.detail.is_null() {
+            "-".to_string()
+        } else {
+            row.detail.to_string()
+        };
+        println!(
+            "{:<TS_W$}  {:<EVT_W$}  {:<ACTOR_W$}  {:<SES_W$}  {}",
+            truncate(&ts, TS_W),
+            truncate(row.event_type.as_str(), EVT_W),
+            truncate(actor, ACTOR_W),
+            truncate(session, SES_W),
+            detail,
+        );
+    }
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
+        out.push('…');
+        out
     }
 }
 
@@ -110,10 +336,12 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Subcommands short-circuit the server startup path so we don't spin up
-    // tracing / sqlite / axum just to print a single value.
+    // tracing / sqlite / axum just to print a single value. `admin audit`
+    // opens its own storage handle inside the handler — the server
+    // startup path stays untouched.
     if let Some(command) = cli.command {
         return match command {
-            Command::Admin { cmd } => run_admin_command(cmd),
+            Command::Admin { cmd } => run_admin_command(cmd).await,
         };
     }
 
@@ -148,36 +376,54 @@ async fn main() -> anyhow::Result<()> {
     // is the fresh-install norm and stays silent; any other failure (parse
     // error, permission denied, explicit `--targets` path) warns so the
     // operator can see why their targets didn't load.
-    let engine = match &cli.targets {
+    //
+    // Resolve the effective path first (explicit `--targets` or the
+    // default under the data dir) and remember it regardless of
+    // whether this initial load succeeds. That's what lets the admin
+    // `POST /api/admin/targets/reload` endpoint re-attempt a file
+    // the operator fixed after startup — otherwise the only way to
+    // recover from a yaml typo at boot would be a full restart.
+    let targets_path: Option<PathBuf> = match &cli.targets {
+        Some(path) => Some(path.clone()),
+        None => Some(data_dir.join("targets.yaml")),
+    };
+    let engine = match &targets_path {
         Some(path) => TargetEngine::from_file(path).unwrap_or_else(|e| {
-            tracing::warn!(
-                "failed to load targets from {}: {e}, using defaults",
-                path.display()
-            );
+            let is_missing = e
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
+            // An explicit `--targets` path that doesn't exist is a
+            // loud operator mistake; the default path missing on a
+            // fresh install is the norm and stays silent.
+            if cli.targets.is_some() || !is_missing {
+                tracing::warn!(
+                    "failed to load targets from {}: {e}, using defaults",
+                    path.display()
+                );
+            }
             TargetEngine::empty()
         }),
-        None => {
-            let default_path = data_dir.join("targets.yaml");
-            TargetEngine::from_file(&default_path).unwrap_or_else(|e| {
-                let is_missing = e
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
-                if !is_missing {
-                    tracing::warn!(
-                        "failed to load targets from {}: {e}, using defaults",
-                        default_path.display()
-                    );
-                }
-                TargetEngine::empty()
-            })
-        }
+        None => TargetEngine::empty(),
     };
 
-    // Close any sessions left "active" from a previous unclean shutdown
-    match storage.close_stale_sessions().await {
-        Ok(0) => {}
-        Ok(n) => tracing::info!("closed {n} stale session(s) from previous run"),
-        Err(e) => tracing::warn!("failed to close stale sessions: {e}"),
+    // Close any sessions left "active" from a previous unclean shutdown.
+    // These rows get `CloseReason::Startup` so the history view can
+    // distinguish "the server came back up and reclaimed these" from
+    // "the owner clicked Close" or "the reaper timed them out". Route
+    // through SessionService (not raw storage) so the bulk audit row
+    // gets emitted — the history timeline would otherwise have a gap
+    // every time the server restarted.
+    {
+        let audit = Arc::new(AuditSink::new(storage.clone()));
+        let sweep_sessions = SessionService::new(storage.clone(), audit);
+        match sweep_sessions
+            .close_stale_sessions(CloseReason::Startup)
+            .await
+        {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("closed {n} stale session(s) from previous run"),
+            Err(e) => tracing::warn!("failed to close stale sessions: {e}"),
+        }
     }
 
     // Auto-create admin user on first run
@@ -206,7 +452,7 @@ async fn main() -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("--web-dir path is not valid UTF-8"))
             })
             .transpose()?;
-        let state = AppState::new(storage, engine).await;
+        let state = AppState::new(storage, engine, targets_path).await;
         let cors_mode = if cli.allow_any_origin {
             telepair_gateway::CorsMode::AllowAny
         } else {
@@ -234,4 +480,35 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_last_window_accepts_units() {
+        assert_eq!(parse_last_window("30s").unwrap(), Duration::seconds(30));
+        assert_eq!(parse_last_window("45m").unwrap(), Duration::minutes(45));
+        assert_eq!(parse_last_window("24h").unwrap(), Duration::hours(24));
+        assert_eq!(parse_last_window("7d").unwrap(), Duration::days(7));
+    }
+
+    #[test]
+    fn parse_last_window_rejects_garbage() {
+        // Empty, missing unit, unknown unit, compound form, zero/negative
+        // — all of these must error rather than silently reinterpret.
+        assert!(parse_last_window("").is_err());
+        assert!(parse_last_window("42").is_err());
+        assert!(parse_last_window("42y").is_err());
+        assert!(parse_last_window("1h30m").is_err());
+        assert!(parse_last_window("0h").is_err());
+        assert!(parse_last_window("-5h").is_err());
+        assert!(parse_last_window("abc").is_err());
+    }
+
+    #[test]
+    fn parse_last_window_trims_whitespace() {
+        assert_eq!(parse_last_window("  2h  ").unwrap(), Duration::hours(2));
+    }
 }

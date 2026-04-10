@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 
+use telepair_core::audit::{AuditEvent, AuditEventType, AuditSink};
 use telepair_core::auth::TokenAuthProvider;
 use telepair_core::error::{Error, Result};
 use telepair_core::permission::Role;
@@ -56,6 +57,52 @@ pub struct RedeemResult {
     pub issued_token: Option<String>,
 }
 
+/// Read-side view of an invite for the owner-facing management
+/// dialog. Deliberately **does not** carry the raw token — the
+/// `token_prefix` is the first 8 chars of the sha256 digest so the
+/// UI can give each row a stable, non-sensitive label without
+/// leaking a value that could be used to redeem. Clients revoke a
+/// row by its full `token_sha256` (the PK).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InviteSummary {
+    /// Full SHA-256 digest — used as the URL path parameter on
+    /// `DELETE /api/sessions/:id/invites/:token_sha256`. Opaque to
+    /// humans; the UI only shows the prefix.
+    pub token_sha256: String,
+    /// First 8 chars of `token_sha256` — a short stable label the
+    /// UI renders next to each row ("ab12cd34"). Does not collide
+    /// in practice inside a single session's invite list.
+    pub token_prefix: String,
+    pub session_id: String,
+    pub role: Role,
+    pub max_uses: i32,
+    pub used_count: i32,
+    /// Derived: `max_uses - used_count`, clamped to zero. Precomputed
+    /// server-side so every client (CLI, web UI) renders the same
+    /// number without reproducing the arithmetic.
+    pub remaining_uses: i32,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+impl InviteSummary {
+    fn from_token(t: InviteToken) -> Self {
+        let remaining = (t.max_uses - t.used_count).max(0);
+        let token_prefix = t.token_sha256.chars().take(8).collect::<String>();
+        Self {
+            token_sha256: t.token_sha256,
+            token_prefix,
+            session_id: t.session_id,
+            role: t.role,
+            max_uses: t.max_uses,
+            used_count: t.used_count,
+            remaining_uses: remaining,
+            expires_at: t.expires_at,
+            created_at: t.created_at,
+        }
+    }
+}
+
 /// Invite-token business rules. Minting, redeeming, and validation
 /// flow through one place so the gateway handler is pure transport +
 /// serialization. The old design scattered TTL clamping, scoped-guest
@@ -67,6 +114,7 @@ pub struct InviteService {
     storage: Arc<SqliteStorage>,
     sessions: Arc<SessionService>,
     auth: Arc<TokenAuthProvider>,
+    audit: Arc<AuditSink>,
 }
 
 impl InviteService {
@@ -74,11 +122,13 @@ impl InviteService {
         storage: Arc<SqliteStorage>,
         sessions: Arc<SessionService>,
         auth: Arc<TokenAuthProvider>,
+        audit: Arc<AuditSink>,
     ) -> Self {
         Self {
             storage,
             sessions,
             auth,
+            audit,
         }
     }
 
@@ -143,6 +193,26 @@ impl InviteService {
             .create_invite(session_id, params.role, params.max_uses, expires_at)
             .await?;
 
+        // Audit the mint. We deliberately log the sha256 prefix, not
+        // the raw token — the token is only visible to the caller for
+        // exactly the lifetime of this response. Role and max_uses
+        // live in `detail` so the history view can render a chip
+        // without a second lookup.
+        let token_prefix = invite.token_sha256.chars().take(8).collect::<String>();
+        self.audit
+            .record(
+                AuditEvent::new(AuditEventType::InviteMinted)
+                    .with_actor(owner.id, owner.name.clone())
+                    .with_session(session_id.to_string())
+                    .with_detail(serde_json::json!({
+                        "token_prefix": token_prefix,
+                        "role": invite.role.as_str(),
+                        "max_uses": invite.max_uses,
+                        "expires_at": invite.expires_at,
+                    })),
+            )
+            .await;
+
         Ok(CreateInviteResult {
             session_id: session_id.to_string(),
             token: raw_token,
@@ -192,7 +262,8 @@ impl InviteService {
         // "Owner or existing member clicks their own invite": treat
         // as a no-op so the first sanity check of a share link doesn't
         // burn a use. The participant list already carries the role
-        // snapshot, so we can return it directly.
+        // snapshot, so we can return it directly. No audit row — the
+        // participant is already recorded in the original join event.
         if let Some(ref user) = existing_user {
             let participants = self.sessions.list_participants(&preview.session_id).await?;
             if let Some(existing) = participants.iter().find(|p| p.user_id == user.id) {
@@ -210,17 +281,43 @@ impl InviteService {
 
         // Mint-after-consume ordering is load-bearing: it guarantees
         // that a rejected redeem never leaks a guest user row.
-        let (user_id, issued_token) = match existing_user {
-            Some(u) => (u.id, None),
+        let (user_id, actor_name, issued_token, as_guest) = match existing_user {
+            Some(u) => (u.id, u.name, None, false),
             None => {
                 let (guest, raw_token) = self.auth.create_guest(&invite.session_id).await?;
-                (guest.id, Some(raw_token))
+                (guest.id, guest.name, Some(raw_token), true)
             }
         };
 
         self.sessions
             .upsert_participant(&invite.session_id, user_id, invite.role)
             .await?;
+
+        // Two audit rows: the invite redemption and the participant
+        // join that happened because of it. Keeping them separate
+        // lets the "who joined this session" timeline stay useful
+        // even when filtered down to ParticipantJoined only.
+        let token_prefix = invite.token_sha256.chars().take(8).collect::<String>();
+        self.audit
+            .record(
+                AuditEvent::new(AuditEventType::InviteRedeemed)
+                    .with_actor(user_id, actor_name.clone())
+                    .with_session(invite.session_id.clone())
+                    .with_detail(serde_json::json!({
+                        "token_prefix": token_prefix,
+                        "role": invite.role.as_str(),
+                        "as_guest": as_guest,
+                    })),
+            )
+            .await;
+        self.audit
+            .record(
+                AuditEvent::new(AuditEventType::ParticipantJoined)
+                    .with_actor(user_id, actor_name)
+                    .with_session(invite.session_id.clone())
+                    .with_detail(serde_json::json!({ "role": invite.role.as_str() })),
+            )
+            .await;
 
         Ok(RedeemResult {
             session_id: invite.session_id,
@@ -236,5 +333,68 @@ impl InviteService {
     /// enforce them.
     pub async fn preview(&self, token: &str) -> Result<InviteToken> {
         self.storage.find_invite(token).await
+    }
+
+    /// List every invite row owned by `session_id`, sanitized into
+    /// [`InviteSummary`]. Requires `owner` to actually own the
+    /// session (not just a participant) so guests can't enumerate
+    /// other peoples' invite links. Expired / exhausted rows are
+    /// **included** — the management UI wants the full history and
+    /// renders the state chip per row; filtering happens client-side
+    /// if at all.
+    pub async fn list_for_session(
+        &self,
+        owner: &User,
+        session_id: &str,
+    ) -> Result<Vec<InviteSummary>> {
+        // require_owner (not require_active_owned) — an operator
+        // should still be able to see the invite history of a
+        // closed session so post-mortem "who did we invite"
+        // investigations work.
+        self.sessions.require_owner(owner, session_id).await?;
+        let rows = self.storage.list_invites_for_session(session_id).await?;
+        Ok(rows.into_iter().map(InviteSummary::from_token).collect())
+    }
+
+    /// Revoke (hard-delete) an invite row. Requires ownership +
+    /// that the invite actually belongs to the stated session —
+    /// the path parameter `session_id` must match what the invite
+    /// row points at. Mismatch returns `SessionNotFound` so a
+    /// caller poking at `/api/sessions/X/invites/<token>` cannot
+    /// probe for the existence of invites in session Y.
+    pub async fn revoke(&self, owner: &User, session_id: &str, token_sha256: &str) -> Result<()> {
+        self.sessions.require_owner(owner, session_id).await?;
+        // Find the row first so we can verify it belongs to this
+        // session. `find_invite` uses the raw-token lookup path
+        // which hashes before comparison — here we already have the
+        // SHA-256, so query storage directly by listing and
+        // filtering. A dedicated `find_invite_by_sha256` would be
+        // nicer but the blast radius of scanning a single session's
+        // invites is tiny and avoids a new trait method.
+        let rows = self.storage.list_invites_for_session(session_id).await?;
+        let target = rows
+            .into_iter()
+            .find(|r| r.token_sha256 == token_sha256)
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "invite {token_sha256} not found in session {session_id}"
+                ))
+            })?;
+        let role = target.role;
+        self.storage.revoke_invite(&target.token_sha256).await?;
+
+        let token_prefix = target.token_sha256.chars().take(8).collect::<String>();
+        self.audit
+            .record(
+                AuditEvent::new(AuditEventType::InviteRevoked)
+                    .with_actor(owner.id, owner.name.clone())
+                    .with_session(session_id.to_string())
+                    .with_detail(serde_json::json!({
+                        "token_prefix": token_prefix,
+                        "role": role.as_str(),
+                    })),
+            )
+            .await;
+        Ok(())
     }
 }

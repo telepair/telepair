@@ -15,9 +15,12 @@ telepair-agent = { workspace = true }
 telepair-control = { workspace = true }
 telepair-gateway = { workspace = true }
 axum = { workspace = true }
+chrono = { workspace = true }
 clap = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 anyhow = { workspace = true }
 dirs = { workspace = true }

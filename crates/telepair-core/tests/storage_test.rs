@@ -1,7 +1,7 @@
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
 use telepair_core::permission::Role;
-use telepair_core::session::InputMode;
+use telepair_core::session::{CloseReason, InputMode, SessionListFilter};
 use telepair_core::storage::{SqliteStorage, Storage};
 
 async fn setup() -> SqliteStorage {
@@ -82,13 +82,19 @@ async fn close_session() {
         .await
         .unwrap();
 
-    store.close_session(&session.id).await.unwrap();
+    store
+        .close_session(&session.id, CloseReason::Owner)
+        .await
+        .unwrap();
     let fetched = store.get_session(&session.id).await.unwrap().unwrap();
     assert_eq!(
         fetched.status,
         telepair_core::session::SessionStatus::Closed
     );
     assert!(fetched.closed_at.is_some());
+    // The reason the caller passed must round-trip — the history
+    // view reads this to pick the right chip.
+    assert_eq!(fetched.closed_reason, Some(CloseReason::Owner));
 }
 
 #[tokio::test]
@@ -138,11 +144,73 @@ async fn create_session_with_owner_rolls_back_on_fk_violation() {
     // Nothing should be hanging around from the rolled-back tx. Query
     // by the ghost owner — if the FK check rolled back properly, no
     // sessions should be associated with that owner id.
-    let ghost_sessions = store.list_sessions_for_user(ghost_owner).await.unwrap();
+    let ghost_sessions = store
+        .list_sessions_for_user(ghost_owner, SessionListFilter::default())
+        .await
+        .unwrap();
     assert!(
         ghost_sessions.is_empty(),
         "rolled-back transaction must not leave session rows: {ghost_sessions:?}"
     );
+}
+
+#[tokio::test]
+async fn list_sessions_offset_without_limit_returns_remaining_rows() {
+    // Regression for the v0.1.1-dev bug where `SessionListFilter`
+    // carrying `offset > 0` but no `limit` produced `... ORDER BY ...
+    // OFFSET ?` — SQLite rejects that as a syntax error and the
+    // request 500s. The fix emits `LIMIT -1` when offset is set
+    // without an explicit cap.
+    let store = setup().await;
+    let (user, _) = store.create_user("paginator", false).await.unwrap();
+    for _ in 0..3 {
+        store
+            .create_session_with_owner(user.id, "local-shell", InputMode::Serialized)
+            .await
+            .unwrap();
+    }
+
+    // offset=1, no limit → should return 2 rows, NOT error out.
+    let filter = SessionListFilter {
+        offset: 1,
+        ..SessionListFilter::default()
+    };
+    let rows = store.list_sessions_for_user(user.id, filter).await.unwrap();
+    assert_eq!(rows.len(), 2, "offset=1 of 3 rows should yield 2");
+
+    // offset=0 with no limit still works (pre-existing path — guard
+    // against the fix over-reaching).
+    let rows_all = store
+        .list_sessions_for_user(user.id, SessionListFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(rows_all.len(), 3);
+}
+
+#[tokio::test]
+async fn list_sessions_target_name_filter_narrows_results() {
+    // The Dashboard admin-link deep-filters by target_name; make sure
+    // the storage layer honors it. Seeds two sessions on different
+    // targets for the same user, filters down to one, and asserts
+    // the other is excluded.
+    let store = setup().await;
+    let (user, _) = store.create_user("deeplink", false).await.unwrap();
+    let kept = store
+        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized)
+        .await
+        .unwrap();
+    store
+        .create_session_with_owner(user.id, "other-target", InputMode::Serialized)
+        .await
+        .unwrap();
+
+    let filter = SessionListFilter {
+        target_name: Some("local-shell".to_string()),
+        ..SessionListFilter::default()
+    };
+    let rows = store.list_sessions_for_user(user.id, filter).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, kept.id);
 }
 
 #[tokio::test]

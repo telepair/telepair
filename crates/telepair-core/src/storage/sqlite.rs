@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
@@ -6,9 +7,13 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteRow};
 use sqlx::{Pool, Row, Sqlite, SqlitePool};
 use uuid::Uuid;
 
+use crate::audit::{AuditEvent, AuditEventType, AuditFilter};
 use crate::error::{Error, Result};
 use crate::permission::Role;
-use crate::session::{InputMode, InviteToken, Participant, Session, SessionStatus, User};
+use crate::session::{
+    CloseReason, InputMode, InviteToken, Participant, Session, SessionListFilter, SessionStatus,
+    User,
+};
 use crate::storage::Storage;
 
 pub struct SqliteStorage {
@@ -34,13 +39,49 @@ impl SqliteStorage {
             .execute(&self.pool)
             .await?;
 
-        // Schema is the single source of truth — pre-1.0, the only
-        // supported upgrade path is to delete the DB file and start
-        // fresh, so we don't ship compat shims or column-level probes.
+        // Schema is the single source of truth and is applied
+        // idempotently on every boot. The SQL file uses
+        // `CREATE TABLE/INDEX IF NOT EXISTS` so re-running it against
+        // a populated DB is a no-op.
         sqlx::raw_sql(include_str!("../../../../migrations/001_initial.sql"))
             .execute(&self.pool)
             .await?;
 
+        // In-place upgrades from an older v0.1.x DB: `CREATE TABLE IF
+        // NOT EXISTS` does not touch an existing table, so columns
+        // added after the original v0.1.0 shape need explicit ALTER
+        // statements. Each column addition is guarded by a pragma
+        // probe so a booted-many-times DB doesn't fail on
+        // "duplicate column name".
+        self.ensure_column("sessions", "closed_reason", "TEXT")
+            .await?;
+        self.ensure_column("invite_tokens", "created_at", "TEXT")
+            .await?;
+
+        Ok(())
+    }
+
+    /// Idempotently add `column` to `table` if it does not already
+    /// exist. Uses `pragma_table_info` to probe — cheaper than
+    /// parsing `information_schema` in SQLite and works without
+    /// relying on ALTER-TABLE error codes.
+    ///
+    /// `table`, `column`, and `sql_type` are **interpolated into SQL
+    /// without escaping**. They MUST be hardcoded constants at every
+    /// call site — never user input. The argument type is `&str`
+    /// rather than a stricter type because the callers are inside
+    /// this module and the string is always a literal.
+    async fn ensure_column(&self, table: &str, column: &str, sql_type: &str) -> Result<()> {
+        let probe = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?");
+        let exists: Option<i64> = sqlx::query_scalar(&probe)
+            .bind(column)
+            .fetch_optional(&self.pool)
+            .await?;
+        if exists.is_some() {
+            return Ok(());
+        }
+        let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {sql_type}");
+        sqlx::raw_sql(&alter).execute(&self.pool).await?;
         Ok(())
     }
 }
@@ -98,6 +139,19 @@ fn parse_optional_datetime(
 }
 
 fn row_to_session(r: &SqliteRow) -> Result<Session> {
+    // `closed_reason` is nullable (v0.1.0 rows + still-active rows
+    // both read as NULL). Unknown string values become
+    // `Error::InvalidInput` so a corrupt row fails loudly rather
+    // than silently collapsing to `None` — same policy as the other
+    // parse helpers in this file.
+    let closed_reason: Option<String> = r.get("closed_reason");
+    let closed_reason = match closed_reason {
+        None => None,
+        Some(s) => Some(
+            CloseReason::from_str(&s)
+                .map_err(|e| Error::InvalidInput(format!("invalid closed_reason: {e}")))?,
+        ),
+    };
     Ok(Session {
         id: r.get("id"),
         owner_id: parse_uuid(r.get("owner_id"))?,
@@ -112,6 +166,7 @@ fn row_to_session(r: &SqliteRow) -> Result<Session> {
             .map_err(Error::InvalidInput)?,
         created_at: parse_datetime(r.get("created_at"))?,
         closed_at: parse_optional_datetime(r.get("closed_at"), "closed_at")?,
+        closed_reason,
     })
 }
 
@@ -139,6 +194,40 @@ fn row_to_invite(r: &SqliteRow) -> Result<InviteToken> {
         max_uses: r.get("max_uses"),
         used_count: r.get("used_count"),
         expires_at: parse_optional_datetime(r.get("expires_at"), "expires_at")?,
+        // `created_at` is nullable: v0.1.0 rows are `NULL`, new rows
+        // are always populated by `create_invite`.
+        created_at: parse_optional_datetime(r.get("created_at"), "created_at")?,
+    })
+}
+
+fn row_to_audit_event(r: &SqliteRow) -> Result<AuditEvent> {
+    // `detail` is stored as JSON text and round-trips through
+    // `serde_json`. SQL NULL maps back to `Value::Null` — the
+    // same sentinel the in-memory representation uses for "no
+    // extra data" — so callers never have to special-case the
+    // storage layer's missing-vs-null distinction.
+    let detail_raw: Option<String> = r.get("detail");
+    let detail = match detail_raw {
+        None => serde_json::Value::Null,
+        Some(s) => serde_json::from_str(&s)
+            .map_err(|e| Error::InvalidInput(format!("invalid audit detail json: {e}")))?,
+    };
+    let actor_id: Option<String> = r.get("actor_id");
+    let actor_id = match actor_id {
+        None => None,
+        Some(s) => Some(parse_uuid(s)?),
+    };
+    let event_type: String = r.get("event_type");
+    let event_type =
+        AuditEventType::from_str(&event_type).map_err(|e| Error::InvalidInput(e.to_string()))?;
+    Ok(AuditEvent {
+        id: Some(r.get::<i64, _>("id")),
+        ts: parse_datetime(r.get("ts"))?,
+        actor_id,
+        actor_name: r.get("actor_name"),
+        event_type,
+        session_id: r.get("session_id"),
+        detail,
     })
 }
 
@@ -339,6 +428,7 @@ impl Storage for SqliteStorage {
             status: SessionStatus::Active,
             created_at: now,
             closed_at: None,
+            closed_reason: None,
         })
     }
 
@@ -351,7 +441,7 @@ impl Storage for SqliteStorage {
         row.map(|r| row_to_session(&r)).transpose()
     }
 
-    async fn close_session(&self, id: &str) -> Result<()> {
+    async fn close_session(&self, id: &str, reason: CloseReason) -> Result<()> {
         // Close the session AND stamp left_at on every still-active
         // participant in one transaction. The two used to be split:
         // `close_session` only touched the sessions row, and the WS
@@ -368,11 +458,12 @@ impl Storage for SqliteStorage {
         let mut tx = self.pool.begin().await?;
 
         let result = sqlx::query(
-            "UPDATE sessions SET status = ?, closed_at = ? \
+            "UPDATE sessions SET status = ?, closed_at = ?, closed_reason = ? \
              WHERE id = ? AND status = ?",
         )
         .bind(SessionStatus::Closed.as_str())
         .bind(&now_str)
+        .bind(reason.as_str())
         .bind(id)
         .bind(SessionStatus::Active.as_str())
         .execute(&mut *tx)
@@ -398,25 +489,71 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
-    async fn list_sessions_for_user(&self, user_id: Uuid) -> Result<Vec<Session>> {
+    async fn list_sessions_for_user(
+        &self,
+        user_id: Uuid,
+        filter: SessionListFilter,
+    ) -> Result<Vec<Session>> {
+        // History-aware query: unlike the pre-0.1.1 implementation,
+        // the LEFT JOIN no longer filters on `p.left_at IS NULL`.
+        // That predicate made sense for "what am I currently in" but
+        // actively hid every session the user participated in and
+        // then left — exactly the rows the Closed tab needs to show.
+        // The WHERE clause still requires either ownership or
+        // participant membership, so strangers never leak in.
+        //
+        // The SQL is assembled from hardcoded fragments; every `?`
+        // placeholder is bound through sqlx, and no caller-supplied
+        // string ever touches the query text. Anything added here
+        // must preserve that invariant.
         let uid = user_id.to_string();
-        let rows = sqlx::query(
+        let mut sql = String::from(
             "SELECT DISTINCT s.* FROM sessions s \
-             LEFT JOIN participants p ON p.session_id = s.id AND p.user_id = ? AND p.left_at IS NULL \
-             WHERE s.status = ? AND (s.owner_id = ? OR p.user_id IS NOT NULL)",
-        )
-        .bind(&uid)
-        .bind(SessionStatus::Active.as_str())
-        .bind(&uid)
-        .fetch_all(&self.pool)
-        .await?;
+             LEFT JOIN participants p ON p.session_id = s.id AND p.user_id = ? \
+             WHERE (s.owner_id = ? OR p.user_id IS NOT NULL)",
+        );
+        if filter.status.is_some() {
+            sql.push_str(" AND s.status = ?");
+        }
+        if filter.target_name.is_some() {
+            sql.push_str(" AND s.target_name = ?");
+        }
+        sql.push_str(" ORDER BY s.created_at DESC");
+        // SQLite rejects `OFFSET` without an accompanying `LIMIT`. When
+        // the caller wants "skip N, return everything after", emit the
+        // documented `LIMIT -1` sentinel so the query still parses.
+        // Without this, `GET /api/sessions?offset=25` would 500.
+        if filter.limit.is_some() {
+            sql.push_str(" LIMIT ?");
+        } else if filter.offset > 0 {
+            sql.push_str(" LIMIT -1");
+        }
+        if filter.offset > 0 {
+            sql.push_str(" OFFSET ?");
+        }
+
+        let mut q = sqlx::query(&sql).bind(&uid).bind(&uid);
+        if let Some(status) = filter.status {
+            q = q.bind(status.as_str().to_string());
+        }
+        if let Some(target) = filter.target_name.as_ref() {
+            q = q.bind(target.clone());
+        }
+        if let Some(limit) = filter.limit {
+            q = q.bind(limit);
+        }
+        if filter.offset > 0 {
+            q = q.bind(filter.offset);
+        }
+
+        let rows = q.fetch_all(&self.pool).await?;
 
         rows.into_iter()
             .map(|r| row_to_session(&r))
             .collect::<Result<Vec<_>>>()
     }
 
-    async fn close_stale_sessions(&self) -> Result<u64> {
+    async fn close_stale_sessions(&self, reason: CloseReason) -> Result<u64> {
         // Boot-time recovery: an unclean shutdown can leave "active"
         // sessions in the DB that no longer map to any running PTY.
         // Close them AND settle their participants in the same tx
@@ -424,12 +561,15 @@ impl Storage for SqliteStorage {
         let now_str = now_rfc3339();
         let mut tx = self.pool.begin().await?;
 
-        let result = sqlx::query("UPDATE sessions SET status = ?, closed_at = ? WHERE status = ?")
-            .bind(SessionStatus::Closed.as_str())
-            .bind(&now_str)
-            .bind(SessionStatus::Active.as_str())
-            .execute(&mut *tx)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE sessions SET status = ?, closed_at = ?, closed_reason = ? WHERE status = ?",
+        )
+        .bind(SessionStatus::Closed.as_str())
+        .bind(&now_str)
+        .bind(reason.as_str())
+        .bind(SessionStatus::Active.as_str())
+        .execute(&mut *tx)
+        .await?;
 
         sqlx::query(
             "UPDATE participants SET left_at = ? \
@@ -444,6 +584,30 @@ impl Storage for SqliteStorage {
 
         tx.commit().await?;
         Ok(result.rows_affected())
+    }
+
+    async fn count_active_sessions_per_target(&self) -> Result<HashMap<String, u32>> {
+        // One indexed GROUP BY over `sessions`. Targets with no
+        // active rows are omitted from the map — callers look up
+        // absent targets as zero. `COUNT(*)` comes back as i64 from
+        // SQLite, clamped to `u32` because a single node with 4B
+        // live PTYs is a fantasy and a negative row count is a bug.
+        let rows = sqlx::query(
+            "SELECT target_name, COUNT(*) AS n FROM sessions \
+             WHERE status = ? GROUP BY target_name",
+        )
+        .bind(SessionStatus::Active.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row.try_get("target_name")?;
+            let n: i64 = row.try_get("n")?;
+            let clamped = n.clamp(0, u32::MAX as i64) as u32;
+            out.insert(name, clamped);
+        }
+        Ok(out)
     }
 
     async fn upsert_participant(
@@ -496,16 +660,18 @@ impl Storage for SqliteStorage {
             return Err(Error::InvalidInput("max_uses must be at least 1".into()));
         }
         let (raw_token, sha256_hex) = generate_token();
+        let created_at = Utc::now();
 
         sqlx::query(
-            "INSERT INTO invite_tokens (token_sha256, session_id, role, max_uses, used_count, expires_at) \
-             VALUES (?, ?, ?, ?, 0, ?)",
+            "INSERT INTO invite_tokens (token_sha256, session_id, role, max_uses, used_count, expires_at, created_at) \
+             VALUES (?, ?, ?, ?, 0, ?, ?)",
         )
         .bind(&sha256_hex)
         .bind(session_id)
         .bind(role.as_str())
         .bind(max_uses)
         .bind(expires_at.map(rfc3339))
+        .bind(rfc3339(created_at))
         .execute(&self.pool)
         .await?;
 
@@ -516,8 +682,42 @@ impl Storage for SqliteStorage {
             max_uses,
             used_count: 0,
             expires_at,
+            created_at: Some(created_at),
         };
         Ok((invite, raw_token))
+    }
+
+    async fn list_invites_for_session(&self, session_id: &str) -> Result<Vec<InviteToken>> {
+        // Newest-first so the UI can render a chronological feed
+        // without sorting on the client. Exhausted / revoked rows
+        // disappear from here via `revoke_invite`; the service
+        // layer decides whether to hide "fully used" rows.
+        let rows = sqlx::query(
+            "SELECT * FROM invite_tokens WHERE session_id = ? \
+             ORDER BY COALESCE(created_at, '') DESC, token_sha256 ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(row_to_invite).collect()
+    }
+
+    async fn revoke_invite(&self, token_sha256: &str) -> Result<()> {
+        // Hard delete: a revoked invite has no use to the caller and
+        // nothing downstream references it by its PK (participants
+        // are keyed by session+user, not by invite). Returning
+        // `Error::InvalidInput` on miss mirrors `find_invite`'s
+        // "unknown token" behavior so the HTTP layer maps both to
+        // 400 without a separate branch.
+        let result = sqlx::query("DELETE FROM invite_tokens WHERE token_sha256 = ?")
+            .bind(token_sha256)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(Error::InvalidInput("invite token not found".into()));
+        }
+        Ok(())
     }
 
     async fn find_invite(&self, token: &str) -> Result<InviteToken> {
@@ -553,5 +753,102 @@ impl Storage for SqliteStorage {
             used_count: invite.used_count + 1,
             ..invite
         })
+    }
+
+    async fn insert_audit_event(&self, event: &AuditEvent) -> Result<i64> {
+        // `Value::Null` is stored as SQL NULL (not the literal string
+        // `"null"`) so queries that filter on a present detail work
+        // naturally — `detail IS NOT NULL` means "has extra data".
+        let detail_json = if event.detail.is_null() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&event.detail)
+                    .map_err(|e| Error::InvalidInput(format!("invalid detail: {e}")))?,
+            )
+        };
+        let result = sqlx::query(
+            "INSERT INTO audit_events \
+               (ts, actor_id, actor_name, event_type, session_id, detail) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(rfc3339(event.ts))
+        .bind(event.actor_id.map(|u| u.to_string()))
+        .bind(event.actor_name.as_ref())
+        .bind(event.event_type.as_str())
+        .bind(event.session_id.as_ref())
+        .bind(detail_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    async fn list_audit_events(&self, filter: &AuditFilter) -> Result<Vec<AuditEvent>> {
+        // Dynamic WHERE — same safety pattern as
+        // `list_sessions_for_user`: every `?` is bound through sqlx,
+        // the only strings that reach the SQL text are the hardcoded
+        // `IN (?, ?, ...)` placeholders computed from the length of
+        // `event_types`. No caller-supplied string is ever
+        // interpolated.
+        let mut sql = String::from(
+            "SELECT id, ts, actor_id, actor_name, event_type, session_id, detail \
+             FROM audit_events WHERE 1 = 1",
+        );
+        if filter.since.is_some() {
+            sql.push_str(" AND ts >= ?");
+        }
+        if filter.until.is_some() {
+            sql.push_str(" AND ts < ?");
+        }
+        if filter.actor_id.is_some() {
+            sql.push_str(" AND actor_id = ?");
+        }
+        if filter.session_id.is_some() {
+            sql.push_str(" AND session_id = ?");
+        }
+        if !filter.event_types.is_empty() {
+            sql.push_str(" AND event_type IN (");
+            for i in 0..filter.event_types.len() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push('?');
+            }
+            sql.push(')');
+        }
+        sql.push_str(" ORDER BY ts DESC, id DESC");
+        // An unset `limit` falls back to 100 — sane default for the
+        // CLI and the session-detail timeline. Callers that want
+        // everything pass `Some(i64::MAX)` (or the documented
+        // `LIMIT -1` sentinel via a higher layer).
+        let limit = filter.limit.unwrap_or(100);
+        sql.push_str(" LIMIT ?");
+        if filter.offset > 0 {
+            sql.push_str(" OFFSET ?");
+        }
+
+        let mut q = sqlx::query(&sql);
+        if let Some(since) = filter.since {
+            q = q.bind(rfc3339(since));
+        }
+        if let Some(until) = filter.until {
+            q = q.bind(rfc3339(until));
+        }
+        if let Some(actor_id) = filter.actor_id {
+            q = q.bind(actor_id.to_string());
+        }
+        if let Some(session_id) = filter.session_id.as_ref() {
+            q = q.bind(session_id.clone());
+        }
+        for et in &filter.event_types {
+            q = q.bind(et.as_str().to_string());
+        }
+        q = q.bind(limit);
+        if filter.offset > 0 {
+            q = q.bind(filter.offset);
+        }
+
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.iter().map(row_to_audit_event).collect()
     }
 }

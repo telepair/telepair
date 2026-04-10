@@ -136,6 +136,34 @@ describe('sessionStore.fetchSessions', () => {
     // Should not throw
     await sessionStore.fetchSessions();
   });
+
+  it('clears stale rows when a tab-switch fetch fails', async () => {
+    // Regression for the v0.1.1-dev bug: `fetchSessions` used to
+    // update `currentFilter` synchronously and then silently swallow
+    // the fetch error, leaving the previous tab's rows under the
+    // new tab. The fix drops the old rows on failure so the UI
+    // renders an empty state rather than data from the wrong bucket.
+    mockFetch.mockResolvedValueOnce(jsonResponse([fakeSession]));
+    await sessionStore.fetchSessions('active');
+    expect(sessionStore.sessions()).toEqual([fakeSession]);
+    expect(sessionStore.currentFilter()).toBe('active');
+
+    // Now switch to Closed and have the backend blow up.
+    mockFetch.mockResolvedValueOnce(new Response('boom', { status: 500 }));
+    await sessionStore.fetchSessions('closed');
+
+    // The tab highlight follows user intent — they clicked Closed,
+    // so that's what the chip shows.
+    expect(sessionStore.currentFilter()).toBe('closed');
+    // But we must NOT leave the active rows visible under Closed.
+    expect(sessionStore.sessions()).toEqual([]);
+
+    // Reset the filter back to 'active' so sibling tests in this
+    // file (which share a singleton sessionStore) inherit the
+    // default tab state.
+    mockFetch.mockResolvedValueOnce(jsonResponse([]));
+    await sessionStore.fetchSessions('active');
+  });
 });
 
 describe('sessionStore.createSession', () => {

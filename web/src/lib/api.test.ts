@@ -75,6 +75,47 @@ describe('api.listTargets', () => {
   });
 });
 
+describe('api.listSessions filter', () => {
+  it('omits query string when no filter is passed', async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse([]));
+    await api.listSessions();
+    expect(mockFetch.mock.calls[0][0]).toBe('/api/sessions');
+  });
+
+  it('emits status query param for a specific tab', async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse([]));
+    await api.listSessions({ status: 'closed' });
+    expect(mockFetch.mock.calls[0][0]).toBe('/api/sessions?status=closed');
+  });
+
+  it("treats status='all' as no status param (server default)", async () => {
+    // The backend handler's `ListSessionsQuery::into_filter` maps an
+    // absent status to "all statuses" — forwarding the literal string
+    // `all` would fail the handler's case-sensitive match. Keeping
+    // this mapping in one place (the api layer) means the rest of the
+    // app can still speak the readable 'all' | 'active' | 'closed'
+    // vocabulary.
+    mockFetch.mockResolvedValueOnce(jsonResponse([]));
+    await api.listSessions({ status: 'all' });
+    expect(mockFetch.mock.calls[0][0]).toBe('/api/sessions');
+  });
+
+  it('encodes target_name and pagination when present', async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse([]));
+    await api.listSessions({
+      status: 'active',
+      targetName: 'local shell',
+      limit: 50,
+      offset: 25,
+    });
+    const url = mockFetch.mock.calls[0][0] as string;
+    expect(url).toContain('status=active');
+    expect(url).toContain('target_name=local+shell');
+    expect(url).toContain('limit=50');
+    expect(url).toContain('offset=25');
+  });
+});
+
 describe('api.createSession', () => {
   it('sends POST with JSON body', async () => {
     store['telepair_token'] = 'tok';
