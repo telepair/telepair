@@ -376,8 +376,8 @@ export const api = {
     });
   },
 
-  /** Change password for the authenticated user. Requires current password for verification. */
-  changePassword(currentPassword: string, newPassword: string): Promise<{ message: string }> {
+  /** Change password for the authenticated user. Returns a rotated bearer token. */
+  changePassword(currentPassword: string, newPassword: string): Promise<{ token: string }> {
     return request('/auth/change-password', {
       method: 'POST',
       body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),

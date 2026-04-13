@@ -233,13 +233,11 @@ pub async fn change_password(
 ) -> Result<impl IntoResponse, ApiError> {
     let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
     let user = extract_user(&state, &headers).await?;
-    state
+    let new_token = state
         .auth_service
         .change_password(&user, &body.current_password, &body.new_password)
         .await?;
-    Ok(Json(
-        serde_json::json!({"message": "Password changed successfully."}),
-    ))
+    Ok(Json(serde_json::json!({ "token": new_token })))
 }
 
 pub async fn list_targets(
@@ -655,21 +653,26 @@ pub async fn update_participant_role(
         .upsert_participant(&session_id, target_uid, body.role)
         .await?;
 
-    // Update in-memory hub state + broadcast.
-    state
+    // Update in-memory hub state + broadcast. The hub returns false
+    // when the target is not in a live session (e.g. they disconnected
+    // between the DB write and this call). The DB change is still
+    // correct — the next reconnect picks up the new role — but the
+    // live WS handler won't get a PeerRoleChanged broadcast, so log
+    // a warning for operators.
+    if !state
         .hub
         .update_participant_role(&session_id, target_uid, body.role)
-        .await;
+        .await
+    {
+        tracing::warn!(
+            session_id,
+            %target_uid,
+            new_role = body.role.as_str(),
+            "hub role update missed: participant not in live session (DB persisted, will apply on reconnect)"
+        );
+    }
 
     // Audit.
-    let target_name = state
-        .sessions
-        .find_active_participant_role(&session_id, target_uid)
-        .await
-        .ok()
-        .flatten();
-    // Best-effort name lookup for audit — fall back to UUID string.
-    let _ = target_name; // participant name is in hub, just use UUID for now
     state
         .audit
         .record(

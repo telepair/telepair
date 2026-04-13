@@ -652,20 +652,46 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
             // already forwards the message to the WS client; this arm only
             // updates the server-side gate variables.
             result = role_rx.recv() => {
-                if let Ok(ServerMessage::PeerRoleChanged { user_id: uid, new_role }) = result
-                    && uid == user_id
-                {
-                    current_role = new_role;
-                    input_denied_reason = compute_input_denied(current_role, input_mode);
-                    denial_notice_sent = false;
-                    tracing::info!(
-                        user = %user_name,
-                        session = %session_id,
-                        role = %new_role,
-                        "role changed at runtime"
-                    );
+                match result {
+                    Ok(ServerMessage::PeerRoleChanged { user_id: uid, new_role })
+                        if uid == user_id =>
+                    {
+                        current_role = new_role;
+                        input_denied_reason = compute_input_denied(current_role, input_mode);
+                        denial_notice_sent = false;
+                        tracing::info!(
+                            user = %user_name,
+                            session = %session_id,
+                            role = %new_role,
+                            "role changed at runtime"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Messages were dropped — re-fetch the authoritative
+                        // role from the hub so a missed demotion cannot leave
+                        // stale permissions in effect.
+                        tracing::warn!(
+                            user = %user_name,
+                            session = %session_id,
+                            skipped = n,
+                            "collab broadcast lagged, re-syncing role from hub"
+                        );
+                        if let Some(role) = hub.get_participant_role(&session_id, user_id).await
+                            && role != current_role
+                        {
+                            current_role = role;
+                            input_denied_reason = compute_input_denied(current_role, input_mode);
+                            denial_notice_sent = false;
+                            tracing::info!(
+                                user = %user_name,
+                                session = %session_id,
+                                role = %role,
+                                "role re-synced after lag"
+                            );
+                        }
+                    }
+                    _ => {} // non-role messages for other users
                 }
-                // Ignore lag errors and non-role messages.
             }
             _ = shutdown_rx.recv() => {
                 tracing::info!(user = %user_name, session = %session_id, "session force-stopped");

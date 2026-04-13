@@ -363,34 +363,10 @@ async function emailLogin(email: string, password: string): Promise<boolean> {
 
 /**
  * Re-send the OTP code by calling the register endpoint again. The server
- * overwrites the pending row with a fresh OTP (60-second server-side rate
- * limit silently accepts). This is semantically identical to `emailRegister`
- * but named separately so the call site reads clearly as a "resend" action
- * and the UI can show distinct feedback (e.g. "code resent" vs initial send).
+ * overwrites the pending row with a fresh OTP. Delegates to `emailRegister`
+ * since the request and error handling are identical.
  */
-async function resendOtp(
-  email: string,
-  password: string,
-  displayName: string,
-): Promise<boolean> {
-  setValidating(true);
-  try {
-    await api.register(email, password, displayName);
-    setErrorKey(null);
-    return true;
-  } catch (e) {
-    if (e instanceof ApiError) {
-      if (e.status === 503) setErrorKey('auth.error_smtp_unavailable');
-      else if (e.status === 429) setErrorKey('auth.error_rate_limited');
-      else setErrorKey('auth.error_connection_failed');
-    } else {
-      setErrorKey('auth.error_connection_failed');
-    }
-    return false;
-  } finally {
-    setValidating(false);
-  }
-}
+const resendOtp = emailRegister;
 
 function logout() {
   setToken('');

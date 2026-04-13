@@ -4,41 +4,15 @@ import { api, errorMessage } from '../lib/api';
 import { AuditEventType } from '../lib/protocol';
 import type { AuditEvent } from '../lib/protocol';
 import type { ListAdminAuditOptions } from '../lib/api';
-import { useI18n, type TranslationKey } from '../i18n';
+import { useI18n } from '../i18n';
+import { eventLabel as _eventLabel, formatTs } from '../lib/audit';
 import LocaleSwitcher from '../components/LocaleSwitcher';
 import Banner from '../components/Banner';
 
 const PAGE_SIZE = 50;
 
-/** Map dotted-lowercase event type → i18n key for human labels. */
-const EVENT_LABEL_KEYS: Record<string, TranslationKey> = {
-  [AuditEventType.SESSION_CREATED]: 'session_detail.event_session_created',
-  [AuditEventType.SESSION_CLOSED]: 'session_detail.event_session_closed',
-  [AuditEventType.PARTICIPANT_JOINED]: 'session_detail.event_participant_joined',
-  [AuditEventType.INVITE_MINTED]: 'session_detail.event_invite_minted',
-  [AuditEventType.INVITE_REDEEMED]: 'session_detail.event_invite_redeemed',
-  [AuditEventType.INVITE_REVOKED]: 'session_detail.event_invite_revoked',
-  [AuditEventType.TARGET_ACCESS_DENIED]: 'session_detail.event_target_access_denied',
-  [AuditEventType.TARGET_RELOADED]: 'session_detail.event_target_reloaded',
-  [AuditEventType.AUTH_LOGIN_FAILED]: 'session_detail.event_auth_login_failed',
-  [AuditEventType.AUTH_REGISTER_REJECTED]: 'session_detail.event_auth_register_rejected',
-  [AuditEventType.AUTH_REGISTER_COMPLETED]: 'session_detail.event_auth_register_completed',
-  [AuditEventType.AUTH_VERIFY_FAILED]: 'session_detail.event_auth_verify_failed',
-  [AuditEventType.AUTH_USER_ENABLED]: 'session_detail.event_auth_user_enabled',
-  [AuditEventType.AUTH_USER_DISABLED]: 'session_detail.event_auth_user_disabled',
-  [AuditEventType.AUTH_SESSION_ACCESS_DENIED]: 'session_detail.event_auth_session_access_denied',
-  [AuditEventType.AUTH_PASSWORD_CHANGED]: 'session_detail.event_auth_password_changed',
-  [AuditEventType.PARTICIPANT_ROLE_CHANGED]: 'session_detail.event_participant_role_changed',
-};
-
 /** All known event type values for the filter dropdown. */
 const ALL_EVENT_TYPES = Object.values(AuditEventType);
-
-function formatTs(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString();
-}
 
 export default function AdminAudit() {
   const { t } = useI18n();
@@ -116,10 +90,7 @@ export default function AdminAudit() {
     });
   }
 
-  function eventLabel(type: string): string {
-    const key = EVENT_LABEL_KEYS[type];
-    return key ? t(key) : type;
-  }
+  const eventLabel = (type: string) => _eventLabel(t, type);
 
   return (
     <div class="admin-audit">

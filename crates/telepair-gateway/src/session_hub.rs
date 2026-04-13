@@ -726,12 +726,14 @@ impl SessionHub {
     }
 
     /// Update a participant's role in a live session. Mutates the
-    /// in-memory participant map, persists via `upsert_participant`, and
-    /// broadcasts `PeerRoleChanged` so every connected client updates
-    /// its participant list and re-evaluates input permissions. Returns
-    /// `true` if the role was actually changed, `false` if the
-    /// participant wasn't found in the live session or the role was
-    /// already the requested value.
+    /// in-memory participant map and broadcasts `PeerRoleChanged` so
+    /// every connected client updates its participant list and
+    /// re-evaluates input permissions. Does **not** persist to the
+    /// database — the caller is responsible for that (see
+    /// `update_participant_role` in `http.rs`). Returns `true` if the
+    /// role was actually changed, `false` if the participant wasn't
+    /// found in the live session or the role was already the requested
+    /// value.
     pub async fn update_participant_role(
         &self,
         session_id: &str,
@@ -754,6 +756,16 @@ impl SessionHub {
             new_role,
         });
         true
+    }
+
+    /// Return the authoritative role for a participant in a live session.
+    /// Used by the WS handler to re-sync after a broadcast lag.
+    pub async fn get_participant_role(&self, session_id: &str, user_id: Uuid) -> Option<Role> {
+        let sessions = self.sessions.read().await;
+        match sessions.get(session_id)? {
+            SessionEntry::Live(live) => live.participants.get(&user_id).map(|p| p.role),
+            SessionEntry::Pending { .. } => None,
+        }
     }
 
     /// Spawn a background task that periodically reaps sessions which
