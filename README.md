@@ -176,10 +176,10 @@ telepair stores its data in `~/.telepair/`:
 ## Development
 
 ```bash
-# Run backend tests (209 tests)
+# Run backend tests (284 tests)
 cargo test --workspace
 
-# Run frontend unit tests (134 tests)
+# Run frontend unit tests (137 tests)
 cd web && npm test
 
 # Run browser E2E tests (43 tests, requires running server + Chromium)
@@ -220,7 +220,7 @@ RUST_LOG=debug ./target/release/telepair
 | Backend | Rust, axum, tokio, sqlx (SQLite), portable-pty |
 | Frontend | SolidJS, TypeScript, xterm.js, Vite |
 | Protocol | JSON over WebSocket (control + collab), binary frames (terminal I/O) |
-| Auth | Token-based with SHA-256 hashed storage |
+| Auth | Token-based with SHA-256 hashed storage; email registration with OTP and Argon2 password hashing |
 | Storage | SQLite (async via sqlx) |
 
 ## License

@@ -7,6 +7,185 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-04-13
+
+Minor release adding **email-based self-serve registration** with OTP
+verification, **user-owned targets**, and an **admin approval gate** for
+new signups. The auth pipeline is hardened with login throttling, atomic
+OTP lockout, idempotent registration, and a resilience fix that prevents
+transient DB errors from killing live sessions.
+
+No breaking wire-format changes. New tables (`pending_registrations`,
+`user_targets`) and columns (`users.email`, `users.password_hash`,
+`users.session_enabled`, `users.login_failed_count`,
+`users.login_locked_until`, `sessions.user_target_id`) are applied
+idempotently at boot, so an in-place upgrade from 0.1.1 works without
+wiping the database.
+
+### Added — Email authentication
+
+- `POST /api/auth/register` — accepts email, password, and display
+  name. Sends a 6-digit OTP via SMTP with a 15-minute TTL. Response
+  is always `201` (or `503` if SMTP is not configured) to prevent
+  email enumeration.
+- `POST /api/auth/verify` — submits OTP code. On success, atomically
+  consumes the pending row and inserts a new `users` entry with
+  `session_enabled = FALSE` (awaiting admin approval).
+- `POST /api/auth/login` — unified login accepting either
+  `{token}` (existing admin path) or `{email, password}` (new email
+  path).
+- `AuthService` in `telepair-control`: Argon2 password hashing,
+  pre-built SMTP transport reuse for connection pooling, 60-second
+  rate limit on OTP sends, and detailed audit trail for every auth
+  event. All failure responses collapse to "invalid email or code"
+  to prevent enumeration.
+
+### Added — User-owned targets
+
+- `UserTargetService` in `telepair-control`: CRUD for per-user
+  targets with non-blank validation, env-var expansion disabled
+  (prevents leaking server secrets via `${SMTP_PASS}`), and a
+  referential guard that rejects update/delete while an active
+  session references the target.
+- REST endpoints: `POST /api/user-targets`,
+  `GET /api/user-targets/{id}`, `PUT /api/user-targets/{id}`,
+  `DELETE /api/user-targets/{id}`. Guest users rejected with 403.
+- `user_targets` table: id (nanoid PK), user_id (FK), name, display,
+  command, args/env/tags (JSON), timestamps. Unique constraint on
+  `(user_id, name)`.
+- Sessions can now reference a `user_target_id`. The WS PTY spawn
+  path resolves user targets via `UserTargetService::resolve_by_id()`
+  when the global target lookup misses.
+- Frontend `UserTargetDrawer` component: modal form for
+  creating/editing user targets with name, display, command, args,
+  env (KEY=value lines), and tags. Delete with confirmation in edit
+  mode; conflict errors shown when an active session blocks mutation.
+
+### Added — Pending-registration approval gate
+
+- `users.session_enabled` column (default `TRUE` for existing users,
+  `FALSE` for new email registrations) gates session creation and
+  WebSocket attach. Admins bypass the gate.
+- `GET /api/admin/users` — lists all non-guest accounts with email,
+  role, and session-enabled status.
+- `POST /api/admin/users/{id}/enable` /
+  `POST /api/admin/users/{id}/disable` — admin-only toggles for the
+  `session_enabled` bit.
+- Frontend `AdminUsers` page: lists registered users with enable/
+  disable controls. Accessible from the dashboard admin menu.
+
+### Added — Frontend
+
+- **Register page**: two-step flow (email/password/display-name form
+  → 6-digit OTP input with numeric formatting).
+- **Login page**: now supports email + password in addition to token.
+- **Auth store**: new `emailRegister()`, `emailVerifyOtp()`,
+  `emailLogin()` methods with `validating()` and `errorKey()`
+  signals for UI feedback.
+- **Protocol types**: `AdminUserInfo`, `UserTargetInfo` types
+  matching backend DTOs.
+- `admin_users` and `user_targets` i18n namespaces added to both
+  `en.ts` and `zh.ts`.
+
+### Added — Virtual target validation
+
+- `telepair-agent`: target config validation now rejects blank name,
+  display, or command fields at parse time instead of silently
+  accepting empty strings.
+
+### Fixed
+
+- **Login throttle with audit trail.** After 5 failed login attempts,
+  the user is locked out for 15 minutes. Each attempt emits an
+  `auth.login_failed` audit event with reason (`unknown_email`,
+  `bad_password`, `locked`), remaining attempts, and `locked_until`
+  timestamp. Successful login clears the counter. Lockout check
+  runs before hash verification to prevent timing side-channels on
+  locked rows.
+- **Atomic OTP lockout.** `verify_pending_registration()` uses a
+  CAS-based SQL `UPDATE` with `otp_failure_count < 5` guard to
+  prevent concurrent wrong codes from racing past the lockout
+  threshold.
+- **Idempotent registration with orphan OTP rollback.** If SMTP
+  fails after `upsert_pending_registration()` writes the row,
+  `delete_pending_registration()` is called with compare-and-delete
+  (email + OTP code) to prevent the user from being locked behind
+  the 60-second rate limit. A concurrent re-register that overwrote
+  the row is not affected.
+- **Session-ref mutation guard.** `update_user_target()` and
+  `delete_user_target()` check for active sessions referencing the
+  target before proceeding. Returns `Conflict` if blocked;
+  preserves `PermissionDenied` when caller doesn't own the target
+  to prevent information leakage.
+- **Transient DB error resilience.** The WS session reaper no longer
+  kills live sessions on transient SQLite errors (e.g.
+  `SQLITE_BUSY` during WAL contention). Reaper retries instead of
+  propagating the exception.
+- **Concurrent OTP race.** `upsert_pending_registration()` atomically
+  overwrites hash + OTP on re-register, preventing a window where
+  two concurrent registrations could leave inconsistent state.
+- **Target namespace split.** User targets use nanoid as `id` (primary
+  key in responses); `name` is user-specified as part of the unique
+  constraint with `user_id`. Global targets continue using target
+  name as identifier. `Session.target_name` stores the original
+  target name at creation time for both types.
+- **Login error clearing on tab switch.** Auth store clears error
+  state when navigating between Login/Register tabs, preventing
+  stale error messages from persisting across tab switches.
+- **Env-var expansion disabled for user targets.** User-supplied
+  target configs no longer expand process environment variables,
+  closing a path where `${DATABASE_URL}` or `${SMTP_PASS}` in a
+  user target command could exfiltrate server secrets.
+
+### Refactoring
+
+- **SMTP transport reuse.** `AuthService` builds the SMTP
+  `AsyncSmtpTransport` once in `new()` and shares it via `Arc`
+  across all calls, avoiding TLS re-establishment on every email.
+- **Storage helpers.** `parse_optional_datetime()` and
+  `generate_token()` extracted as reusable utilities for timestamp
+  parsing and bearer token generation.
+
+### Chore
+
+- **Makefile root guard.** Added check to prevent running `make`
+  outside the repo root.
+- **Frontend dependency upgrades.** All SolidJS and development
+  dependencies updated to latest versions.
+
+### New error variants
+
+- `Conflict` (409), `RateLimited` (429), `ServiceUnavailable` (503)
+  added to `telepair-core::Error` with automatic HTTP status mapping.
+
+### New audit events
+
+- `auth.register_rejected` — rate-limited or already-registered
+  silent no-op.
+- `auth.register_completed` — OTP verification succeeded, user row
+  materialized.
+- `auth.verify_failed` — OTP verification failed (bad code, locked,
+  expired); includes remaining attempts.
+- `auth.login_failed` — password login failed; includes reason,
+  remaining attempts, and `locked_until`.
+- `auth.user_enabled` / `auth.user_disabled` — admin toggled
+  `session_enabled`.
+- `auth.session_access_denied` — user with `session_enabled = false`
+  attempted to create or join a session.
+
+### Testing
+
+- Cargo test count: **209 → 284** (all green). New coverage:
+  `email_registration_test` (pending row lifecycle, OTP lockout,
+  rate limiting, display-name collisions, email case-insensitivity),
+  `admin_users_test` (enable/disable gate),
+  `session_enabled_gate_test` (HTTP and WS rejection flows),
+  expanded `http_test` (user-target CRUD, auth endpoints).
+- Vitest count: **134 → 137**. Updated API client tests for new
+  auth and user-target endpoints.
+- Playwright count: **43** (unchanged). Existing E2E specs updated
+  for login tab switch behavior and heading matchers.
+
 ## [0.1.1] - 2026-04-10
 
 Patch release focused on **pulling business rules back into `telepair-control`**
@@ -549,6 +728,7 @@ role-based permissions, invite links, and real-time chat.
 - GitHub Actions CI pipeline and release workflow.
 - MIT license across the workspace.
 
-[Unreleased]: https://github.com/telepair/telepair/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/telepair/telepair/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/telepair/telepair/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/telepair/telepair/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/telepair/telepair/releases/tag/v0.1.0

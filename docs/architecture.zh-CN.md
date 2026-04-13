@@ -30,7 +30,7 @@ telepair-cli
 | `auth.rs` | `TokenAuthProvider` —— token 使用 SHA-256 哈希校验(原始 token 在创建时返回一次,之后不再持久化) |
 | `target.rs` | `Target` 和 `TargetKind` 定义 |
 | `audit.rs` | `AuditEvent`、`AuditEventType`、`AuditSink` trait —— 只追加的事件日志,支撑 `telepair admin audit` 和应用内会话时间线 |
-| `error.rs` | `Error` 枚举(Auth、NotFound、Storage、Internal) |
+| `error.rs` | `Error` 枚举 —— Auth (401)、SessionNotFound/TargetNotFound (404)、SessionClosed (410)、PermissionDenied (403)、InvalidInput (400)、Conflict (409)、RateLimited (429)、ServiceUnavailable (503)、Internal/Storage/Io (500)。每个 variant 都有 `http_status()` 方法做统一的 HTTP 状态码映射。 |
 
 ### telepair-agent
 
@@ -49,6 +49,8 @@ telepair-cli
 |------|------|
 | `session_service.rs` | `SessionService` —— 会话生命周期(`create_session`、`close_session(reason)`)、参与者查询(`list_participants`、`list_sessions_for_user`)、授权辅助(`require_owner`)以及跨层聚合查询(如 `active_session_counts_per_target`)。会话创建 / 关闭以及启动清理都会在这里发审计事件。 |
 | `invite_service.rs` | `InviteService` —— 邀请生命周期(`create`、`redeem`、`list_for_session`、`revoke`)。`MAX_INVITE_USES` / TTL 校验、跨会话 scoped-guest 检查、兑换成功后的 guest mint 都收敛在这里,并发出 `invite.minted` / `invite.redeemed` / `invite.revoked` 审计事件。 |
+| `auth_service.rs` | `AuthService` —— 基于邮箱的注册（含 OTP 验证）、密码登录（Argon2 哈希）、管理员用户管理（`list_accounts`、`set_session_access`）。负责 SMTP 发送 OTP（通过 lettre）、登录限流（5 次错误后锁定 15 分钟）、以及防枚举的统一错误折叠。发出 `auth.register_rejected` / `auth.register_completed` / `auth.verify_failed` / `auth.login_failed` / `auth.user_enabled` / `auth.user_disabled` 审计事件。 |
+| `user_target_service.rs` | `UserTargetService` —— 用户自有目标的 CRUD（`create`、`update`、`delete`、`get`、`list`、`resolve_by_id`）。每次变更都校验所有权,在活跃会话引用该目标时阻止修改 / 删除（通过 `Conflict` 错误实现引用完整性），resolve 时故意不做 `${VAR}` 展开以防止用户提交的命令字符串泄露进程环境变量。 |
 | `target_service.rs` | `TargetService` —— 包装 `TargetEngine`,提供目标列表和解析能力。 |
 
 ### telepair-gateway
@@ -58,7 +60,7 @@ telepair-cli
 | 模块 | 用途 |
 |------|------|
 | `lib.rs` | Axum 路由设置与路由定义 |
-| `state.rs` | `AppState` —— 共享应用状态:storage、auth、`SessionService`、`InviteService`、`Arc<ArcSwap<TargetEngine>>`(用于原子化的目标热重载)、`Arc<dyn AuditSink>`、以及 `SessionHub` |
+| `state.rs` | `AppState` —— 共享应用状态:storage、auth、`SessionService`、`InviteService`、`AuthService`、`UserTargetService`、`Arc<ArcSwap<TargetEngine>>`(用于原子化的目标热重载)、`Arc<dyn AuditSink>`、以及 `SessionHub` |
 | `http.rs` | REST handler:health、targets、sessions、invites(list / revoke)、会话历史、会话审计、whoami、admin targets(list + reload)。所有 handler 都走 service —— 生产代码不再直接访问 `.storage()`。 |
 | `ws.rs` | WebSocket handler —— 认证、角色校验、消息分发、PTY I/O 桥接,`participant.joined` / `participant.left` 审计事件发射 |
 | `session_hub.rs` | `SessionHub` —— 单会话状态:PTY 进程、已连接参与者、广播通道。持有 `Arc<SessionService>`(而非裸 Storage),所以空闲清理的关闭也会和所有者主动关闭走同一条审计路径,带 `CloseReason::Reaper`。 |
@@ -83,6 +85,8 @@ Browser                     telepair (single process)
                            │                                   │
                            │  Control (services)               │
                            │    ├── SessionService             │
+                           │    ├── AuthService                │
+                           │    ├── UserTargetService          │
                            │    └── TargetService              │
                            │                                   │
                            │  Core (storage)                   │
@@ -109,9 +113,19 @@ Browser                     telepair (single process)
 3. `SessionHub` 经 `collab_tx` 广播给所有参与者
 4. 各 WS handler 转发给自己的客户端
 
+### 邮箱注册与登录
+
+1. 客户端调用 `POST /api/auth/register`,携带 email、password 和 display name
+2. `AuthService` 用 Argon2 哈希密码、生成 6 位 OTP、写入 `pending_registrations` 行,并通过 SMTP 发送 OTP
+3. 客户端调用 `POST /api/auth/verify`,携带 email 和 OTP 码
+4. `AuthService` 对比 pending 行中的验证码（带尝试次数限制和 TTL），成功后物化 `users` 行,返回 bearer token
+5. 后续登录时客户端调用 `POST /api/auth/login`，携带 email 和 password
+6. `AuthService` 校验 Argon2 哈希,执行 5 次错误锁定窗口,成功时清空计数器,返回新 bearer token
+7. 管理员可通过 `PUT /api/admin/users/{id}/session-access` 启用/禁用用户的会话权限 —— 登录本身不受影响（密码重置、查看历史仍可用），但会话创建和 WS 接入会被阻止
+
 ### 会话生命周期
 
-1. 客户端带 target name 调用 `POST /api/sessions`
+1. 客户端带 target name（或 user target ID）调用 `POST /api/sessions`
 2. `SessionService` 在 SQLite 中创建会话,把 owner 作为参与者加入
 3. Owner 通过 `WS /ws/session/{id}` 连入,发送 `SessionJoin`
 4. `SessionHub` 拉起 PTY,启动 I/O 循环
@@ -133,16 +147,24 @@ Browser                     telepair (single process)
 ## 存储 Schema
 
 ```sql
-users        (id, name, token_sha256, is_admin, scoped_session_id, created_at, updated_at)
-sessions     (id, owner_id, target_name, input_mode, status, closed_reason, created_at, closed_at)
-participants (session_id, user_id, role, joined_at, left_at)
-invite_tokens(token_sha256, session_id, role, max_uses, used_count, expires_at)
-audit_events (id, ts, actor_id, actor_name, event_type, session_id, detail)
+users                 (id, name, token_sha256, is_admin, scoped_session_id,
+                       email, password_hash, session_enabled,
+                       login_failed_count, login_locked_until,
+                       created_at, updated_at)
+sessions              (id, owner_id, target_name, input_mode, status,
+                       closed_reason, user_target_id, created_at, closed_at)
+participants          (session_id, user_id, role, joined_at, left_at)
+invite_tokens         (token_sha256, session_id, role, max_uses, used_count, expires_at)
+audit_events          (id, ts, actor_id, actor_name, event_type, session_id, detail)
+pending_registrations (email, display_name, password_hash, otp_code,
+                       attempts_remaining, expires_at, created_at)
+user_targets          (id, user_id, name, display, command, args, env, tags,
+                       created_at, updated_at)
 ```
 
 所有 ID 都是存为 TEXT 的 UUID。时间戳是 ISO 8601 TEXT。`Storage` trait 是异步且与具体实现无关的 —— v1 的后端是 SQLite。
 
-**Schema 演进(0.1.x)。** 迁移状态保存在单一的 `migrations/001_initial.sql` 中,每次启动都会整份加载。`telepair-core/src/storage/sqlite.rs` 里的 `run_migrations()` 会先执行完整 SQL 文件,再通过 `pragma_table_info` 做一次列存在性检查,以幂等方式给旧库补上 `sessions.closed_reason` 列;`audit_events` 表及其四个索引用 `CREATE TABLE / INDEX IF NOT EXISTS` 达成同样的效果。这让 0.1.x 范围内的原地升级保持可用,而不必引入正式的迁移框架;真正出现 schema 冲突时,pre-1.0 的 "删库重建" 兜底仍然适用。正式迁移框架留给后续 minor 版本。
+**Schema 演进（0.1.x）。** 迁移状态保存在单一的 `migrations/001_initial.sql` 中，每次启动都会整份加载。`telepair-core/src/storage/sqlite.rs` 里的 `run_migrations()` 会先执行完整 SQL 文件，再通过 `pragma_table_info` 做列存在性检查，以幂等方式给旧库补上新列 —— 如 `sessions.closed_reason`、`sessions.user_target_id`、以及 `users` 表的邮箱认证字段（`email`、`password_hash`、`session_enabled`、`login_failed_count`、`login_locked_until`）。新表（`audit_events`、`pending_registrations`、`user_targets`）用 `CREATE TABLE IF NOT EXISTS` 达成同样的效果。这让 0.1.x 范围内的原地升级保持可用，而不必引入正式的迁移框架；真正出现 schema 冲突时，pre-1.0 的"删库重建"兜底仍然适用。正式迁移框架留给后续 minor 版本。
 
 ### 审计事件
 
@@ -162,7 +184,10 @@ audit_events (id, ts, actor_id, actor_name, event_type, session_id, detail)
 
 ## 安全模型
 
-- **认证(Authentication)**:`Authorization` header 里的 bearer token。Token 只以 SHA-256 hex 摘要形式存储 —— 原始值仅在创建时返回给调用方一次,此后不再持久化。
+- **认证（Authentication）**：`Authorization` header 里的 bearer token。Token 只以 SHA-256 hex 摘要形式存储 —— 原始值仅在创建时返回给调用方一次，此后不再持久化。邮箱注册提供了第二条认证路径：用户以 email + password 注册，通过 SMTP 发送的 6 位 OTP 验证后获得 bearer token。密码使用 Argon2 哈希（每行独立 salt）；OTP 有效期 15 分钟，每个邮箱 60 秒限流。
+- **登录限流**：密码登录执行 5 次错误锁定 —— 连续 5 次错误密码后账户锁定 15 分钟。一次成功登录即清空计数器。所有失败模式（未知邮箱、错误密码、已锁定）返回完全相同的错误形态以防止枚举。
+- **待注册**：`pending_registrations` 表是一个无权限的暂存区 —— 在 OTP 验证通过前不会创建 `users` 行。对已验证邮箱的重复注册会静默成功（不泄露信息）并写入审计行。
+- **管理员审批门控**：邮箱注册的新用户默认 `session_enabled = FALSE`。管理员须通过 `PUT /api/admin/users/{id}/session-access` 将其置为 `TRUE` 后用户才能创建会话或接入 WebSocket。登录本身不受限，用户可在等待审批期间查看历史或修改密码。
 - **授权(Authorization)**:按会话做基于角色的授权。WS handler 在每次 input / resize 动作时都检查角色。
 - **邀请 token**:默认单次使用。以 SHA-256 摘要存储;原子化的 `used_count < max_uses` 自增防止并发兑换的竞态。
 - **CORS**:可通过 `--allowed-origins`(逗号分隔的绝对 URL)配置。不设置时,服务器默认**仅允许 loopback dev 源**(`http://localhost:5173`、`http://127.0.0.1:5173`)以匹配 Vite dev server。畸形的 origin 会让启动失败 —— 拼错不会悄悄让 allowlist 变宽。`--allow-any-origin` 显式启用 `Access-Control-Allow-Origin: *`,仅适合 dev 或下游已有强制 CORS 的反向代理。生产环境直连(无反代)时,请把 `--allowed-origins` 设为你信任的前端域名。

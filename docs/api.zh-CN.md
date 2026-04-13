@@ -4,7 +4,7 @@
 
 Base URL:`http://localhost:7700/api`
 
-除 `/api/health` 和 `POST /api/invite/redeem` 之外,所有端点都需要通过 Bearer token 认证:
+除 `/api/health`、认证端点(`POST /api/auth/register`、`POST /api/auth/verify`、`POST /api/auth/login`)和 `POST /api/invite/redeem` 之外,所有端点都需要通过 Bearer token 认证:
 
 ```
 Authorization: Bearer <token>
@@ -37,7 +37,8 @@ Authorization: Bearer <token>
   "user_id": "...",
   "name": "admin",
   "is_admin": true,
-  "is_guest": false
+  "is_guest": false,
+  "session_enabled": true
 }
 ```
 
@@ -47,9 +48,125 @@ Authorization: Bearer <token>
 | `name` | string | 当前显示名 |
 | `is_admin` | boolean | 管理员账号为 `true` |
 | `is_guest` | boolean | 邀请兑换生成的 scoped guest 为 `true` |
+| `session_enabled` | boolean | 用户可以创建/加入会话时为 `true`。Dashboard 在该值为 `false` 时渲染"等待管理员审批"的横幅,并隐藏创建会话的表单。 |
 
 **错误**
 - `401 Unauthorized` —— token 缺失或无效。不会返回 403:"我是 guest" 本身就是一个有意义的身份。
+
+### POST /api/auth/register
+
+发起邮箱注册。创建一个未验证的待审账号,并向提供的邮箱发送一次性验证码。
+**无需认证。**
+
+无论邮箱是否已经注册、是否存在近期的待审注册,该端点在输入合法时**一律返回 `201`**。
+这是故意的防枚举设计 —— 调用方无法区分"验证码已发送"和"地址已被占用"。具体原因
+(已注册、被限流等)会记录在审计日志中。
+
+**请求体**
+```json
+{
+  "email": "alice@example.com",
+  "password": "s3cret!",
+  "display_name": "Alice"
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `email` | string | 是 | 邮箱地址(不区分大小写) |
+| `password` | string | 是 | 明文密码;存储前会用 Argon2 哈希 |
+| `display_name` | string | 是 | 新账号的显示名 |
+
+**响应** `201 Created`
+```json
+{
+  "message": "Verification code sent to your email."
+}
+```
+
+**错误**
+- `400 Bad Request` —— 请求体格式不合法
+- `503 Service Unavailable` —— 该实例未配置 SMTP;请联系管理员
+
+### POST /api/auth/verify
+
+提交邮件中收到的 OTP 验证码以完成注册。成功后返回 bearer token。
+**无需认证。**
+
+所有失败场景(验证码错误、已过期、连续错误次数过多后被锁定)都折叠成同一个 `401`
+形态,使得 API 无法被用于枚举哪些地址有待审注册。详细原因仍然记录在审计日志中。
+
+**请求体**
+```json
+{
+  "email": "alice@example.com",
+  "code": "839204"
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `email` | string | 是 | 注册时使用的邮箱地址 |
+| `code` | string | 是 | 验证邮件中的 6 位 OTP 验证码 |
+
+**响应** `200 OK`
+```json
+{
+  "token": "newly-minted-bearer-token"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `token` | string | 新验证账号的 bearer token。账号初始 `session_enabled = false` —— 需要管理员启用后才能创建或加入会话。 |
+
+**错误**
+- `400 Bad Request` —— 请求体格式不合法
+- `401 Unauthorized` —— OTP 验证码错误、已过期,或待审行在多次失败后被锁定
+
+### POST /api/auth/login
+
+统一登录端点。接受原始 bearer token(已有的 admin/guest 登录路径)或邮箱 + 密码凭证
+(邮箱注册的用户)。**无需认证。**
+
+**请求体 —— token 登录**
+```json
+{
+  "token": "existing-bearer-token"
+}
+```
+
+**请求体 —— 邮箱 + 密码登录**
+```json
+{
+  "email": "alice@example.com",
+  "password": "s3cret!"
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `token` | string | 否* | 要验证的已有 bearer token。与 `email`/`password` 互斥。 |
+| `email` | string | 否* | 密码登录用的邮箱地址 |
+| `password` | string | 否* | 密码登录用的密码 |
+
+\* 必须且只能提供 `{token}` 或 `{email, password}` 中的一种。
+
+**响应** `200 OK`
+```json
+{
+  "token": "valid-bearer-token"
+}
+```
+
+token 登录时,验证通过后回传相同的 token。邮箱 + 密码登录时,会签发一个新的
+bearer token 并返回。
+
+**错误**
+- `400 Bad Request` —— 既没传 `token` 也没传 `email`+`password`,或请求体格式不合法
+- `401 Unauthorized` —— token 无效、邮箱未知、密码错误,或账号在多次失败后被锁定。所有场景返回同一个通用错误(防枚举)。密码登录有节流:连续 5 次错误密码后账号将被锁定一段冷却时间,锁定情况仅在审计日志中可见。
+
+**备注:** `session_enabled` 检查**不在**登录时发生。被禁用的账号仍然可以登录(查看历史、修改密码等)—— 会话创建和 WebSocket 连接才是执行 `session_enabled` 检查的关卡。
 
 ## Targets
 
@@ -336,6 +453,133 @@ Authorization: Bearer <token>
 - `403 Forbidden` —— 调用方不是会话 owner
 - `404 Not Found` —— 会话不存在
 
+## User Targets
+
+用户自有的虚拟 target。每个用户可以对自己的 target 进行增删改查。这些 target 会和
+`targets.yaml` 中的全局 target 一起出现在 target 列表里(以 `"source": "user"` 区分)。
+Scoped guest 在所有 user target 路由上都会得到 `403` —— 它们是邀请兑换生成的,仅在
+会话范围内有效。
+
+### POST /api/user-targets
+
+创建一个用户自有的虚拟 target。调用方自动成为 owner。
+
+**请求体**
+```json
+{
+  "name": "my-dev-db",
+  "display": "My Dev Database",
+  "command": "psql",
+  "args": ["-h", "localhost", "-U", "dev", "mydb"],
+  "env": { "PGPASSWORD": "devpass" },
+  "tags": ["database", "dev"]
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `name` | string | 是 | 唯一的 target 名称(不能为空) |
+| `display` | string | 是 | 人类可读的显示名(不能为空) |
+| `command` | string | 是 | 要执行的命令(不能为空) |
+| `args` | string[] | 否 | 命令参数(默认 `[]`) |
+| `env` | object | 否 | 目标进程的环境变量(默认 `{}`) |
+| `tags` | string[] | 否 | 描述性标签(默认 `[]`) |
+
+**响应** `201 Created`
+```json
+{
+  "id": "a1b2c3d4e5",
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "name": "my-dev-db",
+  "display": "My Dev Database",
+  "command": "psql",
+  "args": ["-h", "localhost", "-U", "dev", "mydb"],
+  "env": { "PGPASSWORD": "devpass" },
+  "tags": ["database", "dev"],
+  "created_at": "2026-04-13T10:00:00Z",
+  "updated_at": "2026-04-13T10:00:00Z"
+}
+```
+
+**错误**
+- `400 Bad Request` —— `name`、`display` 或 `command` 为空,或请求体格式不合法
+- `401 Unauthorized` —— token 缺失或无效
+- `403 Forbidden` —— 调用方是 scoped guest
+
+### GET /api/user-targets/{id}
+
+获取单个用户自有 target。只有 owner 能读取。
+
+**响应** `200 OK`
+```json
+{
+  "id": "a1b2c3d4e5",
+  "user_id": "550e8400-...",
+  "name": "my-dev-db",
+  "display": "My Dev Database",
+  "command": "psql",
+  "args": ["-h", "localhost", "-U", "dev", "mydb"],
+  "env": { "PGPASSWORD": "devpass" },
+  "tags": ["database", "dev"],
+  "created_at": "2026-04-13T10:00:00Z",
+  "updated_at": "2026-04-13T10:00:00Z"
+}
+```
+
+**错误**
+- `401 Unauthorized` —— token 缺失或无效
+- `403 Forbidden` —— 调用方是 scoped guest
+- `404 Not Found` —— target 不存在,或不属于当前调用方
+
+### PUT /api/user-targets/{id}
+
+更新用户自有 target。只有 owner 能更新。更新时忽略 `name` 字段 —— 只有 `display`、
+`command`、`args`、`env` 和 `tags` 是可变的。
+
+**请求体**
+```json
+{
+  "display": "My Dev Database (updated)",
+  "command": "psql",
+  "args": ["-h", "localhost", "-U", "dev", "mydb_v2"],
+  "env": { "PGPASSWORD": "newpass" },
+  "tags": ["database", "dev", "v2"]
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `display` | string | 是 | 人类可读的显示名(不能为空) |
+| `command` | string | 是 | 要执行的命令(不能为空) |
+| `args` | string[] | 否 | 命令参数(默认 `[]`) |
+| `env` | object | 否 | 环境变量(默认 `{}`) |
+| `tags` | string[] | 否 | 描述性标签(默认 `[]`) |
+
+**响应** `200 OK`
+
+返回更新后的 `UserTarget` 对象(与创建响应形状一致)。
+
+**错误**
+- `400 Bad Request` —— `display` 或 `command` 为空,或请求体格式不合法
+- `401 Unauthorized` —— token 缺失或无效
+- `403 Forbidden` —— 调用方是 scoped guest
+- `404 Not Found` —— target 不存在,或不属于当前调用方
+- `409 Conflict` —— 有活跃会话仍在引用此 target;先关闭会话再重试
+
+### DELETE /api/user-targets/{id}
+
+删除用户自有 target。只有 owner 能删除。
+
+**响应** `204 No Content`
+
+无响应体。
+
+**错误**
+- `401 Unauthorized` —— token 缺失或无效
+- `403 Forbidden` —— 调用方是 scoped guest
+- `404 Not Found` —— target 不存在,或不属于当前调用方
+- `409 Conflict` —— 有活跃会话仍在引用此 target;先关闭会话再重试
+
 ## Admin
 
 `/api/admin/*` 下的路由需要 admin bearer token。非管理员会得到 `403`。guest token
@@ -414,3 +658,85 @@ engine —— 整个过程没有锁窗口。
 - `400 Bad Request`,body 为 `{ "reason": "still_referenced", "message": "...", "targets": [{ "target": "...", "active_sessions": N }, ...] }` —— 新的 `targets.yaml` 会删掉仍有活跃会话的 target。旧 engine 保持不动,`targets` 数组精确列出哪些 target 正在阻塞重载以及各自的活跃会话数,管理员可以先关掉这些会话(或在 yaml 中恢复 target)再重试。admin 页面会把它渲染为常驻的 banner,而不是一闪而过的 toast。
 - `401 Unauthorized` —— token 缺失或无效
 - `403 Forbidden` —— 调用方已认证但不是管理员
+
+### GET /api/admin/users
+
+列出所有非 guest 用户账号,最新优先。仅管理员可访问。Scoped guest 不会出现在列表里
+—— 它们是邀请兑换生成的,仅在会话范围内存在,会话关闭后即消失。
+
+该端点支撑 v0.1.2 引入的管理员 Users 页面,管理员可以在这里切换自注册邮箱账号的
+`session_enabled` 开关。
+
+**响应** `200 OK`
+```json
+[
+  {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "name": "alice",
+    "email": "alice@example.com",
+    "is_admin": false,
+    "session_enabled": false,
+    "created_at": "2026-04-13T08:00:00Z",
+    "updated_at": "2026-04-13T08:00:00Z"
+  }
+]
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | string | 用户 UUID |
+| `name` | string | 显示名 |
+| `email` | string \| null | 邮箱地址。admin / CLI 账号(从未通过邮箱注册的)为 `null`。此处暴露邮箱因为调用方本身就是拥有全量 target-reload 和 session-close 权限的管理员。 |
+| `is_admin` | boolean | 管理员账号为 `true` |
+| `session_enabled` | boolean | 用户可以创建/加入会话时为 `true`。邮箱注册的新账号初始值为 `false`。 |
+| `created_at` | string (ISO 8601) | 账号创建时间,UTC |
+| `updated_at` | string (ISO 8601) | 最后修改时间,UTC |
+
+**错误**
+- `401 Unauthorized` —— token 缺失或无效
+- `403 Forbidden` —— 调用方已认证但不是管理员
+
+### POST /api/admin/users/{id}/enable
+
+启用用户的会话访问权限。将目标用户的 `session_enabled` 设为 `true`,并记录审计事件。
+仅管理员可操作。
+
+**响应** `200 OK`
+
+返回更新后的用户对象(与 `GET /api/admin/users` 中的行形状一致)。
+
+```json
+{
+  "id": "550e8400-...",
+  "name": "alice",
+  "email": "alice@example.com",
+  "is_admin": false,
+  "session_enabled": true,
+  "created_at": "2026-04-13T08:00:00Z",
+  "updated_at": "2026-04-13T09:00:00Z"
+}
+```
+
+**错误**
+- `400 Bad Request` —— 路径中的 UUID 格式不合法,或管理员试图对自己操作(自我修改保护)
+- `401 Unauthorized` —— token 缺失或无效
+- `403 Forbidden` —— 调用方已认证但不是管理员
+- `404 Not Found` —— 用户不存在
+
+### POST /api/admin/users/{id}/disable
+
+禁用用户的会话访问权限。将目标用户的 `session_enabled` 设为 `false`,并记录审计事件。
+仅管理员可操作。
+
+用户保留其 bearer token —— `whoami` 和会话历史仍然可用。该用户下一次尝试创建会话或
+WebSocket 连接时,会在 `session_enabled` 关卡处被拒绝。
+
+**响应** `200 OK`
+
+返回更新后的用户对象(与 `GET /api/admin/users` 中的行形状一致)。
+
+**错误**
+- `400 Bad Request` —— 路径中的 UUID 格式不合法,或管理员试图对自己操作(自我修改保护)
+- `401 Unauthorized` —— token 缺失或无效
+- `403 Forbidden` —— 调用方已认证但不是管理员
+- `404 Not Found` —— 用户不存在

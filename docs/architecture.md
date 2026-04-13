@@ -30,7 +30,7 @@ The foundation crate. Contains no business logic — only shared abstractions.
 | `auth.rs` | `TokenAuthProvider` — SHA-256 hashed token validation (raw token returned once at creation, never persisted) |
 | `target.rs` | `Target` and `TargetKind` definitions |
 | `audit.rs` | `AuditEvent`, `AuditEventType`, and `AuditSink` trait — append-only event log backing `telepair admin audit` and the in-app session timeline |
-| `error.rs` | `Error` enum (Auth, NotFound, Storage, Internal) |
+| `error.rs` | `Error` enum — Auth (401), SessionNotFound/TargetNotFound (404), SessionClosed (410), PermissionDenied (403), InvalidInput (400), Conflict (409), RateLimited (429), ServiceUnavailable (503), Internal/Storage/Io (500). Each variant carries an `http_status()` method for consistent HTTP mapping. |
 
 ### telepair-agent
 
@@ -49,6 +49,8 @@ Business logic services that coordinate core abstractions. As of 0.1.1 this is t
 |--------|---------|
 | `session_service.rs` | `SessionService` — session lifecycle (`create_session`, `close_session(reason)`), participant queries (`list_participants`, `list_sessions_for_user`), authorization helpers (`require_owner`), and cross-layer aggregates like `active_session_counts_per_target`. Emits audit events for create/close and the startup sweep. |
 | `invite_service.rs` | `InviteService` — invite lifecycle (`create`, `redeem`, `list_for_session`, `revoke`). Owns `MAX_INVITE_USES` / TTL validation, the cross-session scoped-guest check, and the guest mint-on-success path. Emits `invite.minted` / `invite.redeemed` / `invite.revoked` audit events. |
+| `auth_service.rs` | `AuthService` — email-based registration with OTP verification, password login with Argon2 hashing, and admin user management (`list_accounts`, `set_session_access`). Handles SMTP transport for OTP delivery (via lettre), login throttling (5-strike lockout with 15-minute window), and enumeration-safe error collapsing. Emits `auth.register_rejected` / `auth.register_completed` / `auth.verify_failed` / `auth.login_failed` / `auth.user_enabled` / `auth.user_disabled` audit events. |
+| `user_target_service.rs` | `UserTargetService` — CRUD for user-owned targets (`create`, `update`, `delete`, `get`, `list`, `resolve_by_id`). Enforces ownership on every mutation, blocks update/delete while an active session references the target (referential integrity via `Conflict` error), and deliberately skips `${VAR}` expansion on resolve to prevent process-env leakage through user-supplied command strings. |
 | `target_service.rs` | `TargetService` — wraps `TargetEngine`, provides target listing and resolution. |
 
 ### telepair-gateway
@@ -58,7 +60,7 @@ The client-facing layer. Runs the HTTP server, WebSocket upgrade, and serves the
 | Module | Purpose |
 |--------|---------|
 | `lib.rs` | Axum router setup, route definitions |
-| `state.rs` | `AppState` — shared application state: storage, auth, `SessionService`, `InviteService`, `Arc<ArcSwap<TargetEngine>>` (for atomic target hot-reload), `Arc<dyn AuditSink>`, and the `SessionHub` |
+| `state.rs` | `AppState` — shared application state: storage, auth, `SessionService`, `InviteService`, `AuthService`, `UserTargetService`, `Arc<ArcSwap<TargetEngine>>` (for atomic target hot-reload), `Arc<dyn AuditSink>`, and the `SessionHub` |
 | `http.rs` | REST handlers: health, targets, sessions, invites (list / revoke), session history, session audit, whoami, admin targets (list + reload). All handlers go through services — no `.storage()` access in production code. |
 | `ws.rs` | WebSocket handler — auth, role enforcement, message routing, PTY I/O bridge, `participant.joined` / `participant.left` audit emits |
 | `session_hub.rs` | `SessionHub` — per-session state: PTY process, connected participants, broadcast channels. Holds `Arc<SessionService>` (not raw Storage) so the reaper closure emits `CloseReason::Reaper` through the same audit path as owner-initiated closes. |
@@ -83,6 +85,8 @@ Browser                     telepair (single process)
                            │                                   │
                            │  Control (services)               │
                            │    ├── SessionService             │
+                           │    ├── AuthService                │
+                           │    ├── UserTargetService          │
                            │    └── TargetService              │
                            │                                   │
                            │  Core (storage)                   │
@@ -109,9 +113,19 @@ Browser                     telepair (single process)
 3. `SessionHub` broadcasts via `collab_tx` to all participants
 4. Each WS handler forwards to its client
 
+### Email Registration & Login
+
+1. Client calls `POST /api/auth/register` with email, password, and display name
+2. `AuthService` hashes the password with Argon2, generates a 6-digit OTP, writes a `pending_registrations` row, and sends the OTP via SMTP
+3. Client calls `POST /api/auth/verify` with email and OTP code
+4. `AuthService` verifies the code against the pending row (with attempt limiting and TTL), materializes a `users` row, and returns a bearer token
+5. For subsequent logins, client calls `POST /api/auth/login` with email and password
+6. `AuthService` verifies the Argon2 hash, enforces the 5-strike lockout window, clears failure counters on success, and returns a fresh bearer token
+7. Admin can disable/enable a user's session access via `PUT /api/admin/users/{id}/session-access` — login still works (for password reset, history viewing) but session creation and WS attach are blocked
+
 ### Session Lifecycle
 
-1. Client calls `POST /api/sessions` with target name
+1. Client calls `POST /api/sessions` with target name (or user target ID)
 2. `SessionService` creates session in SQLite, adds owner as participant
 3. Owner connects via `WS /ws/session/{id}`, sends `SessionJoin`
 4. `SessionHub` spawns PTY, starts I/O loop
@@ -133,16 +147,24 @@ Separation ensures high-frequency terminal output does not starve collaboration 
 ## Storage Schema
 
 ```sql
-users        (id, name, token_sha256, is_admin, scoped_session_id, created_at, updated_at)
-sessions     (id, owner_id, target_name, input_mode, status, closed_reason, created_at, closed_at)
-participants (session_id, user_id, role, joined_at, left_at)
-invite_tokens(token_sha256, session_id, role, max_uses, used_count, expires_at)
-audit_events (id, ts, actor_id, actor_name, event_type, session_id, detail)
+users                 (id, name, token_sha256, is_admin, scoped_session_id,
+                       email, password_hash, session_enabled,
+                       login_failed_count, login_locked_until,
+                       created_at, updated_at)
+sessions              (id, owner_id, target_name, input_mode, status,
+                       closed_reason, user_target_id, created_at, closed_at)
+participants          (session_id, user_id, role, joined_at, left_at)
+invite_tokens         (token_sha256, session_id, role, max_uses, used_count, expires_at)
+audit_events          (id, ts, actor_id, actor_name, event_type, session_id, detail)
+pending_registrations (email, display_name, password_hash, otp_code,
+                       attempts_remaining, expires_at, created_at)
+user_targets          (id, user_id, name, display, command, args, env, tags,
+                       created_at, updated_at)
 ```
 
 All IDs are UUIDs stored as TEXT. Timestamps are ISO 8601 TEXT. The `Storage` trait is async and implementation-agnostic — SQLite is the v1 backend.
 
-**Schema evolution (0.1.x).** Migration state is kept in a single `migrations/001_initial.sql` file that is loaded on every boot. The loader (`run_migrations()` in `telepair-core/src/storage/sqlite.rs`) applies the full file, then performs a column-existence check (`pragma_table_info`) to idempotently add the `sessions.closed_reason` column on upgraded databases — the `audit_events` table and its four indexes use `CREATE TABLE / INDEX IF NOT EXISTS` for the same reason. This keeps in-place upgrades working within the 0.1.x line without introducing a formal migration framework; the pre-1.0 "delete the DB" fallback still applies on genuine schema conflicts. A proper migration framework is planned for a later minor bump.
+**Schema evolution (0.1.x).** Migration state is kept in a single `migrations/001_initial.sql` file that is loaded on every boot. The loader (`run_migrations()` in `telepair-core/src/storage/sqlite.rs`) applies the full file, then performs column-existence checks (`pragma_table_info`) to idempotently add new columns on upgraded databases — e.g. `sessions.closed_reason`, `sessions.user_target_id`, and the `users` columns for email auth (`email`, `password_hash`, `session_enabled`, `login_failed_count`, `login_locked_until`). New tables (`audit_events`, `pending_registrations`, `user_targets`) use `CREATE TABLE IF NOT EXISTS` for the same reason. This keeps in-place upgrades working within the 0.1.x line without introducing a formal migration framework; the pre-1.0 "delete the DB" fallback still applies on genuine schema conflicts. A proper migration framework is planned for a later minor bump.
 
 ### Audit events
 
@@ -162,7 +184,10 @@ Four indexes cover the four query shapes: time-range (`idx_audit_ts`), per-sessi
 
 ## Security Model
 
-- **Authentication**: Bearer token in `Authorization` header. Tokens are stored as their SHA-256 hex digest only — the raw value is returned to the caller exactly once at creation and never persisted.
+- **Authentication**: Bearer token in `Authorization` header. Tokens are stored as their SHA-256 hex digest only — the raw value is returned to the caller exactly once at creation and never persisted. Email-based registration adds a second path: users register with email + password, verify via a 6-digit OTP sent over SMTP, and receive a bearer token on success. Passwords are hashed with Argon2 (salt per row); the OTP has a 15-minute TTL and a per-email 60-second rate limit.
+- **Login throttling**: Password login enforces a 5-strike lockout — after 5 consecutive bad-password attempts the account is locked for 15 minutes. A single successful login clears the counter. All failure modes (unknown email, bad password, locked) return an identical error shape to prevent enumeration.
+- **Pending registration**: The `pending_registrations` table is a staging area with no authority — it does not create a `users` row until the OTP is verified. Re-registration against an already-verified email silently succeeds (no information leak) and writes an audit row.
+- **Admin approval gate**: New email-registered users start with `session_enabled = FALSE`. An admin must flip it to `TRUE` via `PUT /api/admin/users/{id}/session-access` before the user can create sessions or attach to WebSocket. Login itself remains permitted so the user can view history or change their password while waiting for approval.
 - **Authorization**: Role-based per session. WS handler checks role on every input/resize action.
 - **Invite tokens**: Single-use by default. Stored as SHA-256 digests; atomic `used_count < max_uses` increment prevents concurrent redemption race conditions.
 - **CORS**: Configurable via `--allowed-origins` (comma-separated absolute URLs). When unset, the server defaults to **loopback dev origins only** (`http://localhost:5173`, `http://127.0.0.1:5173`) to match the Vite dev server. Malformed origins are fatal at startup so a typo can never silently widen the allowlist. `--allow-any-origin` opts into `Access-Control-Allow-Origin: *` and is only safe in dev or behind a reverse proxy that enforces CORS. For production direct-exposure (no reverse proxy), set `--allowed-origins` to the trusted frontend domain.
