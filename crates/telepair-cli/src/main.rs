@@ -7,6 +7,7 @@ use tracing_subscriber::EnvFilter;
 use chrono::{DateTime, Duration, Utc};
 
 use telepair_agent::virtual_target::TargetEngine;
+use telepair_control::auth_service::SmtpConfig;
 use telepair_control::session_service::SessionService;
 use telepair_core::audit::{AuditEvent, AuditEventType, AuditFilter, AuditSink};
 use telepair_core::auth::TokenAuthProvider;
@@ -63,6 +64,26 @@ struct Cli {
     /// Mutually exclusive with `--allowed-origins` (this flag wins).
     #[arg(long, default_value_t = false)]
     allow_any_origin: bool,
+
+    /// SMTP server hostname for email verification (enables registration)
+    #[arg(long, env = "TELEPAIR_SMTP_HOST")]
+    smtp_host: Option<String>,
+
+    /// SMTP port [default: 587]
+    #[arg(long, env = "TELEPAIR_SMTP_PORT", default_value_t = 587)]
+    smtp_port: u16,
+
+    /// SMTP username
+    #[arg(long, env = "TELEPAIR_SMTP_USER")]
+    smtp_user: Option<String>,
+
+    /// SMTP password
+    #[arg(long, env = "TELEPAIR_SMTP_PASS")]
+    smtp_pass: Option<String>,
+
+    /// SMTP sender address, e.g. "Telepair <noreply@example.com>"
+    #[arg(long, env = "TELEPAIR_SMTP_FROM")]
+    smtp_from: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -389,9 +410,11 @@ async fn main() -> anyhow::Result<()> {
     };
     let engine = match &targets_path {
         Some(path) => TargetEngine::from_file(path).unwrap_or_else(|e| {
-            let is_missing = e
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
+            let is_missing = matches!(
+                &e,
+                telepair_core::error::Error::Io(io)
+                    if io.kind() == std::io::ErrorKind::NotFound
+            );
             // An explicit `--targets` path that doesn't exist is a
             // loud operator mistake; the default path missing on a
             // fresh install is the norm and stays silent.
@@ -426,6 +449,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Sweep unverified accounts older than 24h. These are registrations
+    // that started but were never completed — the OTP expired and the
+    // user never came back. Running at startup keeps the DB tidy without
+    // requiring a separate cron job.
+    {
+        let cutoff = Utc::now() - Duration::hours(24);
+        match storage.sweep_unverified_users(cutoff).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("swept {n} unverified account(s) older than 24h"),
+            Err(e) => tracing::warn!("failed to sweep unverified accounts: {e}"),
+        }
+    }
+
     // Auto-create admin user on first run
     let auth = TokenAuthProvider::new(storage.clone());
     if storage.get_user_by_name("admin").await?.is_none() {
@@ -443,6 +479,21 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("Save this token — it won't be shown again!");
     }
 
+    // Build SMTP config if the host flag was provided. Missing host = no
+    // SMTP = registration returns 503. The other flags are optional so
+    // operators can mix CLI and env vars.
+    let smtp = cli.smtp_host.map(|host| {
+        Arc::new(SmtpConfig {
+            host,
+            port: cli.smtp_port,
+            username: cli.smtp_user.unwrap_or_default(),
+            password: cli.smtp_pass.unwrap_or_default(),
+            from: cli
+                .smtp_from
+                .unwrap_or_else(|| "Telepair <noreply@localhost>".into()),
+        })
+    });
+
     if gateway {
         let web_dir = cli
             .web_dir
@@ -452,7 +503,7 @@ async fn main() -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("--web-dir path is not valid UTF-8"))
             })
             .transpose()?;
-        let state = AppState::new(storage, engine, targets_path).await;
+        let state = AppState::new(storage, engine, targets_path, smtp).await;
         let cors_mode = if cli.allow_any_origin {
             telepair_gateway::CorsMode::AllowAny
         } else {

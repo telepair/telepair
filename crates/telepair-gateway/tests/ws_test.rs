@@ -20,7 +20,7 @@ async fn owned_session(state: &AppState, username: &str) -> (String, Uuid, Sessi
     let user = state.auth.validate(&token).await.unwrap();
     let session = state
         .storage
-        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized)
+        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized, None)
         .await
         .unwrap();
     (token, user.id, session)
@@ -416,7 +416,7 @@ async fn ws_closes_session_when_target_resolve_fails() {
     // creation and WS join; simulating it by hand is the same shape.
     let session = state
         .storage
-        .create_session_with_owner(user.id, "ghost-target", InputMode::Serialized)
+        .create_session_with_owner(user.id, "ghost-target", InputMode::Serialized, None)
         .await
         .unwrap();
 

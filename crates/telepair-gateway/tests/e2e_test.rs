@@ -164,7 +164,7 @@ async fn create_owned_session(state: &AppState, username: &str) -> (String, Stri
     let user = state.auth.validate(&token).await.unwrap();
     let session = state
         .storage
-        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized)
+        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized, None)
         .await
         .unwrap();
     (session.id, token, user.id)
@@ -413,7 +413,7 @@ async fn e2e_multiplexed_operator_can_type() {
     let owner = state.auth.validate(&owner_token).await.unwrap();
     let session = state
         .storage
-        .create_session_with_owner(owner.id, "local-shell", InputMode::Multiplexed)
+        .create_session_with_owner(owner.id, "local-shell", InputMode::Multiplexed, None)
         .await
         .unwrap();
     let session_id = session.id.clone();
@@ -457,7 +457,7 @@ async fn e2e_late_joiner_receives_scrollback() {
     let owner = state.auth.validate(&owner_token).await.unwrap();
     let session = state
         .storage
-        .create_session_with_owner(owner.id, "local-shell", InputMode::Multiplexed)
+        .create_session_with_owner(owner.id, "local-shell", InputMode::Multiplexed, None)
         .await
         .unwrap();
     let session_id = session.id.clone();

@@ -266,14 +266,43 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let (cmd, args, env) = match state.targets.load().resolve(&session.target_name) {
         Some(resolved) => resolved,
         None => {
-            cleanup_orphan_session(&state, &session_id).await;
-            send_error(
-                &mut ws_tx,
-                error_codes::TARGET_NOT_FOUND,
-                format!("target {} not found", session.target_name),
-            )
-            .await;
-            return;
+            // Global target not found — try the user-owned target recorded
+            // on the session row at create time.
+            if let Some(ref ut_id) = session.user_target_id {
+                match state.user_targets.resolve_by_id(ut_id).await {
+                    Ok(Some(resolved)) => resolved,
+                    Ok(None) => {
+                        cleanup_orphan_session(&state, &session_id).await;
+                        send_error(
+                            &mut ws_tx,
+                            error_codes::TARGET_NOT_FOUND,
+                            format!("user target {} not found", ut_id),
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to resolve user target {ut_id}: {e}");
+                        cleanup_orphan_session(&state, &session_id).await;
+                        send_error(
+                            &mut ws_tx,
+                            error_codes::TARGET_NOT_FOUND,
+                            format!("failed to resolve user target {ut_id}"),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            } else {
+                cleanup_orphan_session(&state, &session_id).await;
+                send_error(
+                    &mut ws_tx,
+                    error_codes::TARGET_NOT_FOUND,
+                    format!("target {} not found", session.target_name),
+                )
+                .await;
+                return;
+            }
         }
     };
     let SessionAttachment {

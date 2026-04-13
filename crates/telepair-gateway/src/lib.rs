@@ -12,7 +12,7 @@ use axum::{
     Router,
     body::Body,
     http::{HeaderValue, Request, Response, StatusCode, header},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use bytes::Bytes;
 use state::AppState;
@@ -108,8 +108,16 @@ pub fn build_router_with_options(
 
     let api = Router::new()
         .route("/api/health", get(http::health))
+        .route("/api/auth/register", post(http::register))
+        .route("/api/auth/verify", post(http::verify_otp))
+        .route("/api/auth/login", post(http::login))
         .route("/api/auth/whoami", get(http::whoami))
         .route("/api/targets", get(http::list_targets))
+        .route("/api/user-targets", post(http::create_user_target))
+        .route(
+            "/api/user-targets/{id}",
+            put(http::update_user_target).delete(http::delete_user_target),
+        )
         .route(
             "/api/sessions",
             post(http::create_session).get(http::list_sessions),

@@ -11,11 +11,11 @@ async fn close_stale_sessions_returns_count() {
     let (user, _) = store.create_user("alice", false).await.unwrap();
 
     store
-        .create_session_with_owner(user.id, "shell", InputMode::Serialized)
+        .create_session_with_owner(user.id, "shell", InputMode::Serialized, None)
         .await
         .unwrap();
     store
-        .create_session_with_owner(user.id, "shell", InputMode::Serialized)
+        .create_session_with_owner(user.id, "shell", InputMode::Serialized, None)
         .await
         .unwrap();
 
@@ -41,7 +41,7 @@ async fn close_stale_sessions_marks_as_closed() {
     let store = setup().await;
     let (user, _) = store.create_user("bob", false).await.unwrap();
     let session = store
-        .create_session_with_owner(user.id, "shell", InputMode::Serialized)
+        .create_session_with_owner(user.id, "shell", InputMode::Serialized, None)
         .await
         .unwrap();
 
@@ -61,7 +61,7 @@ async fn close_stale_sessions_skips_already_closed() {
     let store = setup().await;
     let (user, _) = store.create_user("carol", false).await.unwrap();
     let session = store
-        .create_session_with_owner(user.id, "shell", InputMode::Serialized)
+        .create_session_with_owner(user.id, "shell", InputMode::Serialized, None)
         .await
         .unwrap();
 

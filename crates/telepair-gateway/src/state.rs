@@ -3,8 +3,10 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use telepair_agent::virtual_target::TargetEngine;
+use telepair_control::auth_service::{AuthService, SmtpConfig};
 use telepair_control::invite_service::InviteService;
 use telepair_control::session_service::SessionService;
+use telepair_control::user_target_service::UserTargetService;
 use telepair_core::audit::AuditSink;
 use telepair_core::auth::TokenAuthProvider;
 use telepair_core::storage::{SqliteStorage, Storage};
@@ -47,6 +49,10 @@ pub struct AppState {
     /// only. Do **not** read/write in HTTP/WS handlers — route
     /// through `sessions` / `invites` instead.
     pub storage: Arc<SqliteStorage>,
+    /// Email registration and OTP verification service.
+    pub auth_service: Arc<AuthService>,
+    /// Per-user virtual target CRUD and PTY resolution.
+    pub user_targets: Arc<UserTargetService>,
 }
 
 impl AppState {
@@ -54,6 +60,7 @@ impl AppState {
         storage: Arc<SqliteStorage>,
         engine: TargetEngine,
         targets_path: Option<PathBuf>,
+        smtp: Option<Arc<SmtpConfig>>,
     ) -> Self {
         let auth = Arc::new(TokenAuthProvider::new(storage.clone()));
         let audit = Arc::new(AuditSink::new(storage.clone()));
@@ -65,6 +72,8 @@ impl AppState {
         ));
         let targets = Arc::new(ArcSwap::from_pointee(engine));
         let hub = Arc::new(SessionHub::new(sessions.clone()));
+        let auth_service = Arc::new(AuthService::new(storage.clone(), smtp));
+        let user_targets = Arc::new(UserTargetService::new(storage.clone()));
         // Production: start the idle-session reaper so orphaned PTYs
         // don't leak when all clients disconnect. The JoinHandle is
         // intentionally detached — the task lives for the process
@@ -83,6 +92,8 @@ impl AppState {
             targets_path,
             hub,
             storage,
+            auth_service,
+            user_targets,
         }
     }
 
@@ -102,6 +113,8 @@ impl AppState {
         ));
         let targets = Arc::new(ArcSwap::from_pointee(engine));
         let hub = Arc::new(SessionHub::new(sessions.clone()));
+        let auth_service = Arc::new(AuthService::new(storage.clone(), None));
+        let user_targets = Arc::new(UserTargetService::new(storage.clone()));
         Self {
             auth,
             sessions,
@@ -111,6 +124,8 @@ impl AppState {
             targets_path: None,
             hub,
             storage,
+            auth_service,
+            user_targets,
         }
     }
 

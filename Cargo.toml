@@ -44,7 +44,7 @@ portable-pty = "0.8"
 thiserror = "2"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # Logging
 tracing = "0.1"
@@ -78,6 +78,12 @@ arc-swap = "1"
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.26"
 tempfile = "3"
+
+# Password hashing
+argon2 = "0.5"
+
+# SMTP email sending
+lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "builder"] }
 
 # CLI extras
 anyhow = "1"

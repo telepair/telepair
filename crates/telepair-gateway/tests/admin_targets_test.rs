@@ -85,7 +85,7 @@ async fn setup(
     let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
     let (_, admin_token) = storage.create_user("admin", true).await.unwrap();
     let (_, user_token) = storage.create_user("regular", false).await.unwrap();
-    let state = AppState::new(storage.clone(), engine, Some(path.clone())).await;
+    let state = AppState::new(storage.clone(), engine, Some(path.clone()), None).await;
     let router = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
     (router, admin_token, user_token, path, file)
 }
@@ -289,7 +289,7 @@ async fn reload_targets_audit_event_is_recorded() {
     let engine = TargetEngine::from_file(&path).expect("parse initial yaml");
     let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
     let (_, admin_token) = storage.create_user("admin", true).await.unwrap();
-    let state = AppState::new(storage.clone(), engine, Some(path.clone())).await;
+    let state = AppState::new(storage.clone(), engine, Some(path.clone()), None).await;
     let app = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
 
     std::fs::write(&path, RELOADED_TARGETS_YAML).unwrap();
@@ -434,11 +434,11 @@ async fn reload_targets_rejects_drop_of_still_referenced_target() {
     // read stdin, and we tear it down via `hub.stop_session` at
     // the end of the test.
     let session = storage
-        .create_session_with_owner(admin.id, "alpha", InputMode::Serialized)
+        .create_session_with_owner(admin.id, "alpha", InputMode::Serialized, None)
         .await
         .unwrap();
 
-    let state = AppState::new(storage.clone(), engine, Some(path.clone())).await;
+    let state = AppState::new(storage.clone(), engine, Some(path.clone()), None).await;
     state
         .hub
         .start_or_join(
@@ -546,11 +546,11 @@ async fn reload_targets_allows_adding_new_target_with_referenced_alive() {
     // source of truth, so we have to spawn a real PTY for the guard
     // to "see" alpha as referenced.
     let session = storage
-        .create_session_with_owner(admin.id, "alpha", InputMode::Serialized)
+        .create_session_with_owner(admin.id, "alpha", InputMode::Serialized, None)
         .await
         .unwrap();
 
-    let state = AppState::new(storage.clone(), engine, Some(path.clone())).await;
+    let state = AppState::new(storage.clone(), engine, Some(path.clone()), None).await;
     state
         .hub
         .start_or_join(
@@ -626,11 +626,11 @@ async fn reload_targets_allows_drop_when_only_stale_db_row_present() {
     // DB-only session on alpha (no hub entry) — simulates a
     // zombie row whose PTY exited but whose close hasn't landed.
     let session = storage
-        .create_session_with_owner(admin.id, "alpha", InputMode::Serialized)
+        .create_session_with_owner(admin.id, "alpha", InputMode::Serialized, None)
         .await
         .unwrap();
 
-    let state = AppState::new(storage.clone(), engine, Some(path.clone())).await;
+    let state = AppState::new(storage.clone(), engine, Some(path.clone()), None).await;
     let app = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
 
     // Rewrite yaml to drop alpha — with the old DB-backed guard
@@ -701,7 +701,7 @@ async fn reload_targets_rejects_drop_during_create_to_attach_gap() {
     let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
     let (_, admin_token) = storage.create_user("admin", true).await.unwrap();
 
-    let state = AppState::new(storage.clone(), engine, Some(path.clone())).await;
+    let state = AppState::new(storage.clone(), engine, Some(path.clone()), None).await;
     let app = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
 
     // Step 1: create a session via the HTTP handler — this is
@@ -765,4 +765,79 @@ targets:
     assert_eq!(row.status.as_str(), "active");
 
     drop(file);
+}
+
+/// Reload with bad yaml, assert 400 + parse_error containing
+/// `expected_substr`, then verify the old engine is still loaded.
+async fn assert_reload_rejected(bad_yaml: &str, expected_substr: &str) {
+    let (app, admin_token, _, path, _file) = setup(INITIAL_TARGETS_YAML).await;
+    std::fs::write(&path, bad_yaml).unwrap();
+
+    let app2 = app.clone();
+    let resp = app
+        .oneshot(
+            Request::post("/api/admin/targets/reload")
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["reason"], "parse_error");
+    let message = json["message"].as_str().unwrap();
+    assert!(
+        message.contains(expected_substr),
+        "expected '{expected_substr}' in message, got: {message}"
+    );
+
+    // Old engine must still be loaded.
+    let resp2 = app2
+        .oneshot(
+            Request::get("/api/admin/targets")
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let body2 = resp2.into_body().collect().await.unwrap().to_bytes();
+    let arr2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+    let names: Vec<&str> = arr2
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"beta"),
+        "beta should still be present after rejected reload: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn reload_targets_rejects_duplicate_names() {
+    let yaml = r#"
+targets:
+  - name: alpha
+    display: Alpha
+    command: echo
+  - name: alpha
+    display: Alpha Clone
+    command: printf
+"#;
+    assert_reload_rejected(yaml, "duplicate name").await;
+}
+
+#[tokio::test]
+async fn reload_targets_rejects_missing_command() {
+    let yaml = r#"
+targets:
+  - name: broken
+    display: Broken Target
+"#;
+    assert_reload_rejected(yaml, "requires a command").await;
 }

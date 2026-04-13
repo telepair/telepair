@@ -1,6 +1,7 @@
 // web/src/lib/api.ts
 import type {
   TargetInfo,
+  UserTargetInfo,
   Session,
   SessionStatus,
   InviteInfo,
@@ -47,7 +48,12 @@ class ApiError extends Error {
  * guests hit it anonymously — but anything added here should be the
  * exception, not the rule.
  */
-const PUBLIC_PATHS = new Set<string>(['/invite/redeem']);
+const PUBLIC_PATHS = new Set<string>([
+  '/invite/redeem',
+  '/auth/register',
+  '/auth/verify',
+  '/auth/login',
+]);
 
 /**
  * Called from the request helper when the server returns 401 on an
@@ -290,6 +296,68 @@ export const api = {
    */
   reloadTargets(): Promise<ReloadTargetsResult> {
     return request('/admin/targets/reload', { method: 'POST' });
+  },
+
+  // ── Email auth ──────────────────────────────────────────────────────────────
+
+  /** Register a new account. Returns 201 on success; 409 if email taken; 503 if SMTP not configured. */
+  register(email: string, password: string, display_name: string): Promise<{ message: string }> {
+    return request('/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({ email, password, display_name }),
+    });
+  },
+
+  /** Submit OTP code. Returns `{ token }` on success; 400/429 on bad/locked code. */
+  verifyOtp(email: string, code: string): Promise<{ token: string }> {
+    return request('/auth/verify', {
+      method: 'POST',
+      body: JSON.stringify({ email, code }),
+    });
+  },
+
+  /** Login with email+password. Returns `{ token }` on success; 401 on bad credentials. */
+  loginWithPassword(email: string, password: string): Promise<{ token: string }> {
+    return request('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    });
+  },
+
+  // ── User-owned targets ──────────────────────────────────────────────────────
+
+  createUserTarget(params: {
+    name: string;
+    display: string;
+    command: string;
+    args?: string[];
+    env?: Record<string, string>;
+    tags?: string[];
+  }): Promise<UserTargetInfo> {
+    return request('/user-targets', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    });
+  },
+
+  updateUserTarget(
+    id: string,
+    params: {
+      display: string;
+      command: string;
+      args?: string[];
+      env?: Record<string, string>;
+      tags?: string[];
+    },
+  ): Promise<UserTargetInfo> {
+    return request(`/user-targets/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(params),
+    });
+  },
+
+  deleteUserTarget(id: string): Promise<void> {
+    return request(`/user-targets/${id}`, { method: 'DELETE' });
   },
 };
 

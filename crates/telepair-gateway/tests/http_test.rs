@@ -97,12 +97,12 @@ async fn list_sessions_target_name_query_param_narrows_results() {
         .unwrap();
     let kept = state
         .storage
-        .create_session_with_owner(user.id, "local-shell", InputMode::Multiplexed)
+        .create_session_with_owner(user.id, "local-shell", InputMode::Multiplexed, None)
         .await
         .unwrap();
     state
         .storage
-        .create_session_with_owner(user.id, "other-target", InputMode::Multiplexed)
+        .create_session_with_owner(user.id, "other-target", InputMode::Multiplexed, None)
         .await
         .unwrap();
     let app = build_router(state);
@@ -144,12 +144,12 @@ async fn list_sessions_admin_sees_other_users_sessions() {
     let (alice, _) = state.storage.create_user("alice", false).await.unwrap();
     state
         .storage
-        .create_session_with_owner(alice.id, "local-shell", InputMode::Serialized)
+        .create_session_with_owner(alice.id, "local-shell", InputMode::Serialized, None)
         .await
         .unwrap();
     state
         .storage
-        .create_session_with_owner(alice.id, "local-shell", InputMode::Serialized)
+        .create_session_with_owner(alice.id, "local-shell", InputMode::Serialized, None)
         .await
         .unwrap();
     let admin_token = state.create_test_admin("root").await;
@@ -185,7 +185,7 @@ async fn list_sessions_non_admin_is_still_owner_scoped() {
     let (alice, _) = state.storage.create_user("alice", false).await.unwrap();
     state
         .storage
-        .create_session_with_owner(alice.id, "local-shell", InputMode::Serialized)
+        .create_session_with_owner(alice.id, "local-shell", InputMode::Serialized, None)
         .await
         .unwrap();
     let bob_token = state.create_test_user("bob").await;
@@ -220,7 +220,7 @@ async fn delete_session_owner_succeeds_and_marks_closed() {
     let (alice, alice_token) = state.storage.create_user("alice", false).await.unwrap();
     let session = state
         .storage
-        .create_session_with_owner(alice.id, "local-shell", InputMode::Multiplexed)
+        .create_session_with_owner(alice.id, "local-shell", InputMode::Multiplexed, None)
         .await
         .unwrap();
     let storage = state.storage.clone();
@@ -253,7 +253,7 @@ async fn delete_session_non_owner_gets_403_and_session_stays_active() {
     let (alice, _) = state.storage.create_user("alice", false).await.unwrap();
     let session = state
         .storage
-        .create_session_with_owner(alice.id, "local-shell", InputMode::Multiplexed)
+        .create_session_with_owner(alice.id, "local-shell", InputMode::Multiplexed, None)
         .await
         .unwrap();
     let bob_token = state.create_test_user("bob").await;

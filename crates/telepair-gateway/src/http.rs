@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use telepair_control::invite_service::CreateInviteParams;
+use telepair_control::user_target_service::{CreateTargetParams, UpdateTargetParams};
 use telepair_core::error::Error;
 use telepair_core::permission::Role;
 use telepair_core::session::{InputMode, SessionListFilter, SessionStatus, User};
@@ -70,6 +71,77 @@ pub async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+// ── Email registration ────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct RegisterRequest {
+    pub email: String,
+    pub password: String,
+    pub display_name: String,
+}
+
+/// `POST /api/auth/register` — create unverified account and send OTP.
+/// Returns 503 if SMTP is not configured, 409 if email is taken.
+pub async fn register(
+    State(state): State<AppState>,
+    body: Result<Json<RegisterRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+    state
+        .auth_service
+        .register(&body.email, &body.password, &body.display_name)
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({"message": "Verification code sent to your email."})),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct VerifyOtpRequest {
+    pub email: String,
+    pub code: String,
+}
+
+/// `POST /api/auth/verify` — submit OTP code; returns bearer token on success.
+pub async fn verify_otp(
+    State(state): State<AppState>,
+    body: Result<Json<VerifyOtpRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+    let token = state
+        .auth_service
+        .verify_otp(&body.email, &body.code)
+        .await?;
+    Ok(Json(serde_json::json!({"token": token})))
+}
+
+/// `POST /api/auth/login` — unified login accepting `{token}` (existing
+/// admin path) or `{email, password}` (email-registered users).
+#[derive(Deserialize)]
+pub struct LoginRequest {
+    pub token: Option<String>,
+    pub email: Option<String>,
+    pub password: Option<String>,
+}
+
+pub async fn login(
+    State(state): State<AppState>,
+    body: Result<Json<LoginRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+    let token = if let Some(t) = body.token {
+        // Validate existing bearer token (admin / guest path).
+        state.auth.validate(&t).await?;
+        t
+    } else if let (Some(email), Some(password)) = (body.email, body.password) {
+        state.auth_service.login(&email, &password).await?
+    } else {
+        return Err(ApiError(StatusCode::BAD_REQUEST));
+    };
+    Ok(Json(serde_json::json!({"token": token})))
+}
+
 /// `GET /api/auth/whoami`
 ///
 /// Returns the authenticated caller's identity. Used by the frontend
@@ -106,9 +178,7 @@ pub async fn list_targets(
 ) -> Result<impl IntoResponse, ApiError> {
     let user = extract_user(&state, &headers).await?;
     // Guests are scoped to a single session and have no dashboard —
-    // they must never see a target list at all. (Separate finding
-    // from the info-leak fix below: before this the handler didn't
-    // even check authentication scope.)
+    // they must never see a target list at all.
     require_unscoped(&user)?;
 
     #[derive(Serialize)]
@@ -116,24 +186,19 @@ pub async fn list_targets(
         name: String,
         display: String,
         tags: Vec<String>,
+        /// "global" for targets from targets.yaml; "user" for user-owned targets.
+        source: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        admin_only: bool,
     }
 
     // Info-leak fix: `admin_only` targets must not be enumerable by
-    // non-admin callers. Before this filter, a regular user could
-    // still `GET /api/targets` and read the full set of admin-only
-    // target names / display strings / tags — names in the wild
-    // often encode environment info (e.g. `prod-payments-db`), so
-    // leaking the list is itself the problem, not just "users see a
-    // button they can't click". `create_session` still enforces the
-    // same rule, so this is a defence-in-depth narrowing of the
-    // response, not the sole gate.
-    //
-    // `load()` is wait-free — the hot-reload admin endpoint may be
-    // concurrently installing a new engine, but this reader walks a
-    // consistent snapshot for the duration of the call.
+    // non-admin callers. `load()` is wait-free — concurrent reloads
+    // don't extend the guard's lifetime.
     let is_admin = user.is_admin;
     let engine = state.targets.load();
-    let targets: Vec<TargetInfo> = engine
+    let mut entries: Vec<TargetInfo> = engine
         .list_targets()
         .iter()
         .filter(|t| is_admin || !t.admin_only)
@@ -141,10 +206,26 @@ pub async fn list_targets(
             name: t.name.clone(),
             display: t.display.clone(),
             tags: t.tags.clone(),
+            source: "global",
+            id: None,
+            admin_only: t.admin_only,
         })
         .collect();
 
-    Ok(Json(targets))
+    // Append user-owned targets (always visible to the owner, never admin_only)
+    let user_targets = state.user_targets.list(user.id).await?;
+    for ut in user_targets {
+        entries.push(TargetInfo {
+            name: ut.name,
+            display: ut.display,
+            tags: ut.tags,
+            source: "user",
+            id: Some(ut.id),
+            admin_only: false,
+        });
+    }
+
+    Ok(Json(entries))
 }
 
 #[derive(Deserialize)]
@@ -179,20 +260,24 @@ pub async fn create_session(
     let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
 
     // Verify target exists and enforce admin-only restriction.
-    // Hold the ArcSwap guard only as long as needed to read the two
-    // fields we care about; clone them out so a concurrent reload
-    // doesn't extend the guard's lifetime through the rest of the
-    // handler.
-    let (target_exists, admin_only) = {
+    // Global targets (from targets.yaml) take priority; user-owned targets
+    // are checked as a fallback when the global engine misses.
+    let (admin_only, user_target_id) = {
         let engine = state.targets.load();
         match engine.find(&body.target_name) {
-            Some(t) => (true, t.admin_only),
-            None => (false, false),
+            Some(t) => (t.admin_only, None),
+            None => {
+                // Check caller's user-owned targets
+                let user_ts = state.user_targets.list(user.id).await?;
+                match user_ts.into_iter().find(|ut| ut.name == body.target_name) {
+                    Some(ut) => (false, Some(ut.id)),
+                    None => {
+                        return Err(ApiError(StatusCode::NOT_FOUND));
+                    }
+                }
+            }
         }
     };
-    if !target_exists {
-        return Err(ApiError(StatusCode::NOT_FOUND));
-    }
 
     if admin_only && !user.is_admin {
         // Audit the rejection so admins can see attempted lateral
@@ -215,7 +300,12 @@ pub async fn create_session(
 
     let session = state
         .sessions
-        .create_session(&user, &body.target_name, mode)
+        .create_session_with_user_target(
+            &user,
+            &body.target_name,
+            mode,
+            user_target_id.as_deref(),
+        )
         .await?;
 
     // Reserve the target slot in the hub *before* returning 201 so a
@@ -816,4 +906,85 @@ pub async fn reload_targets(
             "targets": new_count,
         })),
     ))
+}
+
+// ── User-owned target CRUD ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct UserTargetBody {
+    pub name: Option<String>, // Only required on POST
+    pub display: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// `POST /api/user-targets` — create a user-owned virtual target.
+pub async fn create_user_target(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<UserTargetBody>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    require_unscoped(&user)?;
+    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+    let name = body.name.ok_or(ApiError(StatusCode::BAD_REQUEST))?;
+    let target = state
+        .user_targets
+        .create(
+            user.id,
+            CreateTargetParams {
+                name,
+                display: body.display,
+                command: body.command,
+                args: body.args,
+                env: body.env,
+                tags: body.tags,
+            },
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(target)))
+}
+
+/// `PUT /api/user-targets/{id}` — update a user-owned target (owner only).
+pub async fn update_user_target(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Result<Json<UserTargetBody>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    require_unscoped(&user)?;
+    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+    let target = state
+        .user_targets
+        .update(
+            &id,
+            user.id,
+            UpdateTargetParams {
+                display: body.display,
+                command: body.command,
+                args: body.args,
+                env: body.env,
+                tags: body.tags,
+            },
+        )
+        .await?;
+    Ok(Json(target))
+}
+
+/// `DELETE /api/user-targets/{id}` — delete a user-owned target (owner only).
+pub async fn delete_user_target(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    require_unscoped(&user)?;
+    state.user_targets.delete(&id, user.id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
