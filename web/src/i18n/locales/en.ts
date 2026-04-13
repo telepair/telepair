@@ -255,6 +255,13 @@ export const en = {
     event_invite_revoked: 'Invite revoked',
     event_target_access_denied: 'Target access denied',
     event_target_reloaded: 'Targets reloaded',
+    event_auth_login_failed: 'Login failed',
+    event_auth_register_rejected: 'Registration rejected',
+    event_auth_register_completed: 'Registration completed',
+    event_auth_verify_failed: 'Verification failed',
+    event_auth_user_enabled: 'User enabled',
+    event_auth_user_disabled: 'User disabled',
+    event_auth_session_access_denied: 'Session access denied',
   },
   chat: {
     heading: 'Chat',

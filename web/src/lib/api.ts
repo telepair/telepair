@@ -335,7 +335,7 @@ export const api = {
 
   // ── Email auth ──────────────────────────────────────────────────────────────
 
-  /** Register a new account. Returns 201 on success; 409 if email taken; 503 if SMTP not configured. */
+  /** Register a new account. Returns 201 on success (or silent accept for enumeration safety); 503 if SMTP not configured. */
   register(email: string, password: string, display_name: string): Promise<{ message: string }> {
     return request('/auth/register', {
       method: 'POST',

@@ -35,7 +35,7 @@ export default function Login() {
   return (
     <div class="login-page">
       <div class="login-card">
-        <h1>telepair</h1>
+        <h1>TELEPAIR</h1>
         <p class="subtitle">{t('login.subtitle')}</p>
 
         <div class="mode-tabs" role="tablist">
@@ -43,7 +43,7 @@ export default function Login() {
             role="tab"
             aria-selected={mode() === 'email'}
             class={`mode-tab ${mode() === 'email' ? 'active' : ''}`}
-            onClick={() => setMode('email')}
+            onClick={() => { setMode('email'); auth.clearError(); }}
           >
             {t('login.mode_email')}
           </button>
@@ -51,7 +51,7 @@ export default function Login() {
             role="tab"
             aria-selected={mode() === 'token'}
             class={`mode-tab ${mode() === 'token' ? 'active' : ''}`}
-            onClick={() => setMode('token')}
+            onClick={() => { setMode('token'); auth.clearError(); }}
           >
             {t('login.mode_token')}
           </button>

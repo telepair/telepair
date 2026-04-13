@@ -50,6 +50,13 @@ const AUDIT_EVENT_LABEL_KEYS: Record<AuditEventType, TranslationKey> = {
   [AuditEventType.INVITE_REVOKED]: 'session_detail.event_invite_revoked',
   [AuditEventType.TARGET_ACCESS_DENIED]: 'session_detail.event_target_access_denied',
   [AuditEventType.TARGET_RELOADED]: 'session_detail.event_target_reloaded',
+  [AuditEventType.AUTH_LOGIN_FAILED]: 'session_detail.event_auth_login_failed',
+  [AuditEventType.AUTH_REGISTER_REJECTED]: 'session_detail.event_auth_register_rejected',
+  [AuditEventType.AUTH_REGISTER_COMPLETED]: 'session_detail.event_auth_register_completed',
+  [AuditEventType.AUTH_VERIFY_FAILED]: 'session_detail.event_auth_verify_failed',
+  [AuditEventType.AUTH_USER_ENABLED]: 'session_detail.event_auth_user_enabled',
+  [AuditEventType.AUTH_USER_DISABLED]: 'session_detail.event_auth_user_disabled',
+  [AuditEventType.AUTH_SESSION_ACCESS_DENIED]: 'session_detail.event_auth_session_access_denied',
 };
 
 function eventLabel(t: Translator, type: string): string {

@@ -90,6 +90,15 @@ async fn cleanup_orphan_session(state: &AppState, session_id: &str) {
 /// shadow the user's target and launch the admin's command (with
 /// admin-supplied env) on the user's session — see
 /// `resolve_session_pty_does_not_fall_back_when_user_target_missing`.
+#[derive(Debug)]
+enum ResolveError {
+    /// The target genuinely does not exist — safe to clean up the session.
+    NotFound(String),
+    /// A transient storage failure — the target may still exist, so the
+    /// session must NOT be closed.
+    Storage(String),
+}
+
 async fn resolve_session_pty(
     user_target_id: Option<&str>,
     target_name: &str,
@@ -100,20 +109,24 @@ async fn resolve_session_pty(
         Vec<String>,
         std::collections::HashMap<String, String>,
     ),
-    String,
+    ResolveError,
 > {
     if let Some(id) = user_target_id {
         return match state.user_targets.resolve_by_id(id).await {
             Ok(Some(t)) => Ok(t),
-            Ok(None) => Err(format!("user target {id} not found")),
-            Err(e) => Err(format!("failed to resolve user target {id}: {e}")),
+            Ok(None) => Err(ResolveError::NotFound(format!(
+                "user target {id} not found"
+            ))),
+            Err(e) => Err(ResolveError::Storage(format!(
+                "failed to resolve user target {id}: {e}"
+            ))),
         };
     }
     state
         .targets
         .load()
         .resolve(target_name)
-        .ok_or_else(|| format!("target {target_name} not found"))
+        .ok_or_else(|| ResolveError::NotFound(format!("target {target_name} not found")))
 }
 
 /// Build the two WebSocket frames that `send_error` will write for a
@@ -346,15 +359,25 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     .await;
     let (cmd, args, env) = match resolved {
         Ok(tuple) => tuple,
-        Err(err) => {
+        Err(ResolveError::NotFound(msg)) => {
             tracing::warn!(
                 session = %session_id,
                 target = %session.target_name,
                 user_target_id = ?session.user_target_id,
-                "failed to resolve session target: {err}",
+                "target not found: {msg}",
             );
             cleanup_orphan_session(&state, &session_id).await;
-            send_error(&mut ws_tx, error_codes::TARGET_NOT_FOUND, err).await;
+            send_error(&mut ws_tx, error_codes::TARGET_NOT_FOUND, msg).await;
+            return;
+        }
+        Err(ResolveError::Storage(msg)) => {
+            tracing::error!(
+                session = %session_id,
+                target = %session.target_name,
+                user_target_id = ?session.user_target_id,
+                "transient storage error resolving target: {msg}",
+            );
+            send_error(&mut ws_tx, error_codes::STORAGE_ERROR, msg).await;
             return;
         }
     };
@@ -760,8 +783,8 @@ mod tests {
         // Pass a nanoid that does not exist in the user_targets table.
         let result = resolve_session_pty(Some("nonexistent-nanoid"), "vps", &state).await;
         assert!(
-            result.is_err(),
-            "missing user target must NOT fall back to the global engine"
+            matches!(result, Err(ResolveError::NotFound(_))),
+            "missing user target must be NotFound, not Storage"
         );
     }
 
@@ -790,8 +813,8 @@ mod tests {
 
         let result = resolve_session_pty(None, "vps", &state).await;
         assert!(
-            result.is_err(),
-            "missing global target must NOT fall back to a user-owned target with the same name"
+            matches!(result, Err(ResolveError::NotFound(_))),
+            "missing global target must be NotFound, not Storage"
         );
     }
 

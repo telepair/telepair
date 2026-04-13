@@ -237,7 +237,7 @@ export default function Dashboard() {
   return (
     <div class="dashboard">
       <header class="topbar">
-        <h1>telepair</h1>
+        <h1>TELEPAIR</h1>
         <div class="topbar-actions">
           <LocaleSwitcher variant="topbar" />
           {/*

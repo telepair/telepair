@@ -95,7 +95,7 @@ pub enum AuditEventType {
     /// locked_until}` so an operator can distinguish a single typo
     /// from a credential-stuffing run on the same address. The
     /// `reason` field is one of `"unknown_email"`,
-    /// `"unverified"`, `"bad_password"`, or `"locked"`. `remaining`
+    /// `"bad_password"`, or `"locked"`. `remaining`
     /// is present iff the row counter advanced; `locked_until` is
     /// present iff this attempt either tripped or extended a
     /// lockout. `actor_id` is `None` for the unknown-email path
