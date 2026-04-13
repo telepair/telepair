@@ -45,7 +45,6 @@ export default function Dashboard() {
   const [lastMode, setLastMode] = createSignal<InputMode>('multiplexed');
   const [pendingTarget, setPendingTarget] = createSignal<TargetInfo | null>(null);
   const [launching, setLaunching] = createSignal(false);
-  const [loadingMore, setLoadingMore] = createSignal(false);
   // Selected session for the audit-timeline dialog. `null` keeps the
   // dialog closed; setting a closed-session row opens it. Active rows
   // still navigate to the live session page below — the dialog is the
@@ -523,14 +522,10 @@ export default function Dashboard() {
                 <button
                   type="button"
                   class="load-more-btn"
-                  onClick={async () => {
-                    setLoadingMore(true);
-                    try { await sessionStore.loadMoreSessions(); }
-                    finally { setLoadingMore(false); }
-                  }}
-                  disabled={loadingMore()}
+                  onClick={() => sessionStore.loadMoreSessions()}
+                  disabled={sessionStore.loadingMore()}
                 >
-                  {loadingMore() ? t('dashboard.sessions_loading_more') : t('dashboard.sessions_load_more')}
+                  {sessionStore.loadingMore() ? t('dashboard.sessions_loading_more') : t('dashboard.sessions_load_more')}
                 </button>
               </Show>
             </div>

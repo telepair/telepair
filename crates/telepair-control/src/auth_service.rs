@@ -17,6 +17,16 @@ const OTP_RATE_LIMIT_SECS: i64 = 60;
 /// a real user can shake it off after a coffee break, long enough that
 /// a credential-stuffing run can't sustain meaningful throughput.
 const LOGIN_LOCKOUT_MINUTES: i64 = 15;
+const MIN_PASSWORD_LENGTH: usize = 8;
+
+fn validate_password(password: &str) -> Result<()> {
+    if password.len() < MIN_PASSWORD_LENGTH {
+        return Err(Error::InvalidInput(format!(
+            "Password must be at least {MIN_PASSWORD_LENGTH} characters."
+        )));
+    }
+    Ok(())
+}
 
 /// Single user-facing string returned for every failure of
 /// `verify_otp` and `login`. The whole point of the unified shape is
@@ -133,6 +143,8 @@ impl AuthService {
                 .await;
             return Ok(());
         }
+
+        validate_password(password)?;
 
         let password = password.to_owned();
         let hash = tokio::task::spawn_blocking(move || hash_password(&password))
@@ -417,18 +429,21 @@ impl AuthService {
             Err(_) => return Err(Error::Internal("verify task panicked".into())),
         }
 
+        validate_password(new_password)?;
+
         let new_owned = new_password.to_owned();
         let new_hash = tokio::task::spawn_blocking(move || hash_password(&new_owned))
             .await
             .map_err(|_| Error::Internal("hash task panicked".into()))??;
 
-        self.storage
-            .update_password_hash(user.id, &new_hash)
+        // Atomically update the password hash AND rotate the bearer
+        // token in a single transaction so a crash between the two
+        // writes cannot leave the old token valid after a password
+        // change.
+        let new_token = self
+            .storage
+            .change_password_and_rotate_token(user.id, &new_hash)
             .await?;
-
-        // Rotate the bearer token so any leaked/stolen session is
-        // invalidated the moment the password changes.
-        let new_token = self.storage.refresh_user_token(user.id).await?;
 
         let email_str = user.email.as_deref().unwrap_or("unknown");
         self.audit

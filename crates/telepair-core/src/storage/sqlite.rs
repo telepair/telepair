@@ -152,6 +152,42 @@ impl SqliteStorage {
         Ok(())
     }
 
+    /// Atomically update the password hash AND rotate the bearer token
+    /// in a single transaction. Returns the new raw token on success.
+    /// If either write fails, neither takes effect.
+    pub async fn change_password_and_rotate_token(
+        &self,
+        user_id: Uuid,
+        new_hash: &str,
+    ) -> Result<String> {
+        let now_str = now_rfc3339();
+        let uid_str = user_id.to_string();
+        let (raw_token, token_hash) = generate_token();
+
+        let mut tx = self.pool.begin().await?;
+
+        let rows = sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
+            .bind(new_hash)
+            .bind(&now_str)
+            .bind(&uid_str)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            return Err(Error::InvalidInput(format!("user {user_id} not found")));
+        }
+
+        sqlx::query("UPDATE users SET token_sha256 = ?, updated_at = ? WHERE id = ?")
+            .bind(&token_hash)
+            .bind(&now_str)
+            .bind(&uid_str)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(raw_token)
+    }
+
     /// Disambiguate a `user_targets` UPDATE/DELETE CAS that wrote 0
     /// rows. The CAS in `update_user_target` / `delete_user_target`
     /// folds three distinct rejection reasons into a single miss:
@@ -2292,6 +2328,30 @@ mod tests {
         let tok2 = s.refresh_user_token(user.id).await.unwrap();
         let authed = s.validate_token(&tok2).await.unwrap();
         assert_eq!(authed.id, user.id);
+    }
+
+    #[tokio::test]
+    async fn change_password_and_rotate_token_is_atomic() {
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let (user, _) = s.create_user("atomic", false).await.unwrap();
+        let old_token = s.refresh_user_token(user.id).await.unwrap();
+
+        let new_token = s
+            .change_password_and_rotate_token(user.id, "new-hash-value")
+            .await
+            .unwrap();
+
+        // New token is valid.
+        assert_ne!(new_token, old_token);
+        let authed = s.validate_token(&new_token).await.unwrap();
+        assert_eq!(authed.id, user.id);
+
+        // Old token is invalidated.
+        assert!(s.validate_token(&old_token).await.is_err());
+
+        // Password hash was updated.
+        let hash = s.get_password_hash(user.id).await.unwrap();
+        assert_eq!(hash.as_deref(), Some("new-hash-value"));
     }
 
     #[tokio::test]

@@ -16,6 +16,12 @@ const [targets, setTargets] = createSignal<TargetInfo[]>([]);
 const [sessions, setSessions] = createSignal<Session[]>([]);
 const [loading, setLoading] = createSignal(false);
 const [hasMoreSessions, setHasMoreSessions] = createSignal(true);
+const [loadingMore, setLoadingMore] = createSignal(false);
+// Monotonic counter incremented by fetchSessions (full refresh).
+// loadMoreSessions snapshots it before the request; if fetchSessions
+// fires while the request is in flight, the counter advances and the
+// stale append is silently discarded.
+let fetchGeneration = 0;
 // The filter the last refresh ran with. Exposed so the Dashboard can
 // reflect the active tab without threading it through component props
 // — switching tabs calls `fetchSessions(nextFilter)` and the tab
@@ -65,21 +71,26 @@ async function fetchTargets() {
   }
 }
 
+function buildSessionOpts(offset: number): ListSessionsOptions {
+  const filter = currentFilter();
+  const opts: ListSessionsOptions =
+    filter === 'all' ? { status: 'all' } : { status: filter };
+  const target = currentTargetFilter();
+  if (target) opts.targetName = target;
+  opts.limit = SESSION_PAGE_SIZE;
+  opts.offset = offset;
+  return opts;
+}
+
 async function fetchSessions(
   filter: SessionsFilter = currentFilter(),
   targetName: string = currentTargetFilter(),
 ) {
+  fetchGeneration++;
   setCurrentFilter(filter);
   setCurrentTargetFilter(targetName);
-  const opts: ListSessionsOptions =
-    filter === 'all' ? { status: 'all' } : { status: filter };
-  if (targetName) {
-    opts.targetName = targetName;
-  }
-  opts.limit = SESSION_PAGE_SIZE;
-  opts.offset = 0;
   try {
-    const data = await api.listSessions(opts);
+    const data = await api.listSessions(buildSessionOpts(0));
     setSessions(data);
     setHasMoreSessions(data.length >= SESSION_PAGE_SIZE);
   } catch {
@@ -93,20 +104,20 @@ async function fetchSessions(
 }
 
 async function loadMoreSessions() {
-  const opts: ListSessionsOptions =
-    currentFilter() === 'all' ? { status: 'all' } : { status: currentFilter() };
-  const target = currentTargetFilter();
-  if (target) {
-    opts.targetName = target;
-  }
-  opts.limit = SESSION_PAGE_SIZE;
-  opts.offset = sessions().length;
+  if (loadingMore()) return;
+  setLoadingMore(true);
+  const gen = fetchGeneration;
   try {
-    const data = await api.listSessions(opts);
+    const data = await api.listSessions(buildSessionOpts(sessions().length));
+    // Discard if a full refresh happened while this request was in flight.
+    if (gen !== fetchGeneration) return;
     setSessions((prev) => [...prev, ...data]);
     setHasMoreSessions(data.length >= SESSION_PAGE_SIZE);
   } catch {
+    if (gen !== fetchGeneration) return;
     setHasMoreSessions(false);
+  } finally {
+    setLoadingMore(false);
   }
 }
 
@@ -135,6 +146,7 @@ export const sessionStore = {
   targets,
   sessions,
   loading,
+  loadingMore,
   hasMoreSessions,
   currentFilter,
   currentTargetFilter,

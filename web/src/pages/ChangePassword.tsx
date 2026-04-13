@@ -2,6 +2,7 @@
 import { createSignal, Show } from 'solid-js';
 import { useI18n } from '../i18n';
 import { api, ApiError, errorMessage } from '../lib/api';
+import { MIN_PASSWORD_LENGTH } from '../lib/protocol';
 import { auth } from '../stores/auth';
 import LocaleSwitcher from '../components/LocaleSwitcher';
 
@@ -19,6 +20,10 @@ export default function ChangePassword() {
     e.preventDefault();
     setError('');
 
+    if (newPw().length < MIN_PASSWORD_LENGTH) {
+      setError(t('change_password.error_too_short'));
+      return;
+    }
     if (newPw() !== confirmPw()) {
       setError(t('change_password.error_mismatch'));
       return;
