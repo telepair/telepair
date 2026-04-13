@@ -10,6 +10,7 @@ import Session from './pages/Session';
 import Join from './pages/Join';
 import AdminTargets from './pages/AdminTargets';
 import AdminUsers from './pages/AdminUsers';
+import AdminAudit from './pages/AdminAudit';
 import ChangePassword from './pages/ChangePassword';
 import ToastContainer from './components/Toast';
 
@@ -88,6 +89,16 @@ export default function App() {
             <AuthGuard>
               <AdminGuard>
                 <AdminUsers />
+              </AdminGuard>
+            </AuthGuard>
+          )}
+        />
+        <Route
+          path="/admin/audit"
+          component={() => (
+            <AuthGuard>
+              <AdminGuard>
+                <AdminAudit />
               </AdminGuard>
             </AuthGuard>
           )}

@@ -403,9 +403,7 @@ impl AuthService {
             .get_password_hash(user.id)
             .await?
             .ok_or_else(|| {
-                Error::InvalidInput(
-                    "This account does not use password authentication.".into(),
-                )
+                Error::InvalidInput("This account does not use password authentication.".into())
             })?;
 
         let current_owned = current_password.to_owned();
@@ -791,9 +789,11 @@ mod tests {
     #[tokio::test]
     async fn change_password_success() {
         let (svc, uid) = seed_real_account("cp@x.com", "cpuser", "old-pass").await;
-        let user = svc.storage.validate_token(
-            &svc.storage.refresh_user_token(uid).await.unwrap(),
-        ).await.unwrap();
+        let user = svc
+            .storage
+            .validate_token(&svc.storage.refresh_user_token(uid).await.unwrap())
+            .await
+            .unwrap();
 
         svc.change_password(&user, "old-pass", "new-pass")
             .await
@@ -821,9 +821,11 @@ mod tests {
     #[tokio::test]
     async fn change_password_wrong_current_rejects() {
         let (svc, uid) = seed_real_account("cp2@x.com", "cpuser2", "correct").await;
-        let user = svc.storage.validate_token(
-            &svc.storage.refresh_user_token(uid).await.unwrap(),
-        ).await.unwrap();
+        let user = svc
+            .storage
+            .validate_token(&svc.storage.refresh_user_token(uid).await.unwrap())
+            .await
+            .unwrap();
 
         let err = svc
             .change_password(&user, "wrong-current", "new-pass")

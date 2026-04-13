@@ -166,6 +166,22 @@ async fn send_error(
     let _ = ws_tx.send(close).await;
 }
 
+/// Compute the `InputDenied` reason for a given role and input mode.
+/// Returns `None` when input is allowed, `Some(reason)` when it should
+/// be blocked. Extracted so both the initial setup and the runtime
+/// `PeerRoleChanged` handler use the same logic.
+fn compute_input_denied(role: Role, input_mode: InputMode) -> Option<&'static str> {
+    let can_forward =
+        role.can_input() && !(input_mode == InputMode::Serialized && role != Role::Owner);
+    if can_forward {
+        None
+    } else if role == Role::Viewer {
+        Some(input_denied::VIEWER)
+    } else {
+        Some(input_denied::SERIALIZED_NOT_OWNER)
+    }
+}
+
 async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
@@ -458,6 +474,11 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         }
     }
 
+    // Second collab subscriber for the main loop — used to intercept
+    // `PeerRoleChanged` targeting this connection so input permissions
+    // update without a reconnect.
+    let mut role_rx = collab_rx.resubscribe();
+
     // Spawn a forwarder that pumps PTY output + collab messages to the WS sink.
     // `stop_tx` (oneshot) lets the main loop tell the forwarder to exit.
     let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
@@ -530,26 +551,17 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let user_name = user.name.clone();
     let input_mode = session.input_mode;
 
-    // Role is captured at join time and constant for the lifetime of this
-    // WS connection. If a future role-mutation API lands, reconnect is the
-    // right place to re-check (keeps auth consistent across tabs), not a
-    // side-channel that races the input loop.
-    let current_role = my_role;
-    let can_forward_input = current_role.can_input()
-        && !(input_mode == InputMode::Serialized && current_role != Role::Owner);
-    // Precompute the `InputDenied` reason so the hot path never has to
-    // branch twice for the same answer. `None` means "input is allowed";
-    // `Some(reason)` means every binary frame gets dropped and the first
-    // one triggers a single-shot user notice.
-    let input_denied_reason = if can_forward_input {
-        None
-    } else if current_role == Role::Viewer {
-        Some(input_denied::VIEWER)
-    } else {
-        Some(input_denied::SERIALIZED_NOT_OWNER)
-    };
+    // Role starts at the value captured at join time. It can be
+    // mutated at runtime when the owner changes this participant's
+    // role via the REST API — the `role_rx` arm below picks up the
+    // `PeerRoleChanged` broadcast and recalculates input permissions
+    // in place, so the connection doesn't need to reconnect.
+    let mut current_role = my_role;
+    let mut input_denied_reason = compute_input_denied(current_role, input_mode);
     // Latch so we only send the denial notice once per connection —
     // otherwise every keystroke would spam the client's toast bus.
+    // Reset when the role changes (a newly-denied user should get
+    // one fresh notice).
     let mut denial_notice_sent = false;
 
     // Track the last accepted CursorMove timestamp per connection so we can
@@ -634,6 +646,26 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                     Message::Close(_) => break,
                     _ => {}
                 }
+            }
+            // Listen for PeerRoleChanged targeting this user so input
+            // permissions update without a reconnect. The output forwarder
+            // already forwards the message to the WS client; this arm only
+            // updates the server-side gate variables.
+            result = role_rx.recv() => {
+                if let Ok(ServerMessage::PeerRoleChanged { user_id: uid, new_role }) = result
+                    && uid == user_id
+                {
+                    current_role = new_role;
+                    input_denied_reason = compute_input_denied(current_role, input_mode);
+                    denial_notice_sent = false;
+                    tracing::info!(
+                        user = %user_name,
+                        session = %session_id,
+                        role = %new_role,
+                        "role changed at runtime"
+                    );
+                }
+                // Ignore lag errors and non-role messages.
             }
             _ = shutdown_rx.recv() => {
                 tracing::info!(user = %user_name, session = %session_id, "session force-stopped");

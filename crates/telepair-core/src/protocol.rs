@@ -129,6 +129,16 @@ pub enum ServerMessage {
     PeerLeft {
         user_id: Uuid,
     },
+    /// Broadcast when the owner changes another participant's role via
+    /// `PUT /api/sessions/:id/participants/:user_id/role`. Every
+    /// connected client receives this so participant lists update in
+    /// lockstep. The WS handler also intercepts messages targeting the
+    /// current connection to re-evaluate input permissions without a
+    /// reconnect.
+    PeerRoleChanged {
+        user_id: Uuid,
+        new_role: Role,
+    },
     PeerCursor {
         user_id: Uuid,
         x: u16,

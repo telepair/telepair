@@ -12,7 +12,7 @@ use axum::{
     Router,
     body::Body,
     http::{HeaderValue, Request, Response, StatusCode, header},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use bytes::Bytes;
 use state::AppState;
@@ -112,10 +112,7 @@ pub fn build_router_with_options(
         .route("/api/auth/verify", post(http::verify_otp))
         .route("/api/auth/login", post(http::login))
         .route("/api/auth/whoami", get(http::whoami))
-        .route(
-            "/api/auth/change-password",
-            post(http::change_password),
-        )
+        .route("/api/auth/change-password", post(http::change_password))
         .route("/api/targets", get(http::list_targets))
         .route("/api/user-targets", post(http::create_user_target))
         .route(
@@ -134,6 +131,10 @@ pub fn build_router_with_options(
             get(http::list_session_audit),
         )
         .route(
+            "/api/sessions/{session_id}/participants/{user_id}/role",
+            put(http::update_participant_role),
+        )
+        .route(
             "/api/sessions/{session_id}/invites",
             post(http::create_invite).get(http::list_session_invites),
         )
@@ -150,6 +151,7 @@ pub fn build_router_with_options(
         // the prefix.
         .route("/api/admin/targets", get(http::list_admin_targets))
         .route("/api/admin/targets/reload", post(http::reload_targets))
+        .route("/api/admin/audit", get(http::list_admin_audit))
         .route("/api/admin/users", get(http::list_admin_users))
         .route(
             "/api/admin/users/{id}/enable",

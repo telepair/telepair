@@ -31,6 +31,16 @@ export interface ListSessionsOptions {
   limit?: number;
   offset?: number;
 }
+export interface ListAdminAuditOptions {
+  limit?: number;
+  offset?: number;
+  since?: string;
+  until?: string;
+  actor_id?: string;
+  event_type?: string;
+  session_id?: string;
+}
+
 import { auth } from '../stores/auth';
 
 const BASE = '/api';
@@ -319,6 +329,21 @@ export const api = {
     return request('/admin/targets/reload', { method: 'POST' });
   },
 
+  // ── Admin: audit ────────────────────────────────────────────────────────────
+
+  listAdminAudit(opts: ListAdminAuditOptions = {}): Promise<AuditEvent[]> {
+    const params = new URLSearchParams();
+    if (opts.limit != null) params.set('limit', String(opts.limit));
+    if (opts.offset != null) params.set('offset', String(opts.offset));
+    if (opts.since) params.set('since', opts.since);
+    if (opts.until) params.set('until', opts.until);
+    if (opts.actor_id) params.set('actor_id', opts.actor_id);
+    if (opts.event_type) params.set('event_type', opts.event_type);
+    if (opts.session_id) params.set('session_id', opts.session_id);
+    const qs = params.toString();
+    return request(qs ? `/admin/audit?${qs}` : '/admin/audit');
+  },
+
   // ── Admin: users ────────────────────────────────────────────────────────────
 
   listAdminUsers(): Promise<AdminUserInfo[]> {
@@ -405,6 +430,17 @@ export const api = {
 
   deleteUserTarget(id: string): Promise<void> {
     return request(`/user-targets/${id}`, { method: 'DELETE' });
+  },
+
+  updateParticipantRole(
+    sessionId: string,
+    userId: string,
+    role: Role,
+  ): Promise<void> {
+    return request(`/sessions/${sessionId}/participants/${userId}/role`, {
+      method: 'PUT',
+      body: JSON.stringify({ role }),
+    });
   },
 };
 

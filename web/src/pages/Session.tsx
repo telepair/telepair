@@ -152,6 +152,18 @@ export default function SessionPage() {
           { user_id: msg.user_id, name: msg.name, text: msg.text, ts: msg.ts },
         ]);
         break;
+      case 'PeerRoleChanged':
+        setParticipants((prev) =>
+          prev.map((p) =>
+            p.user_id === msg.user_id ? { ...p, role: msg.new_role } : p,
+          ),
+        );
+        // If it's our own role that changed, update the local signal
+        // so canInput / toolbar badges react immediately.
+        if (msg.user_id === auth.currentUserId()) {
+          setRole(msg.new_role);
+        }
+        break;
       case 'PeerCursor':
         break;
       case 'InputDenied':
@@ -271,6 +283,14 @@ export default function SessionPage() {
 
   const handleSendChat = (text: string) => {
     socket?.send({ type: 'ChatMessage', text });
+  };
+
+  const handleRoleChange = async (userId: string, newRole: Role) => {
+    try {
+      await api.updateParticipantRole(params.id, userId, newRole);
+    } catch (e) {
+      toast.error(t('session.role_change_failed', { msg: fmtError(e) }));
+    }
   };
 
   const handleManualReconnect = () => {
@@ -468,7 +488,11 @@ export default function SessionPage() {
         <Show when={sidebarOpen()}>
           <aside class="sidebar">
             <div class="sidebar-section">
-              <ParticipantList participants={participants()} />
+              <ParticipantList
+                participants={participants()}
+                isOwner={role() === 'owner'}
+                onRoleChange={handleRoleChange}
+              />
             </div>
             <div class="sidebar-section chat-section">
               <ChatPanel messages={chatMessages()} onSend={handleSendChat} />

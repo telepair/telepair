@@ -725,6 +725,37 @@ impl SessionHub {
         }
     }
 
+    /// Update a participant's role in a live session. Mutates the
+    /// in-memory participant map, persists via `upsert_participant`, and
+    /// broadcasts `PeerRoleChanged` so every connected client updates
+    /// its participant list and re-evaluates input permissions. Returns
+    /// `true` if the role was actually changed, `false` if the
+    /// participant wasn't found in the live session or the role was
+    /// already the requested value.
+    pub async fn update_participant_role(
+        &self,
+        session_id: &str,
+        target_user_id: Uuid,
+        new_role: Role,
+    ) -> bool {
+        let mut sessions = self.sessions.write().await;
+        let Some(SessionEntry::Live(live)) = sessions.get_mut(session_id) else {
+            return false;
+        };
+        let Some(info) = live.participants.get_mut(&target_user_id) else {
+            return false;
+        };
+        if info.role == new_role {
+            return false;
+        }
+        info.role = new_role;
+        let _ = live.collab_tx.send(ServerMessage::PeerRoleChanged {
+            user_id: target_user_id,
+            new_role,
+        });
+        true
+    }
+
     /// Spawn a background task that periodically reaps sessions which
     /// have had zero WS connections for longer than `config.idle_timeout`.
     ///
