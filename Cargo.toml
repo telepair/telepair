@@ -83,7 +83,7 @@ tempfile = "3"
 argon2 = "0.5"
 
 # SMTP email sending
-lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "builder"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "pool", "hostname", "tokio1", "tokio1-rustls-tls", "builder"] }
 
 # CLI extras
 anyhow = "1"
