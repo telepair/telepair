@@ -4,7 +4,7 @@ English | [简体中文](api.zh-CN.md)
 
 Base URL: `http://localhost:7700/api`
 
-All endpoints except `/api/health` and `POST /api/invite/redeem` require authentication via Bearer token:
+All endpoints except `/api/health`, the auth endpoints (`POST /api/auth/register`, `POST /api/auth/verify`, `POST /api/auth/login`), and `POST /api/invite/redeem` require authentication via Bearer token:
 
 ```
 Authorization: Bearer <token>
@@ -37,7 +37,8 @@ affordances (audit dialog, close button) without an extra round trip per row.
   "user_id": "...",
   "name": "admin",
   "is_admin": true,
-  "is_guest": false
+  "is_guest": false,
+  "session_enabled": true
 }
 ```
 
@@ -47,9 +48,130 @@ affordances (audit dialog, close button) without an extra round trip per row.
 | `name` | string | Current display name |
 | `is_admin` | boolean | `true` for admin accounts |
 | `is_guest` | boolean | `true` for invite-minted scoped guests |
+| `session_enabled` | boolean | `true` when the user is allowed to create / join sessions. The Dashboard renders a "pending admin approval" banner and hides the session-create form when this is `false`. |
 
 **Errors**
 - `401 Unauthorized` — missing or invalid token. Never returns 403: "I am a guest" is still a valid identity worth surfacing.
+
+### POST /api/auth/register
+
+Start email registration. Creates an unverified pending account and sends a
+one-time verification code to the provided address. **No authentication required.**
+
+The endpoint always returns `201` on valid input, regardless of whether the
+email is already registered or a pending registration was recently created.
+This is intentional enumeration safety — callers cannot distinguish "code sent"
+from "address already in use." The detailed reason (already registered, rate
+limited, etc.) is captured in the audit log.
+
+**Request Body**
+```json
+{
+  "email": "alice@example.com",
+  "password": "s3cret!",
+  "display_name": "Alice"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `email` | string | yes | Email address (case-insensitive) |
+| `password` | string | yes | Plaintext password; hashed with Argon2 before storage |
+| `display_name` | string | yes | Display name for the new account |
+
+**Response** `201 Created`
+```json
+{
+  "message": "Verification code sent to your email."
+}
+```
+
+**Errors**
+- `400 Bad Request` — malformed request body
+- `503 Service Unavailable` — SMTP is not configured on this instance; contact the administrator
+
+### POST /api/auth/verify
+
+Submit the OTP code received via email to complete registration. Returns a
+bearer token on success. **No authentication required.**
+
+Every failure mode (bad code, expired, locked after too many attempts) is
+collapsed into the same `401` shape so the API cannot be used to enumerate
+which addresses have pending registrations. The detailed reason is still
+captured in the audit log.
+
+**Request Body**
+```json
+{
+  "email": "alice@example.com",
+  "code": "839204"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `email` | string | yes | Email address used during registration |
+| `code` | string | yes | 6-digit OTP code from the verification email |
+
+**Response** `200 OK`
+```json
+{
+  "token": "newly-minted-bearer-token"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `token` | string | Bearer token for the newly verified account. The account starts with `session_enabled = false` — an admin must enable it before the user can create or join sessions. |
+
+**Errors**
+- `400 Bad Request` — malformed request body
+- `401 Unauthorized` — OTP code is wrong, expired, or the pending row is locked after too many failed attempts
+
+### POST /api/auth/login
+
+Unified login endpoint. Accepts either a raw bearer token (the existing
+admin/guest path) or email + password credentials (email-registered users).
+**No authentication required.**
+
+**Request Body — token login**
+```json
+{
+  "token": "existing-bearer-token"
+}
+```
+
+**Request Body — email + password login**
+```json
+{
+  "email": "alice@example.com",
+  "password": "s3cret!"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `token` | string | no* | Existing bearer token to validate. Mutually exclusive with `email`/`password`. |
+| `email` | string | no* | Email address for password login |
+| `password` | string | no* | Password for email login |
+
+\* Exactly one of `{token}` or `{email, password}` must be provided.
+
+**Response** `200 OK`
+```json
+{
+  "token": "valid-bearer-token"
+}
+```
+
+For token login, the same token is echoed back after validation. For email +
+password login, a fresh bearer token is minted and returned.
+
+**Errors**
+- `400 Bad Request` — neither `token` nor `email`+`password` provided, or body is malformed
+- `401 Unauthorized` — token is invalid, email is unknown, password is wrong, or account is locked after too many failed attempts. All cases return the same generic error (enumeration safety). Login failures are throttled: after 5 consecutive bad passwords the account is locked for a cooldown window. The lockout is only visible in the audit trail.
+
+**Note:** the `session_enabled` check does **not** happen at login. A disabled account can still log in (to read history, change password, etc.) — session creation and WebSocket attach are the gates that enforce the `session_enabled` bit.
 
 ## Targets
 
@@ -338,6 +460,134 @@ for the event taxonomy and write paths.
 - `403 Forbidden` — not the session owner
 - `404 Not Found` — session does not exist
 
+## User Targets
+
+User-owned virtual targets. Each user can create, read, update, and delete their
+own targets. These targets appear alongside global targets from `targets.yaml` in
+the target list (with `"source": "user"`). Scoped guests get `403` on all user
+target routes — they are invite-minted and session-local.
+
+### POST /api/user-targets
+
+Create a user-owned virtual target. The authenticated user becomes the owner.
+
+**Request Body**
+```json
+{
+  "name": "my-dev-db",
+  "display": "My Dev Database",
+  "command": "psql",
+  "args": ["-h", "localhost", "-U", "dev", "mydb"],
+  "env": { "PGPASSWORD": "devpass" },
+  "tags": ["database", "dev"]
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | yes | Unique target name (must be non-blank) |
+| `display` | string | yes | Human-readable display name (must be non-blank) |
+| `command` | string | yes | Command to execute (must be non-blank) |
+| `args` | string[] | no | Command arguments (default: `[]`) |
+| `env` | object | no | Environment variables for the target process (default: `{}`) |
+| `tags` | string[] | no | Descriptive tags (default: `[]`) |
+
+**Response** `201 Created`
+```json
+{
+  "id": "a1b2c3d4e5",
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "name": "my-dev-db",
+  "display": "My Dev Database",
+  "command": "psql",
+  "args": ["-h", "localhost", "-U", "dev", "mydb"],
+  "env": { "PGPASSWORD": "devpass" },
+  "tags": ["database", "dev"],
+  "created_at": "2026-04-13T10:00:00Z",
+  "updated_at": "2026-04-13T10:00:00Z"
+}
+```
+
+**Errors**
+- `400 Bad Request` — `name`, `display`, or `command` is blank, or the body is malformed
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — caller is a scoped guest
+
+### GET /api/user-targets/{id}
+
+Fetch a single user-owned target. Only the target owner can read it.
+
+**Response** `200 OK`
+```json
+{
+  "id": "a1b2c3d4e5",
+  "user_id": "550e8400-...",
+  "name": "my-dev-db",
+  "display": "My Dev Database",
+  "command": "psql",
+  "args": ["-h", "localhost", "-U", "dev", "mydb"],
+  "env": { "PGPASSWORD": "devpass" },
+  "tags": ["database", "dev"],
+  "created_at": "2026-04-13T10:00:00Z",
+  "updated_at": "2026-04-13T10:00:00Z"
+}
+```
+
+**Errors**
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — caller is a scoped guest
+- `404 Not Found` — target does not exist or is not owned by the caller
+
+### PUT /api/user-targets/{id}
+
+Update a user-owned target. Only the target owner can update it. The `name`
+field is ignored on update — only `display`, `command`, `args`, `env`, and
+`tags` are mutable.
+
+**Request Body**
+```json
+{
+  "display": "My Dev Database (updated)",
+  "command": "psql",
+  "args": ["-h", "localhost", "-U", "dev", "mydb_v2"],
+  "env": { "PGPASSWORD": "newpass" },
+  "tags": ["database", "dev", "v2"]
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `display` | string | yes | Human-readable display name (must be non-blank) |
+| `command` | string | yes | Command to execute (must be non-blank) |
+| `args` | string[] | no | Command arguments (default: `[]`) |
+| `env` | object | no | Environment variables (default: `{}`) |
+| `tags` | string[] | no | Descriptive tags (default: `[]`) |
+
+**Response** `200 OK`
+
+Returns the updated `UserTarget` object (same shape as the create response).
+
+**Errors**
+- `400 Bad Request` — `display` or `command` is blank, or the body is malformed
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — caller is a scoped guest
+- `404 Not Found` — target does not exist or is not owned by the caller
+- `409 Conflict` — an active session still references this target; close the session first, then retry
+
+### DELETE /api/user-targets/{id}
+
+Delete a user-owned target. Only the target owner can delete it.
+
+**Response** `204 No Content`
+
+No response body.
+
+**Errors**
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — caller is a scoped guest
+- `404 Not Found` — target does not exist or is not owned by the caller
+- `409 Conflict` — an active session still references this target; close the session first, then retry
+
 ## Admin
 
 The `/api/admin/*` routes require an admin bearer token. Non-admins get `403`.
@@ -421,3 +671,86 @@ detail blob.
 - `400 Bad Request` with body `{ "reason": "still_referenced", "message": "...", "targets": [{ "target": "...", "active_sessions": N }, ...] }` — the new `targets.yaml` would drop one or more targets that still have live sessions in the hub. The old engine stays loaded and the `targets` array lists exactly which targets are blocking the reload with their live session counts, so the operator can close those sessions (or restore the target in yaml) and retry. Admin UI renders this as a persistent banner instead of a one-shot toast.
 - `401 Unauthorized` — missing or invalid token
 - `403 Forbidden` — caller is authenticated but not an admin
+
+### GET /api/admin/users
+
+List every non-guest user account, newest first. Admin-only. Scoped guests are
+not included — they are invite-minted, session-local, and disappear on close.
+
+This endpoint backs the admin Users page introduced in v0.1.2, where an operator
+can flip the `session_enabled` bit on self-registered email accounts.
+
+**Response** `200 OK`
+```json
+[
+  {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "name": "alice",
+    "email": "alice@example.com",
+    "is_admin": false,
+    "session_enabled": false,
+    "created_at": "2026-04-13T08:00:00Z",
+    "updated_at": "2026-04-13T08:00:00Z"
+  }
+]
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | UUID of the user |
+| `name` | string | Display name |
+| `email` | string \| null | Email address. `null` for admin/CLI accounts that never registered with email. Exposed here because the caller is already an admin with full target-reload and session-close rights. |
+| `is_admin` | boolean | `true` for admin accounts |
+| `session_enabled` | boolean | `true` when the user is allowed to create / join sessions. New email registrations start with `false`. |
+| `created_at` | string (ISO 8601) | Account creation time, UTC |
+| `updated_at` | string (ISO 8601) | Last modification time, UTC |
+
+**Errors**
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — caller is authenticated but not an admin
+
+### POST /api/admin/users/{id}/enable
+
+Enable session access for a user. Flips `session_enabled = true` on the target
+row and emits an audit event. Admin-only.
+
+**Response** `200 OK`
+
+Returns the updated user object (same shape as rows in `GET /api/admin/users`).
+
+```json
+{
+  "id": "550e8400-...",
+  "name": "alice",
+  "email": "alice@example.com",
+  "is_admin": false,
+  "session_enabled": true,
+  "created_at": "2026-04-13T08:00:00Z",
+  "updated_at": "2026-04-13T09:00:00Z"
+}
+```
+
+**Errors**
+- `400 Bad Request` — malformed UUID in path, or admin attempted to enable/disable themselves (self-mutation guard)
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — caller is authenticated but not an admin
+- `404 Not Found` — user does not exist
+
+### POST /api/admin/users/{id}/disable
+
+Disable session access for a user. Flips `session_enabled = false` on the target
+row and emits an audit event. Admin-only.
+
+The user keeps their bearer token — `whoami` and session history still work. The
+next session create or WebSocket attach they attempt fails closed via the
+`session_enabled` gate.
+
+**Response** `200 OK`
+
+Returns the updated user object (same shape as rows in `GET /api/admin/users`).
+
+**Errors**
+- `400 Bad Request` — malformed UUID in path, or admin attempted to enable/disable themselves (self-mutation guard)
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — caller is authenticated but not an admin
+- `404 Not Found` — user does not exist

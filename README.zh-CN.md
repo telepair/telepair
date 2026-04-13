@@ -176,10 +176,10 @@ telepair 的所有数据放在 `~/.telepair/`:
 ## 开发
 
 ```bash
-# 后端测试(209 项)
+# 后端测试(284 项)
 cargo test --workspace
 
-# 前端单元测试(134 项)
+# 前端单元测试(137 项)
 cd web && npm test
 
 # 浏览器 E2E 测试(43 项,需要运行中的 server + Chromium)
@@ -220,7 +220,7 @@ RUST_LOG=debug ./target/release/telepair
 | 后端 | Rust、axum、tokio、sqlx (SQLite)、portable-pty |
 | 前端 | SolidJS、TypeScript、xterm.js、Vite |
 | 协议 | JSON over WebSocket(控制 + 协作),二进制帧(终端 I/O) |
-| 认证 | 基于 token,存储时做 SHA-256 哈希 |
+| 认证 | 基于 token,存储时做 SHA-256 哈希;邮箱注册支持 OTP 验证和 Argon2 密码哈希 |
 | 存储 | SQLite(通过 sqlx 异步) |
 
 ## 许可证
