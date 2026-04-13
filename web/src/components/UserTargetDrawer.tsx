@@ -92,8 +92,8 @@ export default function UserTargetDrawer(props: UserTargetDrawerProps) {
         tags: parseArgs(tagsStr()),
       };
       let saved: UserTargetInfo;
-      if (isEdit() && props.target && typeof props.target === 'object') {
-        saved = await api.updateUserTarget(props.target.id, params);
+      if (isEdit()) {
+        saved = await api.updateUserTarget((props.target as UserTargetInfo).id, params);
       } else {
         saved = await api.createUserTarget({ name: name(), ...params });
       }
@@ -106,12 +106,13 @@ export default function UserTargetDrawer(props: UserTargetDrawerProps) {
   };
 
   const handleDelete = async () => {
-    if (!props.target || typeof props.target !== 'object') return;
+    if (!isEdit()) return;
     setDeleting(true);
     setDeleteError('');
     try {
-      await api.deleteUserTarget(props.target.id);
-      props.onDeleted(props.target.id);
+      const t = props.target as UserTargetInfo;
+      await api.deleteUserTarget(t.id);
+      props.onDeleted(t.id);
     } catch (e) {
       setDeleteError(errorMessage(e));
       setConfirmDelete(false);

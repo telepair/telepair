@@ -85,8 +85,8 @@ async function fetchSessions(
   }
 }
 
-async function createSession(targetName: string, inputMode?: InputMode): Promise<Session> {
-  const session = await api.createSession(targetName, inputMode);
+async function createSession(target: TargetInfo, inputMode?: InputMode): Promise<Session> {
+  const session = await api.createSession(target, inputMode);
   // Only surface newly-created sessions on tabs that would show them:
   //   1. Not the "Closed" tab — a freshly-minted row is always active.
   //   2. No target filter OR the filter matches the new session's target
@@ -95,7 +95,7 @@ async function createSession(targetName: string, inputMode?: InputMode): Promise
   //      alpha list (it would vanish on the next refetch anyway, but the
   //      flash is confusing). An empty target filter means "show all".
   const targetOk =
-    currentTargetFilter() === '' || currentTargetFilter() === targetName;
+    currentTargetFilter() === '' || currentTargetFilter() === target.name;
   if (currentFilter() !== 'closed' && targetOk) {
     setSessions((prev) => [...prev, session]);
   }

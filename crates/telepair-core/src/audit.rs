@@ -36,15 +36,9 @@ use crate::storage::{SqliteStorage, Storage};
 /// they appear in the docs; the on-disk representation is the
 /// dotted-lowercase string returned by [`AuditEventType::as_str`].
 ///
-/// Intentionally small for v0.1.1. Two classes of event were
+/// Intentionally small for v0.1.1. One class of event was
 /// considered and deliberately left out:
 ///
-/// - **Auth login** — telepair has no dedicated `POST /api/auth`
-///   endpoint; bearer-token validation happens on every API request
-///   via `extract_user`. Emitting an audit row per request would
-///   flood the table without adding security signal. When a real
-///   login flow lands, an `auth.*` family can be added as a
-///   backward-compatible extension.
 /// - **Participant left** — under reconnect-safe semantics the
 ///   `participants.left_at` column is only stamped by
 ///   `close_session`, so a standalone "someone left" event would
@@ -95,6 +89,57 @@ pub enum AuditEventType {
     /// chasing yaml diffs. `{path, targets}`.
     #[serde(rename = "target.reloaded")]
     TargetReloaded,
+    /// A password login attempt failed verification, was rejected
+    /// because the row was already locked, or was attempted against
+    /// an unknown email. Detail captures `{email, reason, remaining,
+    /// locked_until}` so an operator can distinguish a single typo
+    /// from a credential-stuffing run on the same address. The
+    /// `reason` field is one of `"unknown_email"`,
+    /// `"unverified"`, `"bad_password"`, or `"locked"`. `remaining`
+    /// is present iff the row counter advanced; `locked_until` is
+    /// present iff this attempt either tripped or extended a
+    /// lockout. `actor_id` is `None` for the unknown-email path
+    /// (we have no user row to point at).
+    #[serde(rename = "auth.login_failed")]
+    AuthLoginFailed,
+    /// `POST /api/auth/register` was silently rejected because the
+    /// address already belongs to a real user, or the request was
+    /// rate-limited. The HTTP layer always returns `Ok(())` to
+    /// preserve enumeration safety; this row is the only record an
+    /// operator has of the attempt. Detail: `{email, reason}`.
+    #[serde(rename = "auth.register_rejected")]
+    AuthRegisterRejected,
+    /// A pending registration was successfully verified and a real
+    /// `users` row was materialized (with `session_enabled = FALSE`,
+    /// awaiting admin approval). Detail: `{email}`. The actor is the
+    /// freshly minted user.
+    #[serde(rename = "auth.register_completed")]
+    AuthRegisterCompleted,
+    /// `POST /api/auth/verify` rejected an OTP. The HTTP response is
+    /// always the generic `invalid email or code`; the audit row
+    /// carries the precise reason so an operator can distinguish a
+    /// single typo from a stuffing run. Detail: `{email, reason,
+    /// remaining}`. `reason` is one of `"bad_code"`, `"locked"`, or
+    /// `"expired_or_unknown"`; `remaining` is present iff `reason ==
+    /// "bad_code"`.
+    #[serde(rename = "auth.verify_failed")]
+    AuthVerifyFailed,
+    /// An admin flipped `session_enabled = TRUE` on a user row via
+    /// the user management page. Detail: `{target_user_id,
+    /// target_user_name}`. The actor is the admin who clicked.
+    #[serde(rename = "auth.user_enabled")]
+    AuthUserEnabled,
+    /// An admin flipped `session_enabled = FALSE` on a user row via
+    /// the user management page. Detail: `{target_user_id,
+    /// target_user_name}`. The actor is the admin who clicked.
+    #[serde(rename = "auth.user_disabled")]
+    AuthUserDisabled,
+    /// A holder of a valid bearer token tried to create or attach to
+    /// a session while their `session_enabled` bit was FALSE. The
+    /// HTTP / WS layer rejected them. Detail: `{path}`. Actor is
+    /// the gated user.
+    #[serde(rename = "auth.session_access_denied")]
+    AuthSessionAccessDenied,
 }
 
 impl AuditEventType {
@@ -109,6 +154,13 @@ impl AuditEventType {
             Self::InviteRevoked => "invite.revoked",
             Self::TargetAccessDenied => "target.access_denied",
             Self::TargetReloaded => "target.reloaded",
+            Self::AuthLoginFailed => "auth.login_failed",
+            Self::AuthRegisterRejected => "auth.register_rejected",
+            Self::AuthRegisterCompleted => "auth.register_completed",
+            Self::AuthVerifyFailed => "auth.verify_failed",
+            Self::AuthUserEnabled => "auth.user_enabled",
+            Self::AuthUserDisabled => "auth.user_disabled",
+            Self::AuthSessionAccessDenied => "auth.session_access_denied",
         }
     }
 }
@@ -126,6 +178,13 @@ impl FromStr for AuditEventType {
             "invite.revoked" => Ok(Self::InviteRevoked),
             "target.access_denied" => Ok(Self::TargetAccessDenied),
             "target.reloaded" => Ok(Self::TargetReloaded),
+            "auth.login_failed" => Ok(Self::AuthLoginFailed),
+            "auth.register_rejected" => Ok(Self::AuthRegisterRejected),
+            "auth.register_completed" => Ok(Self::AuthRegisterCompleted),
+            "auth.verify_failed" => Ok(Self::AuthVerifyFailed),
+            "auth.user_enabled" => Ok(Self::AuthUserEnabled),
+            "auth.user_disabled" => Ok(Self::AuthUserDisabled),
+            "auth.session_access_denied" => Ok(Self::AuthSessionAccessDenied),
             _ => Err(format!("unknown audit event type: {s}")),
         }
     }

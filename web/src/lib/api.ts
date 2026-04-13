@@ -11,6 +11,7 @@ import type {
   Role,
   InputMode,
   AdminTargetInfo,
+  AdminUserInfo,
   ReloadTargetsResult,
 } from './protocol';
 
@@ -132,6 +133,7 @@ export interface WhoamiResponse {
   name: string;
   is_admin: boolean;
   is_guest: boolean;
+  session_enabled: boolean;
 }
 
 export const api = {
@@ -182,10 +184,29 @@ export const api = {
     return request(qs ? `/sessions?${qs}` : '/sessions');
   },
 
-  createSession(target_name: string, input_mode?: InputMode): Promise<Session> {
+  /**
+   * Launch a session against the given target. The body MUST carry
+   * exactly one of `target_id` (user-owned, by stable nanoid) or
+   * `target_name` (global, from `targets.yaml` by name) — see the
+   * Rust-side `CreateSessionRequest` doc for the rationale. The
+   * frontend always knows which namespace it's in because every
+   * `TargetInfo` returned by `listTargets` carries the discriminant
+   * `source: 'global' | 'user'` and (for the user case) the row's
+   * `id`. Picking the field here keeps the per-call site honest:
+   * passing a raw string would let a refactor silently regress to the
+   * old name-based collision bug.
+   */
+  createSession(target: TargetInfo, input_mode?: InputMode): Promise<Session> {
+    const body: { target_id?: string; target_name?: string; input_mode?: InputMode } =
+      target.source === 'user' && target.id
+        ? { target_id: target.id }
+        : { target_name: target.name };
+    if (input_mode !== undefined) {
+      body.input_mode = input_mode;
+    }
     return request('/sessions', {
       method: 'POST',
-      body: JSON.stringify({ target_name, input_mode }),
+      body: JSON.stringify(body),
     });
   },
 
@@ -298,6 +319,20 @@ export const api = {
     return request('/admin/targets/reload', { method: 'POST' });
   },
 
+  // ── Admin: users ────────────────────────────────────────────────────────────
+
+  listAdminUsers(): Promise<AdminUserInfo[]> {
+    return request('/admin/users');
+  },
+
+  enableAdminUser(id: string): Promise<AdminUserInfo> {
+    return request(`/admin/users/${id}/enable`, { method: 'POST' });
+  },
+
+  disableAdminUser(id: string): Promise<AdminUserInfo> {
+    return request(`/admin/users/${id}/disable`, { method: 'POST' });
+  },
+
   // ── Email auth ──────────────────────────────────────────────────────────────
 
   /** Register a new account. Returns 201 on success; 409 if email taken; 503 if SMTP not configured. */
@@ -354,6 +389,10 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(params),
     });
+  },
+
+  getUserTarget(id: string): Promise<UserTargetInfo> {
+    return request(`/user-targets/${id}`);
   },
 
   deleteUserTarget(id: string): Promise<void> {

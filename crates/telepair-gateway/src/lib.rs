@@ -12,7 +12,7 @@ use axum::{
     Router,
     body::Body,
     http::{HeaderValue, Request, Response, StatusCode, header},
-    routing::{delete, get, post, put},
+    routing::{delete, get, post},
 };
 use bytes::Bytes;
 use state::AppState;
@@ -116,7 +116,9 @@ pub fn build_router_with_options(
         .route("/api/user-targets", post(http::create_user_target))
         .route(
             "/api/user-targets/{id}",
-            put(http::update_user_target).delete(http::delete_user_target),
+            get(http::get_user_target)
+                .put(http::update_user_target)
+                .delete(http::delete_user_target),
         )
         .route(
             "/api/sessions",
@@ -144,6 +146,15 @@ pub fn build_router_with_options(
         // the prefix.
         .route("/api/admin/targets", get(http::list_admin_targets))
         .route("/api/admin/targets/reload", post(http::reload_targets))
+        .route("/api/admin/users", get(http::list_admin_users))
+        .route(
+            "/api/admin/users/{id}/enable",
+            post(http::enable_admin_user),
+        )
+        .route(
+            "/api/admin/users/{id}/disable",
+            post(http::disable_admin_user),
+        )
         .route("/ws/session/{session_id}", get(ws::ws_handler))
         .layer(cors)
         .with_state(state);

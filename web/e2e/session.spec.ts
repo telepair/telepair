@@ -67,7 +67,7 @@ test.describe('Session page', () => {
 
     await page.locator('.back-btn').click();
     await expect(page).toHaveURL('/');
-    await expect(page.getByRole('heading', { name: 'Targets' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Targets', exact: true })).toBeVisible();
   });
 
   test('participants list shows current user', async ({ page }) => {

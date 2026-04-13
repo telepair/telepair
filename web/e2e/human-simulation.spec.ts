@@ -36,6 +36,8 @@ test('01 · unauthenticated visitor lands on login page', async ({ page }, testI
 // ─── 2. Wrong token → error message ───────────────────────────────────────
 test('02 · wrong token shows inline error', async ({ page }, testInfo) => {
   await page.goto('/login');
+  // Switch to the token tab (login page defaults to email mode).
+  await page.getByRole('tab', { name: /admin token/i }).click();
   await page.locator('#token').fill('definitely-wrong-token');
   await snap(testInfo, page, '02-token-filled');
 
@@ -50,7 +52,7 @@ test('02 · wrong token shows inline error', async ({ page }, testInfo) => {
 test('03 · correct token redirects to dashboard with targets', async ({ page }, testInfo) => {
   await login(page);
 
-  await expect(page.getByRole('heading', { name: 'Targets' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Targets', exact: true })).toBeVisible();
   await snap(testInfo, page, '03-dashboard-logged-in');
 
   // At least one target card visible
@@ -355,7 +357,7 @@ test('16 · back button navigates to dashboard', async ({ page }, testInfo) => {
 
   await page.locator('.back-btn').click();
   await expect(page).toHaveURL('/');
-  await expect(page.getByRole('heading', { name: 'Targets' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Targets', exact: true })).toBeVisible();
   await snap(testInfo, page, '16-back-on-dashboard');
 });
 
