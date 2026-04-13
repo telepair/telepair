@@ -19,6 +19,7 @@ export const ErrorCode = {
    * Paired with `CloseCode.TRANSIENT` on the close frame.
    */
   STORAGE_ERROR: 'STORAGE_ERROR',
+  SESSION_DISABLED: 'SESSION_DISABLED',
 } as const;
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
 
@@ -165,6 +166,13 @@ export const AuditEventType = {
   INVITE_REVOKED: 'invite.revoked',
   TARGET_ACCESS_DENIED: 'target.access_denied',
   TARGET_RELOADED: 'target.reloaded',
+  AUTH_LOGIN_FAILED: 'auth.login_failed',
+  AUTH_REGISTER_REJECTED: 'auth.register_rejected',
+  AUTH_REGISTER_COMPLETED: 'auth.register_completed',
+  AUTH_VERIFY_FAILED: 'auth.verify_failed',
+  AUTH_USER_ENABLED: 'auth.user_enabled',
+  AUTH_USER_DISABLED: 'auth.user_disabled',
+  AUTH_SESSION_ACCESS_DENIED: 'auth.session_access_denied',
 } as const;
 export type AuditEventType = (typeof AuditEventType)[keyof typeof AuditEventType];
 

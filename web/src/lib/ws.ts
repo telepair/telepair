@@ -164,7 +164,7 @@ export class TelepairSocket {
 
   sendInput(data: Uint8Array) {
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(data);
+      this.ws.send(data as Uint8Array<ArrayBuffer>);
     }
   }
 

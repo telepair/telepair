@@ -93,12 +93,16 @@ impl AuthService {
     /// distinguish "we sent you a code" from "this address already
     /// has an account" — the audit log captures the precise reason.
     pub async fn register(&self, email: &str, password: &str, display_name: &str) -> Result<()> {
+        let email = email.to_lowercase();
+        let email = email.as_str();
         let mailer = self.mailer.as_ref().ok_or_else(|| {
             Error::ServiceUnavailable(
                 "This instance has not configured email sending. Contact the administrator.".into(),
             )
         })?;
-        let smtp_from = self.smtp_from.as_deref().unwrap();
+        let smtp_from = self.smtp_from.as_deref().ok_or_else(|| {
+            Error::Internal("SMTP from address missing despite mailer being configured".into())
+        })?;
 
         // Enumeration safety: if the address already maps to a real
         // user row, do not write a pending row and do not send a code.
@@ -144,10 +148,12 @@ impl AuthService {
         if let Err(send_err) = send_otp_email(mailer, smtp_from, email, &code).await {
             // SMTP failed: drop the pending row so the next register
             // attempt is not held off by the 60-second rate limit on
-            // a code that was never delivered. Rollback failures are
-            // logged but do not mask the original SMTP error — the
-            // caller still sees the user-actionable ServiceUnavailable.
-            if let Err(rollback_err) = self.storage.delete_pending_registration(email).await {
+            // a code that was never delivered. The compare-and-delete
+            // (`email + otp_code`) ensures a concurrent registration
+            // that already overwrote the row with a new OTP is not
+            // affected by this rollback.
+            if let Err(rollback_err) = self.storage.delete_pending_registration(email, &code).await
+            {
                 tracing::warn!(
                     %email,
                     "failed to roll back pending registration after SMTP failure: {rollback_err}",
@@ -166,10 +172,18 @@ impl AuthService {
     /// audit log so an operator can distinguish stuffing attempts
     /// from genuine typos.
     pub async fn verify_otp(&self, email: &str, code: &str) -> Result<String> {
-        let outcome = self
-            .storage
-            .verify_pending_registration(email, code)
-            .await?;
+        let email = email.to_lowercase();
+        let email = email.as_str();
+        let outcome = match self.storage.verify_pending_registration(email, code).await {
+            Ok(r) => r,
+            Err(Error::Conflict(msg)) => {
+                tracing::warn!(%email, %msg, "display name collision during OTP verify");
+                self.audit_verify_failed(email, "display_name_conflict", None)
+                    .await;
+                return Err(Error::Auth(GENERIC_AUTH_ERROR.into()));
+            }
+            Err(e) => return Err(e),
+        };
         match outcome {
             PendingVerifyResult::Success { user, raw_token } => {
                 self.audit_register_completed(user.id, &user.name, email)
@@ -226,6 +240,8 @@ impl AuthService {
     /// token whenever `session_enabled = FALSE`. Conflating the two
     /// gates here would block a legitimate password reset flow.
     pub async fn login(&self, email: &str, password: &str) -> Result<String> {
+        let email = email.to_lowercase();
+        let email = email.as_str();
         let user = match self.storage.get_user_by_email(email).await? {
             Some(u) => u,
             None => {

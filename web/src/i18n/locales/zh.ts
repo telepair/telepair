@@ -241,6 +241,13 @@ export const zh: Dict = {
     event_invite_revoked: '撤销邀请',
     event_target_access_denied: '目标访问被拒绝',
     event_target_reloaded: '目标已重载',
+    event_auth_login_failed: '登录失败',
+    event_auth_register_rejected: '注册被拒绝',
+    event_auth_register_completed: '注册完成',
+    event_auth_verify_failed: '验证失败',
+    event_auth_user_enabled: '用户已启用',
+    event_auth_user_disabled: '用户已禁用',
+    event_auth_session_access_denied: '会话访问被拒绝',
   },
   chat: {
     heading: '聊天',

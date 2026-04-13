@@ -117,7 +117,9 @@ pub struct RegisterRequest {
 }
 
 /// `POST /api/auth/register` — create unverified account and send OTP.
-/// Returns 503 if SMTP is not configured, 409 if email is taken.
+/// Returns 503 if SMTP is not configured. Always returns 201 otherwise
+/// (enumeration safety: callers cannot distinguish "sent" from "already
+/// registered").
 pub async fn register(
     State(state): State<AppState>,
     body: Result<Json<RegisterRequest>, JsonRejection>,

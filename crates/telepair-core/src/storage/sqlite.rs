@@ -431,9 +431,9 @@ impl SqliteStorage {
     /// assertions can verify inserts landed.
     pub async fn get_user(&self, id: Uuid) -> Result<Option<User>> {
         let row = sqlx::query(&format!("SELECT {USER_COLS} FROM users WHERE id = ?"))
-        .bind(id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
 
         row.map(|r| row_to_user(&r)).transpose()
     }
@@ -506,9 +506,9 @@ impl Storage for SqliteStorage {
 
     async fn get_user_by_name(&self, name: &str) -> Result<Option<User>> {
         let row = sqlx::query(&format!("SELECT {USER_COLS} FROM users WHERE name = ?"))
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
 
         row.map(|r| row_to_user(&r)).transpose()
     }
@@ -1327,9 +1327,9 @@ impl Storage for SqliteStorage {
         otp_expires_at: DateTime<Utc>,
     ) -> Result<()> {
         // Single statement: insert or replace the pending row keyed by
-        // email. Reset `otp_failure_count` and `created_at` on overwrite
-        // so a re-register from the same address starts a clean
-        // 5-strike window — the previous attempt's lockout state is
+        // email. Reset `otp_failure_count` on overwrite so a re-register
+        // from the same address starts a clean 5-strike window — the
+        // previous attempt's lockout state is
         // intentionally discarded because re-registration is the
         // user-driven recovery path. The pending row carries no
         // authority of its own (no `users` row, no token), so
@@ -1369,9 +1369,10 @@ impl Storage for SqliteStorage {
         parse_optional_datetime(row, "pending_registrations.updated_at")
     }
 
-    async fn delete_pending_registration(&self, email: &str) -> Result<()> {
-        sqlx::query("DELETE FROM pending_registrations WHERE email = ?")
+    async fn delete_pending_registration(&self, email: &str, otp_code: &str) -> Result<()> {
+        sqlx::query("DELETE FROM pending_registrations WHERE email = ? AND otp_code = ?")
             .bind(email)
+            .bind(otp_code)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -1554,9 +1555,9 @@ impl Storage for SqliteStorage {
 
     async fn get_user_by_email(&self, email: &str) -> Result<Option<User>> {
         let row = sqlx::query(&format!("SELECT {USER_COLS} FROM users WHERE email = ?"))
-        .bind(email)
-        .fetch_optional(&self.pool)
-        .await?;
+            .bind(email)
+            .fetch_optional(&self.pool)
+            .await?;
         row.map(|r| row_to_user(&r)).transpose()
     }
 
@@ -1575,9 +1576,9 @@ impl Storage for SqliteStorage {
 
     async fn find_user_by_id(&self, user_id: Uuid) -> Result<Option<User>> {
         let row = sqlx::query(&format!("SELECT {USER_COLS} FROM users WHERE id = ?"))
-        .bind(user_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
+            .bind(user_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
         row.map(|r| row_to_user(&r)).transpose()
     }
 
@@ -2225,7 +2226,8 @@ mod tests {
                 .is_some()
         );
 
-        s.delete_pending_registration("rb@example.com")
+        // Matching OTP deletes the row.
+        s.delete_pending_registration("rb@example.com", "111111")
             .await
             .unwrap();
 
@@ -2233,7 +2235,37 @@ mod tests {
             s.latest_pending_registration_at("rb@example.com")
                 .await
                 .unwrap()
-                .is_none()
+                .is_none(),
+            "matching OTP must delete the pending row"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_pending_registration_skips_mismatched_otp() {
+        // A concurrent registration may have overwritten the row with a
+        // new OTP. The rollback must not delete the newer row.
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let expires = Utc::now() + chrono::Duration::minutes(15);
+        s.upsert_pending_registration("race@example.com", "r", "h", "111111", expires)
+            .await
+            .unwrap();
+        // Simulate concurrent overwrite with a new OTP.
+        s.upsert_pending_registration("race@example.com", "r", "h", "222222", expires)
+            .await
+            .unwrap();
+
+        // Rollback from the first request uses the stale OTP.
+        s.delete_pending_registration("race@example.com", "111111")
+            .await
+            .unwrap();
+
+        // The row with the newer OTP must survive.
+        assert!(
+            s.latest_pending_registration_at("race@example.com")
+                .await
+                .unwrap()
+                .is_some(),
+            "mismatched OTP must not delete the concurrent registration's row"
         );
     }
 

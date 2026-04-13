@@ -19,7 +19,7 @@ export default function Register() {
 
   const handleRegister = async (e: Event) => {
     e.preventDefault();
-    const ok = await auth.emailRegister(name(), email(), password());
+    const ok = await auth.emailRegister(email(), password(), name());
     if (ok) setStep('otp');
   };
 
@@ -32,7 +32,7 @@ export default function Register() {
   return (
     <div class="register-page">
       <div class="register-card">
-        <h1>telepair</h1>
+        <h1>TELEPAIR</h1>
 
         <Show when={step() === 'form'}>
           <p class="subtitle">{t('register.subtitle')}</p>

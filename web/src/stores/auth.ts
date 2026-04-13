@@ -283,8 +283,9 @@ async function emailRegister(
     return true;
   } catch (e) {
     if (e instanceof ApiError) {
-      if (e.status === 409) setErrorKey('auth.error_email_taken');
-      else if (e.status === 503) setErrorKey('auth.error_smtp_unavailable');
+      if (e.status === 503) setErrorKey('auth.error_smtp_unavailable');
+      else if (e.status === 409) setErrorKey('auth.error_email_taken');
+      else if (e.status === 429) setErrorKey('auth.error_rate_limited');
       else setErrorKey('auth.error_connection_failed');
     } else {
       setErrorKey('auth.error_connection_failed');
@@ -309,8 +310,9 @@ async function emailVerifyOtp(email: string, code: string): Promise<boolean> {
     return true;
   } catch (e) {
     if (e instanceof ApiError) {
-      if (e.status === 429) setErrorKey('auth.error_otp_locked');
-      else if (e.status === 400 || e.status === 401) setErrorKey('auth.error_invalid_otp');
+      if (e.status === 400 || e.status === 401) setErrorKey('auth.error_invalid_otp');
+      else if (e.status === 403) setErrorKey('auth.error_otp_locked');
+      else if (e.status === 429) setErrorKey('auth.error_rate_limited');
       else setErrorKey('auth.error_connection_failed');
     } else {
       setErrorKey('auth.error_connection_failed');
@@ -336,6 +338,7 @@ async function emailLogin(email: string, password: string): Promise<boolean> {
     if (e instanceof ApiError) {
       if (e.status === 401) setErrorKey('auth.error_invalid_credentials');
       else if (e.status === 403) setErrorKey('auth.error_not_verified');
+      else if (e.status === 429) setErrorKey('auth.error_rate_limited');
       else setErrorKey('auth.error_connection_failed');
     } else {
       setErrorKey('auth.error_connection_failed');
@@ -368,6 +371,10 @@ function logoutAndRedirect() {
   }
 }
 
+function clearError() {
+  setErrorKey(null);
+}
+
 function isAuthenticated(): boolean {
   return token().length > 0;
 }
@@ -387,6 +394,7 @@ export const auth = {
   emailVerifyOtp,
   emailLogin,
   loadIdentity,
+  clearError,
   logout,
   logoutAndRedirect,
   isAuthenticated,

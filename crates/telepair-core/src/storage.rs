@@ -211,11 +211,13 @@ pub trait Storage: Send + Sync {
     /// any. Used by the auth service's 60-second OTP rate limit.
     async fn latest_pending_registration_at(&self, email: &str) -> Result<Option<DateTime<Utc>>>;
 
-    /// Delete the pending row for `email`, if any. Used by the
-    /// SMTP-failure rollback path so a user whose code was never
-    /// delivered is not stranded behind the rate limit on a row that
-    /// no one can verify.
-    async fn delete_pending_registration(&self, email: &str) -> Result<()>;
+    /// Delete the pending row for `email` only if its OTP matches
+    /// `otp_code`. Used by the SMTP-failure rollback path so a user
+    /// whose code was never delivered is not stranded behind the rate
+    /// limit on a row that no one can verify. The compare-and-delete
+    /// prevents a concurrent registration from losing its valid OTP
+    /// when an earlier request's SMTP send fails and rolls back.
+    async fn delete_pending_registration(&self, email: &str, otp_code: &str) -> Result<()>;
 
     /// Atomically verify a pending registration's OTP. On
     /// [`PendingVerifyResult::Success`] the pending row is consumed
