@@ -134,6 +134,7 @@ export type ServerMessage =
   | { type: 'SessionState'; session: Session; participants: ParticipantInfo[]; your_role: Role; your_user_id: string }
   | { type: 'PeerJoined'; user_id: string; name: string; role: Role; color: string }
   | { type: 'PeerLeft'; user_id: string }
+  | { type: 'PeerRoleChanged'; user_id: string; new_role: Role }
   | { type: 'PeerCursor'; user_id: string; x: number; y: number }
   | { type: 'PeerChat'; user_id: string; name: string; text: string; ts: string }
   | { type: 'InputDenied'; reason: InputDeniedReason }
@@ -173,6 +174,8 @@ export const AuditEventType = {
   AUTH_USER_ENABLED: 'auth.user_enabled',
   AUTH_USER_DISABLED: 'auth.user_disabled',
   AUTH_SESSION_ACCESS_DENIED: 'auth.session_access_denied',
+  AUTH_PASSWORD_CHANGED: 'auth.password_changed',
+  PARTICIPANT_ROLE_CHANGED: 'participant.role_changed',
 } as const;
 export type AuditEventType = (typeof AuditEventType)[keyof typeof AuditEventType];
 

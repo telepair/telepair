@@ -57,6 +57,8 @@ const AUDIT_EVENT_LABEL_KEYS: Record<AuditEventType, TranslationKey> = {
   [AuditEventType.AUTH_USER_ENABLED]: 'session_detail.event_auth_user_enabled',
   [AuditEventType.AUTH_USER_DISABLED]: 'session_detail.event_auth_user_disabled',
   [AuditEventType.AUTH_SESSION_ACCESS_DENIED]: 'session_detail.event_auth_session_access_denied',
+  [AuditEventType.AUTH_PASSWORD_CHANGED]: 'session_detail.event_auth_password_changed',
+  [AuditEventType.PARTICIPANT_ROLE_CHANGED]: 'session_detail.event_participant_role_changed',
 };
 
 function eventLabel(t: Translator, type: string): string {

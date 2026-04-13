@@ -10,9 +10,12 @@ import type { TargetInfo, Session, InputMode, SessionStatus } from '../lib/proto
  *  `api.listSessions` already handles. */
 export type SessionsFilter = SessionStatus | 'all';
 
+const SESSION_PAGE_SIZE = 50;
+
 const [targets, setTargets] = createSignal<TargetInfo[]>([]);
 const [sessions, setSessions] = createSignal<Session[]>([]);
 const [loading, setLoading] = createSignal(false);
+const [hasMoreSessions, setHasMoreSessions] = createSignal(true);
 // The filter the last refresh ran with. Exposed so the Dashboard can
 // reflect the active tab without threading it through component props
 // — switching tabs calls `fetchSessions(nextFilter)` and the tab
@@ -73,15 +76,37 @@ async function fetchSessions(
   if (targetName) {
     opts.targetName = targetName;
   }
+  opts.limit = SESSION_PAGE_SIZE;
+  opts.offset = 0;
   try {
     const data = await api.listSessions(opts);
     setSessions(data);
+    setHasMoreSessions(data.length >= SESSION_PAGE_SIZE);
   } catch {
     // On failure, drop any rows from the previous filter. Leaving
     // them in place would render (say) active rows under the Closed
     // tab because the Closed fetch 500'd mid-switch — an empty list
     // is strictly better than showing the wrong bucket.
     setSessions([]);
+    setHasMoreSessions(false);
+  }
+}
+
+async function loadMoreSessions() {
+  const opts: ListSessionsOptions =
+    currentFilter() === 'all' ? { status: 'all' } : { status: currentFilter() };
+  const target = currentTargetFilter();
+  if (target) {
+    opts.targetName = target;
+  }
+  opts.limit = SESSION_PAGE_SIZE;
+  opts.offset = sessions().length;
+  try {
+    const data = await api.listSessions(opts);
+    setSessions((prev) => [...prev, ...data]);
+    setHasMoreSessions(data.length >= SESSION_PAGE_SIZE);
+  } catch {
+    setHasMoreSessions(false);
   }
 }
 
@@ -110,10 +135,12 @@ export const sessionStore = {
   targets,
   sessions,
   loading,
+  hasMoreSessions,
   currentFilter,
   currentTargetFilter,
   fetchTargets,
   fetchSessions,
+  loadMoreSessions,
   createSession,
   refresh,
 };

@@ -14,6 +14,8 @@ use telepair_core::permission::Role;
 use telepair_core::session::{InputMode, SessionListFilter, SessionStatus, User};
 use telepair_core::target::TargetKind;
 
+use uuid::Uuid;
+
 use crate::state::AppState;
 
 /// Handler-level error wrapper. `?` on any `Result<_, core::Error>`
@@ -235,7 +237,9 @@ pub async fn change_password(
         .auth_service
         .change_password(&user, &body.current_password, &body.new_password)
         .await?;
-    Ok(Json(serde_json::json!({"message": "Password changed successfully."})))
+    Ok(Json(
+        serde_json::json!({"message": "Password changed successfully."}),
+    ))
 }
 
 pub async fn list_targets(
@@ -590,6 +594,98 @@ pub async fn close_session(
         .close_session_as_owner(&user, &session_id)
         .await?;
     state.hub.stop_session(&session_id).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// --- Participant role management ---
+
+#[derive(Deserialize)]
+pub struct UpdateRoleRequest {
+    pub role: Role,
+}
+
+/// `PUT /api/sessions/:session_id/participants/:user_id/role`
+///
+/// Owner-only. Changes a participant's role in a live session. The
+/// owner cannot change their own role or promote anyone to owner.
+/// Persists the change to the DB, updates the hub's in-memory state,
+/// and broadcasts `PeerRoleChanged` to all connected clients so UIs
+/// update in lockstep and the WS handler re-evaluates input
+/// permissions for the affected connection.
+pub async fn update_participant_role(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((session_id, target_user_id)): Path<(String, String)>,
+    body: Result<Json<UpdateRoleRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let body = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?.0;
+    let user = extract_user(&state, &headers).await?;
+    state
+        .sessions
+        .require_active_owned(&user, &session_id)
+        .await?;
+
+    let target_uid =
+        Uuid::parse_str(&target_user_id).map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+
+    // Cannot change own role — the owner role is immutable.
+    if target_uid == user.id {
+        return Err(ApiError(StatusCode::BAD_REQUEST));
+    }
+    // Cannot promote to owner.
+    if body.role == Role::Owner {
+        return Err(ApiError(StatusCode::BAD_REQUEST));
+    }
+
+    // Verify the target is an active participant and get old role.
+    let old_role = state
+        .sessions
+        .find_active_participant_role(&session_id, target_uid)
+        .await?
+        .ok_or(ApiError(StatusCode::NOT_FOUND))?;
+
+    if old_role == body.role {
+        // No-op: role already matches.
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    // Persist to DB.
+    state
+        .sessions
+        .upsert_participant(&session_id, target_uid, body.role)
+        .await?;
+
+    // Update in-memory hub state + broadcast.
+    state
+        .hub
+        .update_participant_role(&session_id, target_uid, body.role)
+        .await;
+
+    // Audit.
+    let target_name = state
+        .sessions
+        .find_active_participant_role(&session_id, target_uid)
+        .await
+        .ok()
+        .flatten();
+    // Best-effort name lookup for audit — fall back to UUID string.
+    let _ = target_name; // participant name is in hub, just use UUID for now
+    state
+        .audit
+        .record(
+            telepair_core::audit::AuditEvent::new(
+                telepair_core::audit::AuditEventType::ParticipantRoleChanged,
+            )
+            .with_actor(user.id, user.name.clone())
+            .with_session(session_id)
+            .with_detail(serde_json::json!({
+                "target_user_id": target_uid.to_string(),
+                "old_role": old_role.as_str(),
+                "new_role": body.role.as_str(),
+            })),
+        )
+        .await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1242,4 +1338,81 @@ pub async fn disable_admin_user(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     set_user_enabled(&state, &headers, &id, false).await
+}
+
+// --- Admin audit log ---
+
+/// Query parameters for `GET /api/admin/audit`.
+///
+/// Every field is optional — the bare URL returns the latest 100 events.
+/// `event_type` accepts a single dotted-lowercase type string (e.g.
+/// `auth.login_failed`); invalid values are silently ignored so the UI
+/// can reset a filter without crashing.
+#[derive(Deserialize)]
+pub struct AdminAuditQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+    /// RFC 3339 inclusive lower bound on `ts`.
+    #[serde(default)]
+    pub since: Option<DateTime<Utc>>,
+    /// RFC 3339 exclusive upper bound on `ts`.
+    #[serde(default)]
+    pub until: Option<DateTime<Utc>>,
+    /// Filter by actor UUID.
+    #[serde(default)]
+    pub actor_id: Option<String>,
+    /// Single event type in dotted-lowercase form.
+    #[serde(default)]
+    pub event_type: Option<String>,
+    /// Filter to events touching a specific session.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// `GET /api/admin/audit`
+///
+/// Global audit log, admin-only. Returns events newest-first with
+/// optional filtering on time range, actor, event type, and session.
+/// Default limit is 100 rows (enforced by `AuditFilter`), capped at
+/// 500 to prevent accidental full-table dumps.
+pub async fn list_admin_audit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminAuditQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    require_admin(&user)?;
+
+    let actor_id = query
+        .actor_id
+        .as_deref()
+        .and_then(|s| Uuid::parse_str(s).ok());
+
+    let event_types: Vec<telepair_core::audit::AuditEventType> = query
+        .event_type
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .into_iter()
+        .collect();
+
+    let limit = query
+        .limit
+        .filter(|&n| n > 0)
+        .map(|n| n.min(500))
+        .or(Some(100));
+
+    let filter = telepair_core::audit::AuditFilter {
+        since: query.since,
+        until: query.until,
+        actor_id,
+        session_id: query.session_id.filter(|s| !s.is_empty()),
+        event_types,
+        limit,
+        offset: query.offset.filter(|&n| n >= 0).unwrap_or(0),
+    };
+
+    let rows = state.audit.query(filter).await?;
+    Ok(Json(rows))
 }

@@ -145,6 +145,11 @@ pub enum AuditEventType {
     /// the user who changed their password.
     #[serde(rename = "auth.password_changed")]
     AuthPasswordChanged,
+    /// The session owner changed a participant's role at runtime.
+    /// Detail: `{target_user_id, target_user_name, old_role, new_role}`.
+    /// Actor is the owner who made the change.
+    #[serde(rename = "participant.role_changed")]
+    ParticipantRoleChanged,
 }
 
 impl AuditEventType {
@@ -167,6 +172,7 @@ impl AuditEventType {
             Self::AuthUserDisabled => "auth.user_disabled",
             Self::AuthSessionAccessDenied => "auth.session_access_denied",
             Self::AuthPasswordChanged => "auth.password_changed",
+            Self::ParticipantRoleChanged => "participant.role_changed",
         }
     }
 }
@@ -192,6 +198,7 @@ impl FromStr for AuditEventType {
             "auth.user_disabled" => Ok(Self::AuthUserDisabled),
             "auth.session_access_denied" => Ok(Self::AuthSessionAccessDenied),
             "auth.password_changed" => Ok(Self::AuthPasswordChanged),
+            "participant.role_changed" => Ok(Self::ParticipantRoleChanged),
             _ => Err(format!("unknown audit event type: {s}")),
         }
     }

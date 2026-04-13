@@ -45,6 +45,7 @@ export default function Dashboard() {
   const [lastMode, setLastMode] = createSignal<InputMode>('multiplexed');
   const [pendingTarget, setPendingTarget] = createSignal<TargetInfo | null>(null);
   const [launching, setLaunching] = createSignal(false);
+  const [loadingMore, setLoadingMore] = createSignal(false);
   // Selected session for the audit-timeline dialog. `null` keeps the
   // dialog closed; setting a closed-session row opens it. Active rows
   // still navigate to the live session page below — the dialog is the
@@ -274,6 +275,14 @@ export default function Dashboard() {
             >
               {t('dashboard.admin_targets_link')}
             </a>
+            <a
+              class="admin-link"
+              href="/admin/audit"
+              aria-label={t('dashboard.admin_audit_link_aria')}
+              data-testid="admin-audit-link"
+            >
+              {t('dashboard.admin_audit_link')}
+            </a>
           </Show>
           <Show when={!auth.currentUserIsGuest() && !auth.currentUserIsAdmin()}>
             <a class="admin-link" href="/change-password">
@@ -501,6 +510,29 @@ export default function Dashboard() {
                   />
                 )}
               </For>
+            </div>
+            <div class="session-load-more">
+              <Show
+                when={sessionStore.hasMoreSessions()}
+                fallback={
+                  <Show when={orderedSessions().length > 0}>
+                    <span class="muted">{t('dashboard.sessions_no_more')}</span>
+                  </Show>
+                }
+              >
+                <button
+                  type="button"
+                  class="load-more-btn"
+                  onClick={async () => {
+                    setLoadingMore(true);
+                    try { await sessionStore.loadMoreSessions(); }
+                    finally { setLoadingMore(false); }
+                  }}
+                  disabled={loadingMore()}
+                >
+                  {loadingMore() ? t('dashboard.sessions_loading_more') : t('dashboard.sessions_load_more')}
+                </button>
+              </Show>
             </div>
           </Show>
         </section>
@@ -756,6 +788,22 @@ export default function Dashboard() {
         .session-reason[data-reason='startup'] { color: #cc8; border-color: #cc8; }
         .session-reason[data-reason='error']   { color: #f88; border-color: #f88; }
         .session-reason[data-reason='active']  { color: #8c8; border-color: #8c8; }
+
+        .session-load-more {
+          display: flex;
+          justify-content: center;
+          padding: 12px 0 4px;
+        }
+        .load-more-btn {
+          font-size: 13px;
+          padding: 6px 20px;
+          border-radius: 6px;
+          cursor: pointer;
+        }
+        .load-more-btn:disabled {
+          opacity: 0.6;
+          cursor: default;
+        }
       `}</style>
     </div>
   );
