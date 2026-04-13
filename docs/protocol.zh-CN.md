@@ -167,6 +167,25 @@ Client                              Server
 }
 ```
 
+#### PeerRoleChanged
+
+当会话 owner 通过 `PUT /api/sessions/:id/participants/:user_id/role` 改变
+某个参与者的角色时广播。所有已连接的客户端都会收到,以便参与者列表同步更新。
+WS handler 还会拦截指向当前连接的消息,就地重新计算输入权限,无需重连。
+
+```json
+{
+  "type": "PeerRoleChanged",
+  "user_id": "...",
+  "new_role": "viewer"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `user_id` | string | 角色被变更的参与者 UUID |
+| `new_role` | string | 新角色:`"operator"` 或 `"viewer"` |
+
 #### Error
 
 服务端错误通知。
