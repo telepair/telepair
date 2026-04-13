@@ -317,3 +317,68 @@ describe('auth.loadIdentity', () => {
     expect(auth.identityChecked()).toBe(false);
   });
 });
+
+describe('auth.refreshIdentity', () => {
+  it('forces a fresh whoami even when identity is already cached', async () => {
+    auth.setToken('admin-token', { persist: true });
+    // First load: pending user
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({
+        user_id: 'u1', name: 'alice', is_admin: false, is_guest: false,
+        session_enabled: false,
+      }),
+    );
+    await auth.loadIdentity();
+    expect(auth.currentUserSessionEnabled()).toBe(false);
+
+    // Admin approves, user clicks "Check status"
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({
+        user_id: 'u1', name: 'alice', is_admin: false, is_guest: false,
+        session_enabled: true,
+      }),
+    );
+    await auth.refreshIdentity();
+    expect(auth.currentUserSessionEnabled()).toBe(true);
+  });
+
+  it('no-ops when there is no token', async () => {
+    auth.logout();
+    await auth.refreshIdentity();
+    expect(auth.currentUserId()).toBe('');
+  });
+});
+
+describe('auth.resendOtp', () => {
+  it('calls register endpoint and returns true on success', async () => {
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ message: 'Verification code sent to your email.' }, 201),
+    );
+    const result = await auth.resendOtp('alice@example.com', 'pw123', 'Alice');
+    expect(result).toBe(true);
+    expect(auth.errorKey()).toBeNull();
+    // Verify it hit the register endpoint with the right body
+    const [url, opts] = mockFetch.mock.calls[0];
+    expect(url).toBe('/api/auth/register');
+    expect(opts.method).toBe('POST');
+    expect(JSON.parse(opts.body)).toEqual({
+      email: 'alice@example.com',
+      password: 'pw123',
+      display_name: 'Alice',
+    });
+  });
+
+  it('returns false and sets error on SMTP failure (503)', async () => {
+    mockFetch.mockResolvedValueOnce(new Response('SMTP not configured', { status: 503 }));
+    const result = await auth.resendOtp('a@b.com', 'pw', 'A');
+    expect(result).toBe(false);
+    expect(auth.errorKey()).toBe('auth.error_smtp_unavailable');
+  });
+
+  it('returns false and sets error on network failure', async () => {
+    mockFetch.mockRejectedValueOnce(new Error('offline'));
+    const result = await auth.resendOtp('a@b.com', 'pw', 'A');
+    expect(result).toBe(false);
+    expect(auth.errorKey()).toBe('auth.error_connection_failed');
+  });
+});

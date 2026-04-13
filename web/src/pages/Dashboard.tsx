@@ -34,6 +34,10 @@ export default function Dashboard() {
     status?: string;
   }>();
   const [launchError, setLaunchError] = createSignal('');
+  // Transient banner shown after a "Check status" refresh reveals
+  // the admin has approved the account. Auto-dismissed after a few
+  // seconds or on the next refresh.
+  const [justApproved, setJustApproved] = createSignal(false);
   // Remember the last mode the user picked so the next dialog opens on
   // their preferred default instead of forcing them to re-toggle every
   // time. Persisting across reloads would be nice but isn't worth a
@@ -110,7 +114,12 @@ export default function Dashboard() {
     return me.length > 0 && session.owner_id === me;
   };
 
+  // Non-admin users with session_enabled=false cannot launch sessions.
+  const canLaunch = () =>
+    auth.currentUserSessionEnabled() !== false || auth.currentUserIsAdmin() === true;
+
   const handleCardClick = (target: TargetInfo) => {
+    if (!canLaunch()) return;
     setLaunchError('');
     setPendingTarget(target);
   };
@@ -266,6 +275,11 @@ export default function Dashboard() {
               {t('dashboard.admin_targets_link')}
             </a>
           </Show>
+          <Show when={!auth.currentUserIsGuest() && !auth.currentUserIsAdmin()}>
+            <a class="admin-link" href="/change-password">
+              {t('dashboard.change_password_link')}
+            </a>
+          </Show>
           <button
             class="refresh-btn"
             onClick={handleRefresh}
@@ -285,8 +299,27 @@ export default function Dashboard() {
         </Banner>
       </Show>
 
+      <Show when={justApproved()}>
+        <Banner variant="success" role="status" onDismiss={() => setJustApproved(false)}>
+          {t('dashboard.pending_approved')}
+        </Banner>
+      </Show>
+
       <Show when={auth.currentUserSessionEnabled() === false && !auth.currentUserIsAdmin()}>
-        <Banner variant="warning" role="status">
+        <Banner
+          variant="warning"
+          role="status"
+          action={{
+            label: t('dashboard.pending_check_status'),
+            onClick: async () => {
+              await auth.refreshIdentity();
+              if (auth.currentUserSessionEnabled() !== false) {
+                setJustApproved(true);
+                sessionStore.refresh();
+              }
+            },
+          }}
+        >
           {t('dashboard.pending_approval_banner')}
         </Banner>
       </Show>
@@ -322,8 +355,10 @@ export default function Dashboard() {
                   {(target) => (
                     <button
                       type="button"
-                      class="target-card"
+                      class={`target-card${canLaunch() ? '' : ' target-card-disabled'}`}
                       onClick={() => handleCardClick(target)}
+                      disabled={!canLaunch()}
+                      title={canLaunch() ? undefined : t('dashboard.pending_target_disabled')}
                     >
                       <div class="target-name">{target.display}</div>
                       <div class="target-id">{target.name}</div>
@@ -367,8 +402,10 @@ export default function Dashboard() {
                     <div class="target-card user-target-card">
                       <button
                         type="button"
-                        class="target-card-body"
+                        class={`target-card-body${canLaunch() ? '' : ' target-card-disabled'}`}
                         onClick={() => handleCardClick(target)}
+                        disabled={!canLaunch()}
+                        title={canLaunch() ? undefined : t('dashboard.pending_target_disabled')}
                       >
                         <div class="target-name">{target.display}</div>
                         <div class="target-id">{target.name}</div>
@@ -594,8 +631,12 @@ export default function Dashboard() {
           font: inherit;
           color: inherit;
         }
-        .target-card:hover { border-color: var(--accent); }
+        .target-card:hover:not(:disabled) { border-color: var(--accent); }
         .target-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+        .target-card-disabled {
+          opacity: 0.5;
+          cursor: not-allowed;
+        }
         /* User-owned target card: wrapper div, with a launch button body and an edit icon */
         .user-target-card {
           position: relative;
