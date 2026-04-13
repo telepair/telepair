@@ -2,6 +2,7 @@
 import { createSignal, onCleanup, Show } from 'solid-js';
 import { useNavigate } from '@solidjs/router';
 import { auth } from '../stores/auth';
+import { MIN_PASSWORD_LENGTH } from '../lib/protocol';
 import { useI18n, renderTemplate } from '../i18n';
 import LocaleSwitcher from '../components/LocaleSwitcher';
 
@@ -43,6 +44,10 @@ export default function Register() {
 
   const handleRegister = async (e: Event) => {
     e.preventDefault();
+    if (password().length < MIN_PASSWORD_LENGTH) {
+      auth.setErrorKey('auth.error_password_too_short');
+      return;
+    }
     const ok = await auth.emailRegister(email(), password(), name());
     if (ok) {
       setStep('otp');

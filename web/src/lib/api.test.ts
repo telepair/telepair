@@ -234,6 +234,18 @@ describe('401 auth-expired interceptor', () => {
     expect(onExpired).not.toHaveBeenCalled();
   });
 
+  it('does NOT invoke the handler on a 401 from change-password (wrong current password is not session expiry)', async () => {
+    auth.setToken('valid-token');
+    const onExpired = vi.fn();
+    __setAuthExpiredHandler(onExpired);
+    mockFetch.mockResolvedValueOnce(errorResponse('Current password is incorrect.', 401));
+
+    await expect(
+      api.changePassword('wrong-pw', 'new-pw-12345'),
+    ).rejects.toThrow(ApiError);
+    expect(onExpired).not.toHaveBeenCalled();
+  });
+
   it('does NOT invoke the handler on non-401 errors', async () => {
     const onExpired = vi.fn();
     __setAuthExpiredHandler(onExpired);

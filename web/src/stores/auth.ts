@@ -100,6 +100,7 @@ export type AuthErrorKey =
   | 'auth.error_not_verified'
   | 'auth.error_rate_limited'
   | 'auth.error_smtp_unavailable'
+  | 'auth.error_password_too_short'
   | null;
 
 const [token, setTokenSignal] = createSignal(readInitialToken());
@@ -295,7 +296,8 @@ async function emailRegister(
     return true;
   } catch (e) {
     if (e instanceof ApiError) {
-      if (e.status === 503) setErrorKey('auth.error_smtp_unavailable');
+      if (e.status === 400) setErrorKey('auth.error_password_too_short');
+      else if (e.status === 503) setErrorKey('auth.error_smtp_unavailable');
       else if (e.status === 409) setErrorKey('auth.error_email_taken');
       else if (e.status === 429) setErrorKey('auth.error_rate_limited');
       else setErrorKey('auth.error_connection_failed');
@@ -415,6 +417,7 @@ export const auth = {
   resendOtp,
   loadIdentity,
   refreshIdentity,
+  setErrorKey,
   clearError,
   logout,
   logoutAndRedirect,

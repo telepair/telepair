@@ -64,6 +64,7 @@ const PUBLIC_PATHS = new Set<string>([
   '/auth/register',
   '/auth/verify',
   '/auth/login',
+  '/auth/change-password',
 ]);
 
 /**

@@ -200,6 +200,9 @@ export function canInput(role: Role, inputMode: InputMode): boolean {
   return false;
 }
 
+/** Must match `MIN_PASSWORD_LENGTH` in auth_service.rs. */
+export const MIN_PASSWORD_LENGTH = 8;
+
 export interface InviteInfo {
   token: string;
   role: Role;
