@@ -1,11 +1,13 @@
 // web/src/pages/Register.tsx
-import { createSignal, Show } from 'solid-js';
+import { createSignal, onCleanup, Show } from 'solid-js';
 import { useNavigate } from '@solidjs/router';
 import { auth } from '../stores/auth';
 import { useI18n, renderTemplate } from '../i18n';
 import LocaleSwitcher from '../components/LocaleSwitcher';
 
-type Step = 'form' | 'otp';
+type Step = 'form' | 'otp' | 'pending';
+
+const RESEND_COOLDOWN_SECS = 60;
 
 export default function Register() {
   const { t } = useI18n();
@@ -17,16 +19,61 @@ export default function Register() {
   const [password, setPassword] = createSignal('');
   const [code, setCode] = createSignal('');
 
+  // Resend countdown state
+  const [countdown, setCountdown] = createSignal(0);
+  const [resending, setResending] = createSignal(false);
+  const [resendFeedback, setResendFeedback] = createSignal('');
+  let countdownTimer: ReturnType<typeof setInterval> | undefined;
+
+  function startCountdown() {
+    clearInterval(countdownTimer);
+    setCountdown(RESEND_COOLDOWN_SECS);
+    countdownTimer = setInterval(() => {
+      setCountdown((prev) => {
+        if (prev <= 1) {
+          clearInterval(countdownTimer);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  }
+
+  onCleanup(() => clearInterval(countdownTimer));
+
   const handleRegister = async (e: Event) => {
     e.preventDefault();
     const ok = await auth.emailRegister(email(), password(), name());
-    if (ok) setStep('otp');
+    if (ok) {
+      setStep('otp');
+      startCountdown();
+    }
+  };
+
+  const handleResend = async () => {
+    if (resending() || countdown() > 0) return;
+    setResending(true);
+    setResendFeedback('');
+    const ok = await auth.resendOtp(email(), password(), name());
+    setResending(false);
+    if (ok) {
+      setResendFeedback(t('register.resend_sent'));
+      setCode('');
+      startCountdown();
+    }
   };
 
   const handleVerify = async (e: Event) => {
     e.preventDefault();
     const ok = await auth.emailVerifyOtp(email(), code());
-    if (ok) navigate('/', { replace: true });
+    if (ok) {
+      // Check if account is pending admin approval
+      if (auth.currentUserSessionEnabled() === false && !auth.currentUserIsAdmin()) {
+        setStep('pending');
+      } else {
+        navigate('/', { replace: true });
+      }
+    }
   };
 
   return (
@@ -34,6 +81,7 @@ export default function Register() {
       <div class="register-card">
         <h1>TELEPAIR</h1>
 
+        {/* ── Step 1: Registration form ── */}
         <Show when={step() === 'form'}>
           <p class="subtitle">{t('register.subtitle')}</p>
 
@@ -88,6 +136,7 @@ export default function Register() {
           </p>
         </Show>
 
+        {/* ── Step 2: OTP verification ── */}
         <Show when={step() === 'otp'}>
           <p class="subtitle">
             {renderTemplate(t('register.otp_subtitle'), { email: <strong>{email()}</strong> })}
@@ -108,6 +157,10 @@ export default function Register() {
               autofocus
             />
 
+            <Show when={resendFeedback()}>
+              <p class="resend-feedback">{resendFeedback()}</p>
+            </Show>
+
             <Show when={auth.errorKey()}>
               {(key) => <p class="error-msg">{t(key())}</p>}
             </Show>
@@ -121,9 +174,39 @@ export default function Register() {
             </button>
           </form>
 
-          <button type="button" class="back-btn" onClick={() => setStep('form')}>
-            {t('register.back')}
-          </button>
+          <div class="otp-actions">
+            <button
+              type="button"
+              class="resend-btn"
+              onClick={handleResend}
+              disabled={resending() || countdown() > 0}
+            >
+              {resending()
+                ? t('register.resend_sending')
+                : countdown() > 0
+                  ? renderTemplate(t('register.resend_countdown'), { seconds: String(countdown()) })
+                  : t('register.resend')}
+            </button>
+            <button type="button" class="back-btn" onClick={() => setStep('form')}>
+              {t('register.back')}
+            </button>
+          </div>
+        </Show>
+
+        {/* ── Step 3: Pending admin approval ── */}
+        <Show when={step() === 'pending'}>
+          <div class="pending-step">
+            <div class="pending-icon">&#10003;</div>
+            <h2>{t('register.pending_title')}</h2>
+            <p class="pending-body">{t('register.pending_body')}</p>
+            <button
+              type="button"
+              class="primary"
+              onClick={() => navigate('/', { replace: true })}
+            >
+              {t('register.pending_go_dashboard')}
+            </button>
+          </div>
         </Show>
 
         <LocaleSwitcher variant="card" />
@@ -180,6 +263,11 @@ export default function Register() {
           font-size: 13px;
           margin-bottom: 12px;
         }
+        .resend-feedback {
+          color: var(--success, #22c55e);
+          font-size: 13px;
+          margin-bottom: 12px;
+        }
         .alt-link {
           margin-top: 16px;
           font-size: 13px;
@@ -193,8 +281,29 @@ export default function Register() {
         .alt-link a:hover {
           text-decoration: underline;
         }
-        .back-btn {
+        .otp-actions {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
           margin-top: 12px;
+        }
+        .resend-btn {
+          background: transparent;
+          border: none;
+          color: var(--accent);
+          font-size: 13px;
+          padding: 4px 8px;
+          cursor: pointer;
+        }
+        .resend-btn:hover:not(:disabled) {
+          text-decoration: underline;
+          background: transparent;
+        }
+        .resend-btn:disabled {
+          color: var(--text-secondary);
+          cursor: default;
+        }
+        .back-btn {
           background: transparent;
           border: none;
           color: var(--text-secondary);
@@ -205,6 +314,35 @@ export default function Register() {
         .back-btn:hover {
           color: var(--accent);
           background: transparent;
+        }
+        .pending-step {
+          padding: 8px 0;
+        }
+        .pending-icon {
+          width: 48px;
+          height: 48px;
+          border-radius: 50%;
+          background: var(--success, #22c55e);
+          color: #fff;
+          font-size: 24px;
+          line-height: 48px;
+          margin: 0 auto 16px;
+        }
+        .pending-step h2 {
+          font-size: 20px;
+          font-weight: 600;
+          margin-bottom: 8px;
+        }
+        .pending-body {
+          color: var(--text-secondary);
+          font-size: 14px;
+          line-height: 1.5;
+          margin-bottom: 20px;
+        }
+        .pending-step button {
+          width: 100%;
+          padding: 10px;
+          font-size: 15px;
         }
       `}</style>
     </div>

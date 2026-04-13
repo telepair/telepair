@@ -128,12 +128,28 @@ impl SqliteStorage {
     /// NOT on the `Storage` trait — callers use `AuthService` which
     /// holds the concrete `SqliteStorage` type.
     pub async fn get_password_hash(&self, user_id: Uuid) -> Result<Option<String>> {
-        let row: Option<String> =
-            sqlx::query_scalar("SELECT password_hash FROM users WHERE id = ?")
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT password_hash FROM users WHERE id = ?")
                 .bind(user_id.to_string())
                 .fetch_optional(&self.pool)
                 .await?;
-        Ok(row)
+        Ok(row.and_then(|(h,)| h))
+    }
+
+    /// Update the password hash for a user. Returns `Error::NotFound`
+    /// if no such user exists.
+    pub async fn update_password_hash(&self, user_id: Uuid, new_hash: &str) -> Result<()> {
+        let rows = sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
+            .bind(new_hash)
+            .bind(now_rfc3339())
+            .bind(user_id.to_string())
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            return Err(Error::InvalidInput(format!("user {user_id} not found")));
+        }
+        Ok(())
     }
 
     /// Disambiguate a `user_targets` UPDATE/DELETE CAS that wrote 0

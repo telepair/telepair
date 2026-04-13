@@ -10,6 +10,7 @@ import Session from './pages/Session';
 import Join from './pages/Join';
 import AdminTargets from './pages/AdminTargets';
 import AdminUsers from './pages/AdminUsers';
+import ChangePassword from './pages/ChangePassword';
 import ToastContainer from './components/Toast';
 
 function AuthGuard(props: { children: any }) {
@@ -70,6 +71,7 @@ export default function App() {
         <Route path="/join/:token" component={Join} />
         <Route path="/" component={() => <AuthGuard><Dashboard /></AuthGuard>} />
         <Route path="/session/:id" component={() => <AuthGuard><Session /></AuthGuard>} />
+        <Route path="/change-password" component={() => <AuthGuard><ChangePassword /></AuthGuard>} />
         <Route
           path="/admin/targets"
           component={() => (

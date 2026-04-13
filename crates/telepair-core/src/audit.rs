@@ -140,6 +140,11 @@ pub enum AuditEventType {
     /// the gated user.
     #[serde(rename = "auth.session_access_denied")]
     AuthSessionAccessDenied,
+    /// An authenticated user changed their own password via the
+    /// change-password endpoint. Detail: `{email}`. Actor is
+    /// the user who changed their password.
+    #[serde(rename = "auth.password_changed")]
+    AuthPasswordChanged,
 }
 
 impl AuditEventType {
@@ -161,6 +166,7 @@ impl AuditEventType {
             Self::AuthUserEnabled => "auth.user_enabled",
             Self::AuthUserDisabled => "auth.user_disabled",
             Self::AuthSessionAccessDenied => "auth.session_access_denied",
+            Self::AuthPasswordChanged => "auth.password_changed",
         }
     }
 }
@@ -185,6 +191,7 @@ impl FromStr for AuditEventType {
             "auth.user_enabled" => Ok(Self::AuthUserEnabled),
             "auth.user_disabled" => Ok(Self::AuthUserDisabled),
             "auth.session_access_denied" => Ok(Self::AuthSessionAccessDenied),
+            "auth.password_changed" => Ok(Self::AuthPasswordChanged),
             _ => Err(format!("unknown audit event type: {s}")),
         }
     }

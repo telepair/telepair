@@ -112,6 +112,10 @@ pub fn build_router_with_options(
         .route("/api/auth/verify", post(http::verify_otp))
         .route("/api/auth/login", post(http::login))
         .route("/api/auth/whoami", get(http::whoami))
+        .route(
+            "/api/auth/change-password",
+            post(http::change_password),
+        )
         .route("/api/targets", get(http::list_targets))
         .route("/api/user-targets", post(http::create_user_target))
         .route(

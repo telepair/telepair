@@ -217,6 +217,27 @@ pub async fn whoami(
     }))
 }
 
+#[derive(Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+/// `POST /api/auth/change-password` — authenticated password update.
+pub async fn change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<ChangePasswordRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+    let user = extract_user(&state, &headers).await?;
+    state
+        .auth_service
+        .change_password(&user, &body.current_password, &body.new_password)
+        .await?;
+    Ok(Json(serde_json::json!({"message": "Password changed successfully."})))
+}
+
 pub async fn list_targets(
     State(state): State<AppState>,
     headers: HeaderMap,

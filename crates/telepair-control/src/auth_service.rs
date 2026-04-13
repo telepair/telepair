@@ -386,6 +386,58 @@ impl AuthService {
         self.audit.record(event).await;
     }
 
+    // ── Password management ───────────────────────────────────────────
+
+    /// Change the authenticated user's password. Requires the current
+    /// password for verification (even though the caller already holds
+    /// a valid bearer token — defence in depth against session theft).
+    /// Rejects users who do not have a password hash (admin/CLI accounts).
+    pub async fn change_password(
+        &self,
+        user: &User,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<()> {
+        let hash = self
+            .storage
+            .get_password_hash(user.id)
+            .await?
+            .ok_or_else(|| {
+                Error::InvalidInput(
+                    "This account does not use password authentication.".into(),
+                )
+            })?;
+
+        let current_owned = current_password.to_owned();
+        let verify =
+            tokio::task::spawn_blocking(move || verify_password(&current_owned, &hash)).await;
+        match verify {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(Error::Auth("Current password is incorrect.".into())),
+            Err(_) => return Err(Error::Internal("verify task panicked".into())),
+        }
+
+        let new_owned = new_password.to_owned();
+        let new_hash = tokio::task::spawn_blocking(move || hash_password(&new_owned))
+            .await
+            .map_err(|_| Error::Internal("hash task panicked".into()))??;
+
+        self.storage
+            .update_password_hash(user.id, &new_hash)
+            .await?;
+
+        let email_str = user.email.as_deref().unwrap_or("unknown");
+        self.audit
+            .record(
+                AuditEvent::new(AuditEventType::AuthPasswordChanged)
+                    .with_actor(user.id, user.name.clone())
+                    .with_detail(serde_json::json!({ "email": email_str })),
+            )
+            .await;
+
+        Ok(())
+    }
+
     // ── Admin user management ────────────────────────────────────────
     //
     // These three methods back the `/api/admin/users*` endpoints.
@@ -732,5 +784,69 @@ mod tests {
             .find(|e| e.detail["reason"] == "locked")
             .expect("expected a 'locked' audit row");
         assert!(row.detail["locked_until"].is_string());
+    }
+
+    // ── Change password ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn change_password_success() {
+        let (svc, uid) = seed_real_account("cp@x.com", "cpuser", "old-pass").await;
+        let user = svc.storage.validate_token(
+            &svc.storage.refresh_user_token(uid).await.unwrap(),
+        ).await.unwrap();
+
+        svc.change_password(&user, "old-pass", "new-pass")
+            .await
+            .unwrap();
+
+        // Verify new password works via login
+        let token = svc.login("cp@x.com", "new-pass").await.unwrap();
+        assert!(!token.is_empty());
+
+        // Verify old password no longer works
+        let err = svc.login("cp@x.com", "old-pass").await.unwrap_err();
+        assert!(matches!(err, Error::Auth(_)));
+
+        // Audit row emitted
+        let sink = AuditSink::new(svc.storage.clone());
+        let rows = sink.query(AuditFilter::default()).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|e| e.event_type == AuditEventType::AuthPasswordChanged)
+            .expect("expected an auth.password_changed row");
+        assert_eq!(row.actor_id, Some(uid));
+        assert_eq!(row.detail["email"], "cp@x.com");
+    }
+
+    #[tokio::test]
+    async fn change_password_wrong_current_rejects() {
+        let (svc, uid) = seed_real_account("cp2@x.com", "cpuser2", "correct").await;
+        let user = svc.storage.validate_token(
+            &svc.storage.refresh_user_token(uid).await.unwrap(),
+        ).await.unwrap();
+
+        let err = svc
+            .change_password(&user, "wrong-current", "new-pass")
+            .await
+            .unwrap_err();
+        match err {
+            Error::Auth(msg) => assert_eq!(msg, "Current password is incorrect."),
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn change_password_no_password_hash_rejects() {
+        // Admin/CLI account has no password hash
+        let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+        let audit = make_audit(storage.clone());
+        let svc = AuthService::new(storage.clone(), None, audit);
+        let (admin, _) = storage.create_user("admin", true).await.unwrap();
+
+        let err = svc
+            .change_password(&admin, "any", "new-pass")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)));
     }
 }

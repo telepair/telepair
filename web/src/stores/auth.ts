@@ -239,6 +239,18 @@ async function loadIdentity(): Promise<void> {
   return identityInFlight;
 }
 
+/**
+ * Force a fresh whoami round-trip, even if the identity is already cached.
+ * Used by the "Check status" button on the pending-approval banner so the
+ * user can discover their account was approved without a full page reload.
+ */
+async function refreshIdentity(): Promise<void> {
+  if (!token()) return;
+  setCurrentUser(null);
+  identityInFlight = null;
+  return loadIdentity();
+}
+
 async function validateToken(t: string): Promise<boolean> {
   setValidating(true);
   // Login is the "persistent" entry point — the admin wants their
@@ -349,6 +361,37 @@ async function emailLogin(email: string, password: string): Promise<boolean> {
   }
 }
 
+/**
+ * Re-send the OTP code by calling the register endpoint again. The server
+ * overwrites the pending row with a fresh OTP (60-second server-side rate
+ * limit silently accepts). This is semantically identical to `emailRegister`
+ * but named separately so the call site reads clearly as a "resend" action
+ * and the UI can show distinct feedback (e.g. "code resent" vs initial send).
+ */
+async function resendOtp(
+  email: string,
+  password: string,
+  displayName: string,
+): Promise<boolean> {
+  setValidating(true);
+  try {
+    await api.register(email, password, displayName);
+    setErrorKey(null);
+    return true;
+  } catch (e) {
+    if (e instanceof ApiError) {
+      if (e.status === 503) setErrorKey('auth.error_smtp_unavailable');
+      else if (e.status === 429) setErrorKey('auth.error_rate_limited');
+      else setErrorKey('auth.error_connection_failed');
+    } else {
+      setErrorKey('auth.error_connection_failed');
+    }
+    return false;
+  } finally {
+    setValidating(false);
+  }
+}
+
 function logout() {
   setToken('');
 }
@@ -393,7 +436,9 @@ export const auth = {
   emailRegister,
   emailVerifyOtp,
   emailLogin,
+  resendOtp,
   loadIdentity,
+  refreshIdentity,
   clearError,
   logout,
   logoutAndRedirect,
