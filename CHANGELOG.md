@@ -7,6 +7,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-04-14
+
+Patch release adding **change-password flow**, **admin audit log page**,
+**dynamic participant role changes**, and **dashboard pagination**. Auth
+is hardened with server-side password-length validation and atomic
+password+token rotation. The audit subsystem gains two new event types
+(`auth.password_changed`, `participant.role_changed`) and a dedicated
+admin page for browsing all system events with filters.
+
+No breaking wire-format changes. One new `ServerMessage` variant
+(`PeerRoleChanged`) is additive. In-place upgrade from 0.1.2 works
+without wiping the database.
+
+### Added — Change password
+
+- `POST /api/auth/change-password` — authenticated endpoint that
+  verifies the current password (defence in depth against session
+  theft), hashes the new password with Argon2, and atomically
+  rotates the bearer token in a single SQLite transaction so a crash
+  between the two writes can never leave the old token valid after a
+  password change. Returns the new token so the caller stays
+  authenticated.
+- `AuthService::change_password` in `telepair-control` with
+  server-side `MIN_PASSWORD_LENGTH` (8 chars) validation applied to
+  both registration and password change paths.
+- Frontend `ChangePassword` page (`/change-password`) with
+  current/new/confirm fields, client-side validation (length +
+  mismatch), and automatic token swap on success. Accessible from a
+  "Password" link in the dashboard topbar (email-auth users only).
+
+### Added — Admin audit log page
+
+- `GET /api/admin/audit` — admin-only endpoint returning the global
+  audit log with optional filtering by time range (`since`/`until`),
+  actor, event type, and session. Default 100 rows, capped at 500.
+- Frontend `AdminAudit` page (`/admin/audit`) with a filterable,
+  paginated event table. Filters include event-type dropdown and
+  session-ID text input. Load-more pagination fetches the next page
+  without losing filter state.
+- Audit helpers (`eventLabel`, `formatTs`) extracted from
+  `SessionDetailDialog` into `web/src/lib/audit.ts` so both the
+  per-session timeline and the admin audit page share the same
+  formatting logic.
+- Dashboard topbar gains an "Admin · Audit" link for admin users.
+
+### Added — Dynamic participant role changes
+
+- `PUT /api/sessions/:id/participants/:user_id/role` — owner-only
+  endpoint that changes a participant's role at runtime. The owner
+  cannot change their own role or promote anyone to owner. Persists
+  to DB, updates the hub's in-memory state, and broadcasts
+  `PeerRoleChanged` to all connected clients.
+- New `ServerMessage::PeerRoleChanged { user_id, new_role }` variant.
+  The WS handler intercepts this for the affected connection and
+  recalculates input permissions (`can_input`, serialized-mode gate)
+  without requiring a reconnect. A broadcast-lag recovery path
+  re-fetches the authoritative role from the hub to prevent a missed
+  demotion from leaving stale permissions in effect.
+- `ParticipantList` component gains role-toggle buttons for owners:
+  clicking a participant's role badge toggles between Operator and
+  Viewer with a single click. Non-owners see the static role label.
+
+### Added — Dashboard improvements
+
+- **Session pagination**: the sessions list now loads in pages with a
+  "Load more" button, replacing the previous unbounded fetch.
+- **OTP resend**: the registration verify step gains a "Resend code"
+  button with a 60-second countdown matching the server-side rate
+  limit.
+- **Pending-approval status check**: users awaiting admin approval
+  can click "Check status" to poll `whoami` and see an inline
+  confirmation when approved, without a full page reload.
+
+### Fixed
+
+- `SqliteStorage::get_password_hash` now correctly returns `None`
+  for users without a password hash (admin/CLI accounts). Previously
+  the query used `query_scalar` which mapped a SQL `NULL` to an
+  empty result rather than `Some(None)`, causing `change_password`
+  to return a confusing "user not found" error instead of "this
+  account does not use password authentication."
+
+### Security
+
+- Server-side password length validation (`MIN_PASSWORD_LENGTH = 8`)
+  applied uniformly at registration and password change. Previously
+  only the frontend enforced length, so a direct API caller could set
+  a 1-character password.
+- Atomic password+token rotation in `change_password_and_rotate_token`
+  prevents a crash window where the old token remains valid after a
+  password change.
+
+### Testing
+
+- Cargo test count: **284 → 300** (all green). New coverage:
+  `change_password_success`, `change_password_wrong_current_rejects`,
+  `change_password_no_password_hash_rejects`,
+  `change_password_and_rotate_token_is_atomic`.
+- Vitest count: **137 → 143** (all green). New coverage for audit
+  helpers, auth store token rotation, and API client change-password
+  path.
+
 ## [0.1.2] - 2026-04-13
 
 Minor release adding **email-based self-serve registration** with OTP
@@ -728,7 +830,8 @@ role-based permissions, invite links, and real-time chat.
 - GitHub Actions CI pipeline and release workflow.
 - MIT license across the workspace.
 
-[Unreleased]: https://github.com/telepair/telepair/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/telepair/telepair/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/telepair/telepair/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/telepair/telepair/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/telepair/telepair/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/telepair/telepair/releases/tag/v0.1.0

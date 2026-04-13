@@ -49,7 +49,7 @@ Business logic services that coordinate core abstractions. As of 0.1.1 this is t
 |--------|---------|
 | `session_service.rs` | `SessionService` — session lifecycle (`create_session`, `close_session(reason)`), participant queries (`list_participants`, `list_sessions_for_user`), authorization helpers (`require_owner`), and cross-layer aggregates like `active_session_counts_per_target`. Emits audit events for create/close and the startup sweep. |
 | `invite_service.rs` | `InviteService` — invite lifecycle (`create`, `redeem`, `list_for_session`, `revoke`). Owns `MAX_INVITE_USES` / TTL validation, the cross-session scoped-guest check, and the guest mint-on-success path. Emits `invite.minted` / `invite.redeemed` / `invite.revoked` audit events. |
-| `auth_service.rs` | `AuthService` — email-based registration with OTP verification, password login with Argon2 hashing, and admin user management (`list_accounts`, `set_session_access`). Handles SMTP transport for OTP delivery (via lettre), login throttling (5-strike lockout with 15-minute window), and enumeration-safe error collapsing. Emits `auth.register_rejected` / `auth.register_completed` / `auth.verify_failed` / `auth.login_failed` / `auth.user_enabled` / `auth.user_disabled` audit events. |
+| `auth_service.rs` | `AuthService` — email-based registration with OTP verification, password login with Argon2 hashing, password change with atomic token rotation, and admin user management (`list_accounts`, `set_session_access`). Handles SMTP transport for OTP delivery (via lettre), login throttling (5-strike lockout with 15-minute window), server-side password-length validation, and enumeration-safe error collapsing. Emits `auth.register_rejected` / `auth.register_completed` / `auth.verify_failed` / `auth.login_failed` / `auth.password_changed` / `auth.user_enabled` / `auth.user_disabled` audit events. |
 | `user_target_service.rs` | `UserTargetService` — CRUD for user-owned targets (`create`, `update`, `delete`, `get`, `list`, `resolve_by_id`). Enforces ownership on every mutation, blocks update/delete while an active session references the target (referential integrity via `Conflict` error), and deliberately skips `${VAR}` expansion on resolve to prevent process-env leakage through user-supplied command strings. |
 | `target_service.rs` | `TargetService` — wraps `TargetEngine`, provides target listing and resolution. |
 
@@ -61,7 +61,7 @@ The client-facing layer. Runs the HTTP server, WebSocket upgrade, and serves the
 |--------|---------|
 | `lib.rs` | Axum router setup, route definitions |
 | `state.rs` | `AppState` — shared application state: storage, auth, `SessionService`, `InviteService`, `AuthService`, `UserTargetService`, `Arc<ArcSwap<TargetEngine>>` (for atomic target hot-reload), `Arc<dyn AuditSink>`, and the `SessionHub` |
-| `http.rs` | REST handlers: health, targets, sessions, invites (list / revoke), session history, session audit, whoami, admin targets (list + reload). All handlers go through services — no `.storage()` access in production code. |
+| `http.rs` | REST handlers: health, targets, sessions, participant role change, invites (list / revoke), session history, session audit, whoami, change password, admin targets (list + reload), admin users, admin audit. All handlers go through services — no `.storage()` access in production code. |
 | `ws.rs` | WebSocket handler — auth, role enforcement, message routing, PTY I/O bridge, `participant.joined` / `participant.left` audit emits |
 | `session_hub.rs` | `SessionHub` — per-session state: PTY process, connected participants, broadcast channels. Holds `Arc<SessionService>` (not raw Storage) so the reaper closure emits `CloseReason::Reaper` through the same audit path as owner-initiated closes. |
 
@@ -140,7 +140,7 @@ Each live session has two independent broadcast channels:
 | Channel | Capacity | Content |
 |---------|----------|---------|
 | `output_tx` | 256 messages | PTY bytes (forwarded as raw binary WS frames) |
-| `collab_tx` | 64 messages | `PeerJoined`, `PeerLeft`, `PeerChat`, `PeerCursor` |
+| `collab_tx` | 64 messages | `PeerJoined`, `PeerLeft`, `PeerChat`, `PeerCursor`, `PeerRoleChanged` |
 
 Separation ensures high-frequency terminal output does not starve collaboration messages. Both use `tokio::broadcast` — slow receivers lose oldest messages.
 
@@ -168,7 +168,7 @@ All IDs are UUIDs stored as TEXT. Timestamps are ISO 8601 TEXT. The `Storage` tr
 
 ### Audit events
 
-The `audit_events` table is append-only. Every row is a single immutable record of a security-meaningful state transition — logins, session lifecycle, participant joins / leaves, invite mint / redeem / revoke, target access denials, and target hot-reloads. High-frequency events (chat messages, cursor updates, PTY bytes) are **not** audited: the table would explode and none of them carry security-meaningful state that isn't already covered by the coarser events.
+The `audit_events` table is append-only. Every row is a single immutable record of a security-meaningful state transition — logins, password changes, session lifecycle, participant joins / leaves / role changes, invite mint / redeem / revoke, target access denials, and target hot-reloads. High-frequency events (chat messages, cursor updates, PTY bytes) are **not** audited: the table would explode and none of them carry security-meaningful state that isn't already covered by the coarser events.
 
 | Column | Purpose |
 |--------|---------|

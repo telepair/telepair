@@ -49,7 +49,7 @@ telepair-cli
 |------|------|
 | `session_service.rs` | `SessionService` —— 会话生命周期(`create_session`、`close_session(reason)`)、参与者查询(`list_participants`、`list_sessions_for_user`)、授权辅助(`require_owner`)以及跨层聚合查询(如 `active_session_counts_per_target`)。会话创建 / 关闭以及启动清理都会在这里发审计事件。 |
 | `invite_service.rs` | `InviteService` —— 邀请生命周期(`create`、`redeem`、`list_for_session`、`revoke`)。`MAX_INVITE_USES` / TTL 校验、跨会话 scoped-guest 检查、兑换成功后的 guest mint 都收敛在这里,并发出 `invite.minted` / `invite.redeemed` / `invite.revoked` 审计事件。 |
-| `auth_service.rs` | `AuthService` —— 基于邮箱的注册（含 OTP 验证）、密码登录（Argon2 哈希）、管理员用户管理（`list_accounts`、`set_session_access`）。负责 SMTP 发送 OTP（通过 lettre）、登录限流（5 次错误后锁定 15 分钟）、以及防枚举的统一错误折叠。发出 `auth.register_rejected` / `auth.register_completed` / `auth.verify_failed` / `auth.login_failed` / `auth.user_enabled` / `auth.user_disabled` 审计事件。 |
+| `auth_service.rs` | `AuthService` —— 基于邮箱的注册（含 OTP 验证）、密码登录（Argon2 哈希）、密码修改（原子化 token 轮换）、管理员用户管理（`list_accounts`、`set_session_access`）。负责 SMTP 发送 OTP（通过 lettre）、登录限流（5 次错误后锁定 15 分钟）、服务端密码长度校验、以及防枚举的统一错误折叠。发出 `auth.register_rejected` / `auth.register_completed` / `auth.verify_failed` / `auth.login_failed` / `auth.password_changed` / `auth.user_enabled` / `auth.user_disabled` 审计事件。 |
 | `user_target_service.rs` | `UserTargetService` —— 用户自有目标的 CRUD（`create`、`update`、`delete`、`get`、`list`、`resolve_by_id`）。每次变更都校验所有权,在活跃会话引用该目标时阻止修改 / 删除（通过 `Conflict` 错误实现引用完整性），resolve 时故意不做 `${VAR}` 展开以防止用户提交的命令字符串泄露进程环境变量。 |
 | `target_service.rs` | `TargetService` —— 包装 `TargetEngine`,提供目标列表和解析能力。 |
 
@@ -61,7 +61,7 @@ telepair-cli
 |------|------|
 | `lib.rs` | Axum 路由设置与路由定义 |
 | `state.rs` | `AppState` —— 共享应用状态:storage、auth、`SessionService`、`InviteService`、`AuthService`、`UserTargetService`、`Arc<ArcSwap<TargetEngine>>`(用于原子化的目标热重载)、`Arc<dyn AuditSink>`、以及 `SessionHub` |
-| `http.rs` | REST handler:health、targets、sessions、invites(list / revoke)、会话历史、会话审计、whoami、admin targets(list + reload)。所有 handler 都走 service —— 生产代码不再直接访问 `.storage()`。 |
+| `http.rs` | REST handler：health、targets、sessions、参与者角色变更、invites（list / revoke）、会话历史、会话审计、whoami、修改密码、admin targets（list + reload）、admin users、admin audit。所有 handler 都走 service —— 生产代码不再直接访问 `.storage()`。 |
 | `ws.rs` | WebSocket handler —— 认证、角色校验、消息分发、PTY I/O 桥接,`participant.joined` / `participant.left` 审计事件发射 |
 | `session_hub.rs` | `SessionHub` —— 单会话状态:PTY 进程、已连接参与者、广播通道。持有 `Arc<SessionService>`(而非裸 Storage),所以空闲清理的关闭也会和所有者主动关闭走同一条审计路径,带 `CloseReason::Reaper`。 |
 
@@ -140,7 +140,7 @@ Browser                     telepair (single process)
 | 通道 | 容量 | 内容 |
 |------|------|------|
 | `output_tx` | 256 条 | PTY 字节(作为原始二进制 WS 帧转发) |
-| `collab_tx` | 64 条 | `PeerJoined`、`PeerLeft`、`PeerChat`、`PeerCursor` |
+| `collab_tx` | 64 条 | `PeerJoined`、`PeerLeft`、`PeerChat`、`PeerCursor`、`PeerRoleChanged` |
 
 分离是为了确保高频的终端输出不会把协作消息饿死。两者都用 `tokio::broadcast` —— 接收端太慢时会丢掉最旧的消息。
 
@@ -168,7 +168,7 @@ user_targets          (id, user_id, name, display, command, args, env, tags,
 
 ### 审计事件
 
-`audit_events` 表是只追加(append-only)的。每一行都是一次安全相关状态转移的不可变记录 —— 登录、会话生命周期、参与者加入 / 离开、邀请发放 / 兑换 / 撤销、目标访问被拒绝、以及目标热重载。高频事件(聊天、光标、PTY 字节流)**不**入审计:这类事件会让表爆炸,而且它们承载的信息已经被更粗粒度的事件覆盖。
+`audit_events` 表是只追加(append-only)的。每一行都是一次安全相关状态转移的不可变记录 —— 登录、密码变更、会话生命周期、参与者加入 / 离开 / 角色变更、邀请发放 / 兑换 / 撤销、目标访问被拒绝、以及目标热重载。高频事件(聊天、光标、PTY 字节流)**不**入审计:这类事件会让表爆炸,而且它们承载的信息已经被更粗粒度的事件覆盖。
 
 | 列 | 用途 |
 |----|------|

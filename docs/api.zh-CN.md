@@ -168,6 +168,43 @@ bearer token 并返回。
 
 **备注:** `session_enabled` 检查**不在**登录时发生。被禁用的账号仍然可以登录(查看历史、修改密码等)—— 会话创建和 WebSocket 连接才是执行 `session_enabled` 检查的关卡。
 
+### POST /api/auth/change-password
+
+修改当前已认证用户的密码。即使调用方已经持有有效的 bearer token,仍然要求验证当前
+密码(针对 session 劫持的纵深防御)。不支持没有密码哈希的账号(通过 token 而非邮箱
+注册的 admin / CLI 账号)。
+
+成功后旧的 bearer token 即被作废,返回一个新的。密码哈希更新和 token 轮换在同一个
+SQLite 事务中完成,所以两次写入之间不会出现旧 token 在密码变更后仍然有效的崩溃窗口。
+
+**请求体**
+```json
+{
+  "current_password": "old-pass",
+  "new_password": "new-pass"
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `current_password` | string | 是 | 用户的当前密码 |
+| `new_password` | string | 是 | 新密码;至少 8 个字符 |
+
+**响应** `200 OK`
+```json
+{
+  "token": "new-bearer-token"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `token` | string | 新签发的 bearer token。旧 token 已作废。 |
+
+**错误**
+- `400 Bad Request` —— 请求体格式不合法、新密码短于 8 个字符,或该账号不使用密码认证(admin / CLI 账号)
+- `401 Unauthorized` —— bearer token 缺失或无效,或当前密码不正确
+
 ## Targets
 
 ### GET /api/targets
@@ -276,6 +313,36 @@ bearer token 并返回。
 - `401 Unauthorized` —— token 缺失或无效
 - `403 Forbidden` —— 调用方不是会话 owner
 - `404 Not Found` —— 会话不存在
+
+### PUT /api/sessions/{session_id}/participants/{user_id}/role
+
+在活跃会话中变更参与者的角色。仅 owner 可操作。Owner 不能修改自己的角色,也不能把
+任何人提升为 `owner`。
+
+变更会持久化到数据库、更新 hub 的内存参与者映射,并向所有已连接的客户端广播
+`PeerRoleChanged` WebSocket 消息,使参与者列表同步更新,同时 WS handler 会就地
+重新计算受影响连接的输入权限,无需重连。
+
+**请求体**
+```json
+{
+  "role": "viewer"
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `role` | string | 是 | `"operator"` 或 `"viewer"` |
+
+**响应** `204 No Content`
+
+无响应体。如果该参与者已经是请求的角色,端点视为无操作并仍然返回 `204`。
+
+**错误**
+- `400 Bad Request` —— `role` 为 `owner`、目标用户就是 owner 自身,或 UUID 格式不合法
+- `401 Unauthorized` —— token 缺失或无效
+- `403 Forbidden` —— 调用方不是会话 owner
+- `404 Not Found` —— 会话不存在、会话非活跃状态,或目标用户不是活跃参与者
 
 ## Invites
 
@@ -444,7 +511,7 @@ bearer token 并返回。
 | `ts` | string (ISO 8601) | 事件发射时间,UTC。 |
 | `actor_id` | string \| null | 触发者的 UUID。系统事件和登录失败时为 `null`。 |
 | `actor_name` | string \| null | 发射时刻的用户名快照 —— 用户后续改名不会改写历史。 |
-| `event_type` | string | 形如以下之一:`session.created`、`session.closed`、`participant.joined`、`participant.left`、`invite.minted`、`invite.redeemed`、`invite.revoked`、`auth.login_success`、`auth.login_failed`、`target.access_denied`、`target.reloaded`。 |
+| `event_type` | string | 形如以下之一:`session.created`、`session.closed`、`participant.joined`、`participant.left`、`participant.role_changed`、`invite.minted`、`invite.redeemed`、`invite.revoked`、`auth.login_success`、`auth.login_failed`、`auth.register_rejected`、`auth.register_completed`、`auth.verify_failed`、`auth.user_enabled`、`auth.user_disabled`、`auth.session_access_denied`、`auth.password_changed`、`target.access_denied`、`target.reloaded`。 |
 | `session_id` | string \| null | 没有绑定到具体会话的事件为 `null`(登录、目标热重载)。 |
 | `detail` | object | 事件专属的 JSON blob。例如 `session.closed` 带 `{reason, duration_s}`、`invite.minted` 带 `{role, max_uses, expires_at}`。 |
 
@@ -740,3 +807,42 @@ WebSocket 连接时,会在 `session_enabled` 关卡处被拒绝。
 - `401 Unauthorized` —— token 缺失或无效
 - `403 Forbidden` —— 调用方已认证但不是管理员
 - `404 Not Found` —— 用户不存在
+
+### GET /api/admin/audit
+
+全局审计日志,仅管理员可访问。按最新优先返回事件,支持按时间范围、actor、事件类型
+和会话做可选过滤。默认限制 100 行,最大 500,防止意外全表输出。
+
+**查询参数**
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `limit` | integer | 返回行数上限(默认 100,最大 500)。 |
+| `offset` | integer | 分页偏移(默认 0)。 |
+| `since` | string (ISO 8601) | `ts` 的包含下界。 |
+| `until` | string (ISO 8601) | `ts` 的不包含上界。 |
+| `actor_id` | string | 按 actor UUID 过滤。无效 UUID 会被静默忽略。 |
+| `event_type` | string | 单个点分小写类型(如 `auth.login_failed`)。无效值被静默忽略。 |
+| `session_id` | string | 过滤到与某个会话相关的事件。 |
+
+**响应** `200 OK`
+
+行结构与 `GET /api/sessions/{id}/audit` 完全相同 —— 字段说明见上文的会话审计部分。
+
+```json
+[
+  {
+    "id": 42,
+    "ts": "2026-04-14T08:00:00Z",
+    "actor_id": "...",
+    "actor_name": "alice",
+    "event_type": "auth.password_changed",
+    "session_id": null,
+    "detail": { "email": "alice@example.com" }
+  }
+]
+```
+
+**错误**
+- `401 Unauthorized` —— token 缺失或无效
+- `403 Forbidden` —— 调用方已认证但不是管理员

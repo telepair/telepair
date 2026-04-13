@@ -169,6 +169,27 @@ Forwarded cursor position from another participant.
 }
 ```
 
+#### PeerRoleChanged
+
+Broadcast when the session owner changes a participant's role via
+`PUT /api/sessions/:id/participants/:user_id/role`. Every connected
+client receives this so participant lists update in lockstep. The WS
+handler also intercepts messages targeting the current connection to
+re-evaluate input permissions without a reconnect.
+
+```json
+{
+  "type": "PeerRoleChanged",
+  "user_id": "...",
+  "new_role": "viewer"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `user_id` | string | UUID of the participant whose role changed |
+| `new_role` | string | New role: `"operator"` or `"viewer"` |
+
 #### Error
 
 Server-side error notification.

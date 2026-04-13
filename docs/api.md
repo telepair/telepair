@@ -173,6 +173,46 @@ password login, a fresh bearer token is minted and returned.
 
 **Note:** the `session_enabled` check does **not** happen at login. A disabled account can still log in (to read history, change password, etc.) — session creation and WebSocket attach are the gates that enforce the `session_enabled` bit.
 
+### POST /api/auth/change-password
+
+Change the authenticated user's password. Requires the current password for
+verification (defence in depth against session theft) even though the caller
+already holds a valid bearer token. Rejects users who do not have a password
+hash (admin/CLI accounts created via token, not email registration).
+
+On success the old bearer token is invalidated and a new one is returned. The
+password hash update and token rotation happen in a single SQLite transaction
+so a crash between the two writes can never leave the old token valid after a
+password change.
+
+**Request Body**
+```json
+{
+  "current_password": "old-pass",
+  "new_password": "new-pass"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `current_password` | string | yes | The user's current password |
+| `new_password` | string | yes | New password; must be at least 8 characters |
+
+**Response** `200 OK`
+```json
+{
+  "token": "new-bearer-token"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `token` | string | Fresh bearer token. The previous token is invalidated. |
+
+**Errors**
+- `400 Bad Request` — request body is malformed, new password is shorter than 8 characters, or the account does not use password authentication (admin/CLI accounts)
+- `401 Unauthorized` — missing or invalid bearer token, or current password is incorrect
+
 ## Targets
 
 ### GET /api/targets
@@ -278,6 +318,39 @@ No response body.
 - `401 Unauthorized` — missing or invalid token
 - `403 Forbidden` — not the session owner
 - `404 Not Found` — session does not exist
+
+### PUT /api/sessions/{session_id}/participants/{user_id}/role
+
+Change a participant's role in a live session. Owner-only. The owner cannot
+change their own role or promote anyone to `owner`.
+
+Persists the change to the database, updates the hub's in-memory participant
+map, and broadcasts a `PeerRoleChanged` WebSocket message to all connected
+clients so participant lists update in lockstep and the WS handler
+re-evaluates input permissions for the affected connection without a
+reconnect.
+
+**Request Body**
+```json
+{
+  "role": "viewer"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `role` | string | yes | `"operator"` or `"viewer"` |
+
+**Response** `204 No Content`
+
+No response body. If the participant already has the requested role, the
+endpoint is a no-op and still returns `204`.
+
+**Errors**
+- `400 Bad Request` — `role` is `owner`, target user is the owner themselves, or malformed UUID
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — not the session owner
+- `404 Not Found` — session does not exist, session is not active, or target user is not an active participant
 
 ## Invites
 
@@ -451,7 +524,7 @@ for the event taxonomy and write paths.
 | `ts` | string (ISO 8601) | Emit time, UTC. |
 | `actor_id` | string \| null | UUID of the initiator. `null` for system events and failed logins. |
 | `actor_name` | string \| null | Denormalized display name snapshot — a later rename does not rewrite history. |
-| `event_type` | string | Tagged string: `session.created`, `session.closed`, `participant.joined`, `participant.left`, `invite.minted`, `invite.redeemed`, `invite.revoked`, `auth.login_success`, `auth.login_failed`, `target.access_denied`, `target.reloaded`. |
+| `event_type` | string | Tagged string: `session.created`, `session.closed`, `participant.joined`, `participant.left`, `participant.role_changed`, `invite.minted`, `invite.redeemed`, `invite.revoked`, `auth.login_success`, `auth.login_failed`, `auth.register_rejected`, `auth.register_completed`, `auth.verify_failed`, `auth.user_enabled`, `auth.user_disabled`, `auth.session_access_denied`, `auth.password_changed`, `target.access_denied`, `target.reloaded`. |
 | `session_id` | string \| null | `null` for events without a session (logins, target reload). |
 | `detail` | object | Event-specific JSON blob. For example, `session.closed` carries `{reason, duration_s}`; `invite.minted` carries `{role, max_uses, expires_at}`. |
 
@@ -754,3 +827,44 @@ Returns the updated user object (same shape as rows in `GET /api/admin/users`).
 - `401 Unauthorized` — missing or invalid token
 - `403 Forbidden` — caller is authenticated but not an admin
 - `404 Not Found` — user does not exist
+
+### GET /api/admin/audit
+
+Global audit log, admin-only. Returns events newest-first with optional
+filtering on time range, actor, event type, and session. Default limit is
+100 rows, capped at 500 to prevent accidental full-table dumps.
+
+**Query Parameters**
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `limit` | integer | Upper bound on rows returned (default: 100, max: 500). |
+| `offset` | integer | Pagination offset (default: 0). |
+| `since` | string (ISO 8601) | Inclusive lower bound on `ts`. |
+| `until` | string (ISO 8601) | Exclusive upper bound on `ts`. |
+| `actor_id` | string | Filter by actor UUID. Invalid UUIDs are silently ignored. |
+| `event_type` | string | Single dotted-lowercase type (e.g. `auth.login_failed`). Invalid values are silently ignored. |
+| `session_id` | string | Filter to events touching a specific session. |
+
+**Response** `200 OK`
+
+Same row shape as `GET /api/sessions/{id}/audit` — see the session audit
+section above for the field reference.
+
+```json
+[
+  {
+    "id": 42,
+    "ts": "2026-04-14T08:00:00Z",
+    "actor_id": "...",
+    "actor_name": "alice",
+    "event_type": "auth.password_changed",
+    "session_id": null,
+    "detail": { "email": "alice@example.com" }
+  }
+]
+```
+
+**Errors**
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — caller is authenticated but not an admin
