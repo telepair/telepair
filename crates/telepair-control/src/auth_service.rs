@@ -392,12 +392,14 @@ impl AuthService {
     /// password for verification (even though the caller already holds
     /// a valid bearer token — defence in depth against session theft).
     /// Rejects users who do not have a password hash (admin/CLI accounts).
+    /// Returns the new bearer token so the caller can continue
+    /// authenticated. The old token is invalidated by the rotation.
     pub async fn change_password(
         &self,
         user: &User,
         current_password: &str,
         new_password: &str,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let hash = self
             .storage
             .get_password_hash(user.id)
@@ -424,6 +426,10 @@ impl AuthService {
             .update_password_hash(user.id, &new_hash)
             .await?;
 
+        // Rotate the bearer token so any leaked/stolen session is
+        // invalidated the moment the password changes.
+        let new_token = self.storage.refresh_user_token(user.id).await?;
+
         let email_str = user.email.as_deref().unwrap_or("unknown");
         self.audit
             .record(
@@ -433,7 +439,7 @@ impl AuthService {
             )
             .await;
 
-        Ok(())
+        Ok(new_token)
     }
 
     // ── Admin user management ────────────────────────────────────────
@@ -789,15 +795,23 @@ mod tests {
     #[tokio::test]
     async fn change_password_success() {
         let (svc, uid) = seed_real_account("cp@x.com", "cpuser", "old-pass").await;
-        let user = svc
-            .storage
-            .validate_token(&svc.storage.refresh_user_token(uid).await.unwrap())
+        let old_token = svc.storage.refresh_user_token(uid).await.unwrap();
+        let user = svc.storage.validate_token(&old_token).await.unwrap();
+
+        let new_token = svc
+            .change_password(&user, "old-pass", "new-pass")
             .await
             .unwrap();
 
-        svc.change_password(&user, "old-pass", "new-pass")
-            .await
-            .unwrap();
+        // The returned token must be valid and different from the old one.
+        assert!(!new_token.is_empty());
+        assert_ne!(new_token, old_token, "token must be rotated");
+        let validated = svc.storage.validate_token(&new_token).await;
+        assert!(validated.is_ok(), "new token must be valid");
+
+        // The old token must be invalidated.
+        let old_result = svc.storage.validate_token(&old_token).await;
+        assert!(old_result.is_err(), "old token must be invalidated");
 
         // Verify new password works via login
         let token = svc.login("cp@x.com", "new-pass").await.unwrap();

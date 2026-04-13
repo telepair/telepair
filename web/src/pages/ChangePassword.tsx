@@ -2,6 +2,7 @@
 import { createSignal, Show } from 'solid-js';
 import { useI18n } from '../i18n';
 import { api, ApiError, errorMessage } from '../lib/api';
+import { auth } from '../stores/auth';
 import LocaleSwitcher from '../components/LocaleSwitcher';
 
 export default function ChangePassword() {
@@ -25,7 +26,10 @@ export default function ChangePassword() {
 
     setSubmitting(true);
     try {
-      await api.changePassword(currentPw(), newPw());
+      const { token } = await api.changePassword(currentPw(), newPw());
+      // The server rotated the bearer token — update the auth store
+      // so subsequent requests use the new credential.
+      auth.setToken(token, { persist: true });
       setSuccess(true);
       setCurrentPw('');
       setNewPw('');
