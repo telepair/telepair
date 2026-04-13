@@ -26,6 +26,12 @@ pub enum Error {
     /// meaningfully react to the specific cause and we just want a
     /// 500 with a descriptive message. Keep the string concise —
     /// it goes into logs and (generically masked) HTTP responses.
+    #[error("conflict: {0}")]
+    Conflict(String),
+    #[error("rate limited: {0}")]
+    RateLimited(String),
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
     #[error("internal error: {0}")]
     Internal(String),
     #[error("storage error: {0}")]
@@ -53,9 +59,24 @@ impl Error {
             Error::SessionNotFound(_) | Error::TargetNotFound(_) => 404,
             Error::SessionClosed(_) => 410,
             Error::InvalidInput(_) | Error::Json(_) => 400,
+            Error::Conflict(_) => 409,
+            Error::RateLimited(_) => 429,
+            Error::ServiceUnavailable(_) => 503,
             Error::Internal(_) | Error::Storage(_) | Error::Io(_) | Error::Yaml(_) => 500,
         }
     }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_error_variants_have_correct_http_status() {
+        assert_eq!(Error::Conflict("dup".into()).http_status(), 409);
+        assert_eq!(Error::RateLimited("slow".into()).http_status(), 429);
+        assert_eq!(Error::ServiceUnavailable("smtp".into()).http_status(), 503);
+    }
+}

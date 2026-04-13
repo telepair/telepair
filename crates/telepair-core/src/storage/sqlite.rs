@@ -11,8 +11,8 @@ use crate::audit::{AuditEvent, AuditEventType, AuditFilter};
 use crate::error::{Error, Result};
 use crate::permission::Role;
 use crate::session::{
-    CloseReason, InputMode, InviteToken, Participant, RedeemIdentity, RedeemOutcome, Session,
-    SessionListFilter, SessionStatus, User,
+    CloseReason, CreateUserTargetParams, InputMode, InviteToken, OtpVerifyResult, Participant,
+    RedeemIdentity, RedeemOutcome, Session, SessionListFilter, SessionStatus, User, UserTarget,
 };
 use crate::storage::Storage;
 
@@ -57,8 +57,29 @@ impl SqliteStorage {
             .await?;
         self.ensure_column("invite_tokens", "created_at", "TEXT")
             .await?;
+        self.ensure_column("users", "email", "TEXT").await?;
+        self.ensure_column("users", "password_hash", "TEXT")
+            .await?;
+        self.ensure_column("users", "verified", "BOOLEAN NOT NULL DEFAULT FALSE")
+            .await?;
+        self.ensure_column("sessions", "user_target_id", "TEXT")
+            .await?;
 
         Ok(())
+    }
+
+    /// Retrieve the argon2id hash stored for the given user_id.
+    /// Returns `None` if the user does not exist or has no password.
+    /// NOT on the `Storage` trait — callers use `AuthService` which
+    /// holds the concrete `SqliteStorage` type.
+    pub async fn get_password_hash(&self, user_id: Uuid) -> Result<Option<String>> {
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT password_hash FROM users WHERE id = ?",
+        )
+        .bind(user_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
     }
 
     /// Idempotently add `column` to `table` if it does not already
@@ -113,6 +134,8 @@ fn row_to_user(r: &SqliteRow) -> Result<User> {
         name: r.get("name"),
         is_admin: r.get("is_admin"),
         scoped_session_id: r.get("scoped_session_id"),
+        email: r.try_get("email").ok().flatten(),
+        verified: r.try_get::<bool, _>("verified").unwrap_or(false),
         created_at: parse_datetime(r.get("created_at"))?,
         updated_at: parse_datetime(r.get("updated_at"))?,
     })
@@ -167,6 +190,7 @@ fn row_to_session(r: &SqliteRow) -> Result<Session> {
         created_at: parse_datetime(r.get("created_at"))?,
         closed_at: parse_optional_datetime(r.get("closed_at"), "closed_at")?,
         closed_reason,
+        user_target_id: r.try_get("user_target_id").ok().flatten(),
     })
 }
 
@@ -197,6 +221,27 @@ fn row_to_invite(r: &SqliteRow) -> Result<InviteToken> {
         // `created_at` is nullable: v0.1.0 rows are `NULL`, new rows
         // are always populated by `create_invite`.
         created_at: parse_optional_datetime(r.get("created_at"), "created_at")?,
+    })
+}
+
+fn row_to_user_target(r: &SqliteRow) -> Result<UserTarget> {
+    let args_json: String = r.get("args");
+    let env_json: String = r.get("env");
+    let tags_json: String = r.get("tags");
+    Ok(UserTarget {
+        id: r.get("id"),
+        user_id: parse_uuid(r.get("user_id"))?,
+        name: r.get("name"),
+        display: r.get("display"),
+        command: r.get("command"),
+        args: serde_json::from_str(&args_json)
+            .map_err(|e| Error::InvalidInput(format!("invalid args json: {e}")))?,
+        env: serde_json::from_str(&env_json)
+            .map_err(|e| Error::InvalidInput(format!("invalid env json: {e}")))?,
+        tags: serde_json::from_str(&tags_json)
+            .map_err(|e| Error::InvalidInput(format!("invalid tags json: {e}")))?,
+        created_at: parse_datetime(r.get("created_at"))?,
+        updated_at: parse_datetime(r.get("updated_at"))?,
     })
 }
 
@@ -337,6 +382,8 @@ impl SqliteStorage {
             name: name.into(),
             is_admin,
             scoped_session_id: scoped_session_id.map(|s| s.to_owned()),
+            email: None,
+            verified: false,
             created_at: now,
             updated_at: now,
         };
@@ -380,6 +427,7 @@ impl Storage for SqliteStorage {
         owner_id: Uuid,
         target_name: &str,
         input_mode: InputMode,
+        user_target_id: Option<&str>,
     ) -> Result<Session> {
         let id = nanoid::nanoid!(10);
         let now = Utc::now();
@@ -395,8 +443,9 @@ impl Storage for SqliteStorage {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
-            "INSERT INTO sessions (id, owner_id, target_name, input_mode, status, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sessions \
+             (id, owner_id, target_name, input_mode, status, created_at, user_target_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&owner_str)
@@ -404,6 +453,7 @@ impl Storage for SqliteStorage {
         .bind(input_mode.as_str())
         .bind(SessionStatus::Active.as_str())
         .bind(&now_str)
+        .bind(user_target_id)
         .execute(&mut *tx)
         .await?;
 
@@ -429,6 +479,7 @@ impl Storage for SqliteStorage {
             created_at: now,
             closed_at: None,
             closed_reason: None,
+            user_target_id: user_target_id.map(|s| s.to_string()),
         })
     }
 
@@ -1167,6 +1218,325 @@ impl Storage for SqliteStorage {
         let rows = q.fetch_all(&self.pool).await?;
         rows.iter().map(row_to_audit_event).collect()
     }
+
+    // ── Auth — email registration ─────────────────────────────────────────
+
+    async fn register_user(
+        &self,
+        email: &str,
+        password_hash: &str,
+        display_name: &str,
+    ) -> Result<User> {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        let now_str = rfc3339(now);
+        sqlx::query(
+            "INSERT INTO users \
+             (id, name, token_sha256, is_admin, email, password_hash, verified, created_at, updated_at) \
+             VALUES (?, ?, '', FALSE, ?, ?, FALSE, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(display_name)
+        .bind(email)
+        .bind(password_hash)
+        .bind(&now_str)
+        .bind(&now_str)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(ref db) = e {
+                if db.is_unique_violation() {
+                    return Error::Conflict(format!(
+                        "email or name already registered: {email}"
+                    ));
+                }
+            }
+            Error::Storage(e)
+        })?;
+
+        Ok(User {
+            id,
+            name: display_name.to_string(),
+            is_admin: false,
+            scoped_session_id: None,
+            email: Some(email.to_string()),
+            verified: false,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    async fn get_user_by_email(&self, email: &str) -> Result<Option<User>> {
+        let row = sqlx::query(
+            "SELECT id, name, is_admin, scoped_session_id, email, verified, created_at, updated_at \
+             FROM users WHERE email = ?",
+        )
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| row_to_user(&r)).transpose()
+    }
+
+    async fn create_otp(
+        &self,
+        user_id: Uuid,
+        code: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO email_verifications (user_id, code, expires_at, created_at) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(user_id.to_string())
+        .bind(code)
+        .bind(rfc3339(expires_at))
+        .bind(now_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn verify_otp(&self, user_id: Uuid, code: &str) -> Result<OtpVerifyResult> {
+        use OtpVerifyResult::*;
+        let uid = user_id.to_string();
+        let now = now_rfc3339();
+
+        let row = sqlx::query(
+            "SELECT id, code, failure_count FROM email_verifications \
+             WHERE user_id = ? AND used = FALSE AND expires_at > ? \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&uid)
+        .bind(&now)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(Expired);
+        };
+
+        let otp_id: i64 = row.get("id");
+        let stored_code: String = row.get("code");
+        let failure_count: i64 = row.get("failure_count");
+
+        if failure_count >= 5 {
+            return Ok(Locked);
+        }
+
+        if stored_code == code {
+            sqlx::query("UPDATE email_verifications SET used = TRUE WHERE id = ?")
+                .bind(otp_id)
+                .execute(&self.pool)
+                .await?;
+            Ok(Success)
+        } else {
+            let new_count = failure_count + 1;
+            sqlx::query(
+                "UPDATE email_verifications SET failure_count = ? WHERE id = ?",
+            )
+            .bind(new_count)
+            .bind(otp_id)
+            .execute(&self.pool)
+            .await?;
+            if new_count >= 5 {
+                Ok(Locked)
+            } else {
+                Ok(Failure {
+                    remaining: (5 - new_count) as u32,
+                })
+            }
+        }
+    }
+
+    async fn latest_otp_created_at(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT created_at FROM email_verifications WHERE user_id = ? \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(user_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|s| s.parse().ok()))
+    }
+
+    async fn activate_user(&self, user_id: Uuid) -> Result<String> {
+        let raw = nanoid::nanoid!(32);
+        let hash = hex::encode(Sha256::digest(raw.as_bytes()));
+        sqlx::query(
+            "UPDATE users SET verified = TRUE, token_sha256 = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(&hash)
+        .bind(now_rfc3339())
+        .bind(user_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(raw)
+    }
+
+    async fn refresh_user_token(&self, user_id: Uuid) -> Result<String> {
+        let raw = nanoid::nanoid!(32);
+        let hash = hex::encode(Sha256::digest(raw.as_bytes()));
+        sqlx::query(
+            "UPDATE users SET token_sha256 = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(&hash)
+        .bind(now_rfc3339())
+        .bind(user_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(raw)
+    }
+
+    async fn sweep_unverified_users(&self, cutoff: DateTime<Utc>) -> Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM users \
+             WHERE verified = FALSE AND email IS NOT NULL AND created_at < ?",
+        )
+        .bind(rfc3339(cutoff))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    // ── User-owned targets ────────────────────────────────────────────────
+
+    async fn create_user_target(
+        &self,
+        params: CreateUserTargetParams,
+    ) -> Result<UserTarget> {
+        let id = nanoid::nanoid!(21);
+        let now = Utc::now();
+        let now_str = rfc3339(now);
+        let args_json = serde_json::to_string(&params.args)?;
+        let env_json = serde_json::to_string(&params.env)?;
+        let tags_json = serde_json::to_string(&params.tags)?;
+
+        sqlx::query(
+            "INSERT INTO user_targets \
+             (id, user_id, name, display, command, args, env, tags, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(params.user_id.to_string())
+        .bind(&params.name)
+        .bind(&params.display)
+        .bind(&params.command)
+        .bind(&args_json)
+        .bind(&env_json)
+        .bind(&tags_json)
+        .bind(&now_str)
+        .bind(&now_str)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(ref db) = e {
+                if db.is_unique_violation() {
+                    return Error::Conflict(format!(
+                        "target name '{}' already exists",
+                        params.name
+                    ));
+                }
+            }
+            Error::Storage(e)
+        })?;
+
+        Ok(UserTarget {
+            id,
+            user_id: params.user_id,
+            name: params.name,
+            display: params.display,
+            command: params.command,
+            args: params.args,
+            env: params.env,
+            tags: params.tags,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    async fn list_user_targets(&self, user_id: Uuid) -> Result<Vec<UserTarget>> {
+        let rows = sqlx::query(
+            "SELECT id, user_id, name, display, command, args, env, tags, created_at, updated_at \
+             FROM user_targets WHERE user_id = ? ORDER BY name",
+        )
+        .bind(user_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_user_target).collect()
+    }
+
+    async fn update_user_target(
+        &self,
+        id: &str,
+        user_id: Uuid,
+        display: &str,
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+        tags: &[String],
+    ) -> Result<UserTarget> {
+        let args_json = serde_json::to_string(args)?;
+        let env_json = serde_json::to_string(env)?;
+        let tags_json = serde_json::to_string(tags)?;
+        let now_str = now_rfc3339();
+
+        let result = sqlx::query(
+            "UPDATE user_targets \
+             SET display = ?, command = ?, args = ?, env = ?, tags = ?, updated_at = ? \
+             WHERE id = ? AND user_id = ?",
+        )
+        .bind(display)
+        .bind(command)
+        .bind(&args_json)
+        .bind(&env_json)
+        .bind(&tags_json)
+        .bind(&now_str)
+        .bind(id)
+        .bind(user_id.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::PermissionDenied(format!(
+                "target {id} not found or not owned by caller"
+            )));
+        }
+
+        self.find_user_target_by_id(id)
+            .await?
+            .ok_or_else(|| Error::Internal("target disappeared after update".into()))
+    }
+
+    async fn delete_user_target(&self, id: &str, user_id: Uuid) -> Result<()> {
+        let result = sqlx::query(
+            "DELETE FROM user_targets WHERE id = ? AND user_id = ?",
+        )
+        .bind(id)
+        .bind(user_id.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(Error::PermissionDenied(format!(
+                "target {id} not found or not owned by caller"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn find_user_target_by_id(&self, id: &str) -> Result<Option<UserTarget>> {
+        let row = sqlx::query(
+            "SELECT id, user_id, name, display, command, args, env, tags, created_at, updated_at \
+             FROM user_targets WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| row_to_user_target(&r)).transpose()
+    }
 }
 
 #[cfg(test)]
@@ -1221,7 +1591,7 @@ mod tests {
         // value so the assertion below is exact-string equality, not
         // a fuzzy "some timestamp near now" check.
         let s_old = store
-            .create_session_with_owner(alice.id, "shell", InputMode::Serialized)
+            .create_session_with_owner(alice.id, "shell", InputMode::Serialized, None)
             .await
             .unwrap();
         store
@@ -1245,7 +1615,7 @@ mod tests {
 
         // New active session that the sweep should actually close.
         let s_new = store
-            .create_session_with_owner(alice.id, "shell", InputMode::Serialized)
+            .create_session_with_owner(alice.id, "shell", InputMode::Serialized, None)
             .await
             .unwrap();
 
@@ -1289,7 +1659,7 @@ mod tests {
         let store = SqliteStorage::new_memory().await.unwrap();
         let (alice, _) = store.create_user("alice", false).await.unwrap();
         let session = store
-            .create_session_with_owner(alice.id, "shell", InputMode::Serialized)
+            .create_session_with_owner(alice.id, "shell", InputMode::Serialized, None)
             .await
             .unwrap();
 
@@ -1336,7 +1706,7 @@ mod tests {
         let (alice, _) = store.create_user("alice", false).await.unwrap();
         let (bob, _) = store.create_user("bob", false).await.unwrap();
         let session = store
-            .create_session_with_owner(alice.id, "shell", InputMode::Serialized)
+            .create_session_with_owner(alice.id, "shell", InputMode::Serialized, None)
             .await
             .unwrap();
 
@@ -1345,5 +1715,114 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, None, "non-member lookup must return None");
+    }
+
+    #[tokio::test]
+    async fn register_and_verify_otp_flow() {
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let expires = Utc::now() + chrono::Duration::minutes(15);
+
+        let user = s
+            .register_user("alice@example.com", "hash_placeholder", "alice")
+            .await
+            .unwrap();
+        assert_eq!(user.email.as_deref(), Some("alice@example.com"));
+        assert!(!user.verified);
+
+        // duplicate email is Conflict
+        let err = s
+            .register_user("alice@example.com", "h2", "alice2")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Conflict(_)));
+
+        // create and verify OTP
+        s.create_otp(user.id, "123456", expires).await.unwrap();
+        let result = s.verify_otp(user.id, "123456").await.unwrap();
+        assert_eq!(result, OtpVerifyResult::Success);
+
+        // second use is Expired (already used)
+        let result2 = s.verify_otp(user.id, "123456").await.unwrap();
+        assert_eq!(result2, OtpVerifyResult::Expired);
+
+        // activate returns a bearer token
+        let raw_token = s.activate_user(user.id).await.unwrap();
+        assert!(!raw_token.is_empty());
+
+        // token validates
+        let authed = s.validate_token(&raw_token).await.unwrap();
+        assert_eq!(authed.id, user.id);
+        assert!(authed.verified);
+    }
+
+    #[tokio::test]
+    async fn otp_failure_locking() {
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let user = s
+            .register_user("bob@example.com", "h", "bob")
+            .await
+            .unwrap();
+        let expires = Utc::now() + chrono::Duration::minutes(15);
+        s.create_otp(user.id, "999999", expires).await.unwrap();
+
+        for i in 0..5u32 {
+            let r = s.verify_otp(user.id, "000000").await.unwrap();
+            if i < 4 {
+                assert_eq!(r, OtpVerifyResult::Failure { remaining: 4 - i });
+            } else {
+                assert_eq!(r, OtpVerifyResult::Locked);
+            }
+        }
+        // 6th attempt still locked
+        assert_eq!(
+            s.verify_otp(user.id, "999999").await.unwrap(),
+            OtpVerifyResult::Locked
+        );
+    }
+
+    #[tokio::test]
+    async fn login_with_password_generates_token() {
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let user = s
+            .register_user("carol@example.com", "bogushash", "carol")
+            .await
+            .unwrap();
+        let _tok = s.activate_user(user.id).await.unwrap();
+        let tok2 = s.refresh_user_token(user.id).await.unwrap();
+        let authed = s.validate_token(&tok2).await.unwrap();
+        assert_eq!(authed.id, user.id);
+    }
+
+    #[tokio::test]
+    async fn schema_has_email_verifications_and_user_targets() {
+        let s = SqliteStorage::new_memory().await.unwrap();
+        // Verify new columns on existing tables exist via SELECT (no FK/data needed).
+        sqlx::query("SELECT email, password_hash, verified FROM users LIMIT 1")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        sqlx::query("SELECT user_target_id FROM sessions LIMIT 1")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        // Verify new tables exist by inserting with a real user.
+        let (user, _) = s.create_user("schematest", false).await.unwrap();
+        let uid = user.id.to_string();
+        sqlx::query(
+            "INSERT INTO email_verifications (user_id, code, expires_at, created_at)
+             VALUES (?, '123456', '2099-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(&uid)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO user_targets (id, user_id, name, display, command, created_at, updated_at)
+             VALUES ('t1', ?, 'test', 'Test', 'bash', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(&uid)
+        .execute(&s.pool)
+        .await
+        .unwrap();
     }
 }

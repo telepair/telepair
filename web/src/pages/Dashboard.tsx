@@ -3,11 +3,12 @@ import { createSignal, onMount, Show, For, createMemo, createEffect } from 'soli
 import { useNavigate, useSearchParams } from '@solidjs/router';
 import { auth } from '../stores/auth';
 import { sessionStore, type SessionsFilter } from '../stores/session';
-import type { CloseReason, InputMode, Session, TargetInfo } from '../lib/protocol';
+import type { CloseReason, InputMode, Session, TargetInfo, UserTargetInfo } from '../lib/protocol';
 import Banner from '../components/Banner';
 import { TargetCardSkeleton } from '../components/Skeleton';
 import CreateSessionDialog from '../components/CreateSessionDialog';
 import SessionDetailDialog from '../components/SessionDetailDialog';
+import UserTargetDrawer from '../components/UserTargetDrawer';
 import LocaleSwitcher from '../components/LocaleSwitcher';
 import { inputModeLabel, useI18n, type Translator } from '../i18n';
 
@@ -44,6 +45,17 @@ export default function Dashboard() {
   // still navigate to the live session page below — the dialog is the
   // *history* surface, not a generic detail view.
   const [detailSession, setDetailSession] = createSignal<Session | null>(null);
+  // UserTargetDrawer: null = closed, undefined = create mode, object = edit mode
+  const [drawerTarget, setDrawerTarget] = createSignal<UserTargetInfo | null | undefined>(null);
+
+  // Split the flat target list into global (from targets.yaml) and
+  // user-owned, so the Dashboard can render two separate sections.
+  const globalTargets = createMemo(() =>
+    sessionStore.targets().filter((t) => t.source === 'global'),
+  );
+  const userTargets = createMemo(() =>
+    sessionStore.targets().filter((t) => t.source === 'user') as (TargetInfo & { id: string })[],
+  );
 
   onMount(() => {
     // Identity load is fire-and-forget: the dashboard's owner-gate
@@ -130,6 +142,17 @@ export default function Dashboard() {
   const handleRefresh = () => {
     setLaunchError('');
     sessionStore.refresh();
+  };
+
+  const handleTargetSaved = (_saved: UserTargetInfo) => {
+    setDrawerTarget(null);
+    // Reload target list so the new/updated card appears immediately.
+    sessionStore.fetchTargets();
+  };
+
+  const handleTargetDeleted = (_id: string) => {
+    setDrawerTarget(null);
+    sessionStore.fetchTargets();
   };
 
   const handleTabClick = (tab: SessionsFilter) => {
@@ -254,6 +277,7 @@ export default function Dashboard() {
       </Show>
 
       <main class="content">
+        {/* ── Global targets ── */}
         <section>
           <div class="section-header">
             <h2>{t('dashboard.targets_heading')}</h2>
@@ -270,7 +294,7 @@ export default function Dashboard() {
             }
           >
             <Show
-              when={sessionStore.targets().length > 0}
+              when={globalTargets().length > 0}
               fallback={
                 <div class="empty-state">
                   <p class="empty-title">{t('dashboard.targets_empty_title')}</p>
@@ -279,7 +303,7 @@ export default function Dashboard() {
               }
             >
               <div class="target-grid">
-                <For each={sessionStore.targets()}>
+                <For each={globalTargets()}>
                   {(target) => (
                     <button
                       type="button"
@@ -302,6 +326,75 @@ export default function Dashboard() {
             </Show>
           </Show>
         </section>
+
+        {/* ── User-owned targets ── */}
+        <Show when={!auth.currentUserIsGuest()}>
+          <section>
+            <div class="section-header">
+              <h2>{t('dashboard.my_targets_heading')}</h2>
+              <div class="section-header-actions">
+                <p class="section-hint">{t('dashboard.my_targets_hint')}</p>
+                <button
+                  type="button"
+                  class="new-target-btn"
+                  onClick={() => setDrawerTarget(undefined)}
+                >
+                  {t('dashboard.my_targets_new')}
+                </button>
+              </div>
+            </div>
+            <Show when={userTargets().length > 0} fallback={
+              <p class="muted">{t('dashboard.my_targets_empty')}</p>
+            }>
+              <div class="target-grid">
+                <For each={userTargets()}>
+                  {(target) => (
+                    <div class="target-card user-target-card">
+                      <button
+                        type="button"
+                        class="target-card-body"
+                        onClick={() => handleCardClick(target)}
+                      >
+                        <div class="target-name">{target.display}</div>
+                        <div class="target-id">{target.name}</div>
+                        <Show when={target.tags.length > 0}>
+                          <div class="tags">
+                            <For each={target.tags}>
+                              {(tag) => <span class="tag">{tag}</span>}
+                            </For>
+                          </div>
+                        </Show>
+                      </button>
+                      <button
+                        type="button"
+                        class="edit-target-btn"
+                        aria-label={t('dashboard.my_targets_edit_aria', { name: target.name })}
+                        onClick={() => {
+                          // Fetch the full user target by id from the target list.
+                          // The TargetInfo has id; we cast to build a minimal UserTargetInfo.
+                          setDrawerTarget({
+                            id: target.id!,
+                            user_id: '',
+                            name: target.name,
+                            display: target.display,
+                            command: '',
+                            args: [],
+                            env: {},
+                            tags: target.tags,
+                            created_at: '',
+                            updated_at: '',
+                          });
+                        }}
+                      >
+                        ✎
+                      </button>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </Show>
+          </section>
+        </Show>
 
         <section>
           <div class="section-header">
@@ -384,6 +477,13 @@ export default function Dashboard() {
       <SessionDetailDialog
         session={detailSession()}
         onClose={() => setDetailSession(null)}
+      />
+
+      <UserTargetDrawer
+        target={drawerTarget()}
+        onClose={() => setDrawerTarget(null)}
+        onSaved={handleTargetSaved}
+        onDeleted={handleTargetDeleted}
       />
 
       <style>{`
@@ -493,6 +593,53 @@ export default function Dashboard() {
         }
         .target-card:hover { border-color: var(--accent); }
         .target-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+        /* User-owned target card: wrapper div, with a launch button body and an edit icon */
+        .user-target-card {
+          position: relative;
+          padding: 0;
+          display: flex;
+          flex-direction: column;
+        }
+        .target-card-body {
+          flex: 1;
+          background: transparent;
+          border: none;
+          padding: 16px;
+          cursor: pointer;
+          text-align: left;
+          font: inherit;
+          color: inherit;
+          border-radius: 8px;
+        }
+        .user-target-card:hover { border-color: var(--accent); }
+        .edit-target-btn {
+          position: absolute;
+          top: 8px;
+          right: 8px;
+          background: transparent;
+          border: 1px solid transparent;
+          border-radius: 6px;
+          font-size: 14px;
+          color: var(--text-secondary);
+          padding: 2px 6px;
+          cursor: pointer;
+          opacity: 0;
+          transition: opacity 0.15s;
+        }
+        .user-target-card:hover .edit-target-btn,
+        .edit-target-btn:focus-visible { opacity: 1; }
+        .edit-target-btn:hover { border-color: var(--border); color: var(--text-primary); background: transparent; }
+        .section-header-actions {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+        }
+        .new-target-btn {
+          font-size: 12px;
+          padding: 5px 12px;
+          border-radius: 999px;
+          white-space: nowrap;
+        }
         .target-name { font-weight: 600; margin-bottom: 4px; }
         .target-id { font-family: var(--font-mono); font-size: 12px; color: var(--text-secondary); }
         .tags { margin-top: 8px; display: flex; gap: 4px; flex-wrap: wrap; }

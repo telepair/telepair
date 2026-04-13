@@ -39,11 +39,25 @@ impl SessionService {
         target_name: &str,
         input_mode: InputMode,
     ) -> Result<Session> {
+        self.create_session_with_user_target(owner, target_name, input_mode, None)
+            .await
+    }
+
+    /// Like `create_session` but also records a `user_target_id` on the
+    /// session row so the WS PTY spawn path can look up the user-owned
+    /// target config if `TargetEngine::resolve` misses.
+    pub async fn create_session_with_user_target(
+        &self,
+        owner: &User,
+        target_name: &str,
+        input_mode: InputMode,
+        user_target_id: Option<&str>,
+    ) -> Result<Session> {
         // Atomic: session row + owner participant row land together or
         // not at all. See `Storage::create_session_with_owner`.
         let session = self
             .storage
-            .create_session_with_owner(owner.id, target_name, input_mode)
+            .create_session_with_owner(owner.id, target_name, input_mode, user_target_id)
             .await?;
 
         // Audit the lifecycle event after the storage write has

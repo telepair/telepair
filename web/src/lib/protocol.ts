@@ -96,6 +96,24 @@ export interface TargetInfo {
   name: string;
   display: string;
   tags: string[];
+  /** "global" for targets.yaml entries; "user" for user-owned targets. */
+  source: 'global' | 'user';
+  /** Present only for user-owned targets. */
+  id?: string;
+  admin_only: boolean;
+}
+
+export interface UserTargetInfo {
+  id: string;
+  user_id: string;
+  name: string;
+  display: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  tags: string[];
+  created_at: string;
+  updated_at: string;
 }
 
 // --- Client → Server ---

@@ -110,3 +110,36 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts      ON audit_events(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_events(session_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_actor   ON audit_events(actor_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_type    ON audit_events(event_type, ts DESC);
+
+-- OTP verification codes for email-based registration.
+-- Codes are 6-digit, short-lived (15 min), single-use, and have a
+-- failure counter that locks the code after 5 wrong attempts.
+CREATE TABLE IF NOT EXISTS email_verifications (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       TEXT    NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code          TEXT    NOT NULL,
+    expires_at    TEXT    NOT NULL,
+    used          BOOLEAN NOT NULL DEFAULT FALSE,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_verif_user_id ON email_verifications(user_id, created_at DESC);
+
+-- Per-user virtual targets (SSH, commands, etc.) created via the Web UI.
+-- Merged with global targets from targets.yaml at list time.
+CREATE TABLE IF NOT EXISTS user_targets (
+    id         TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    display    TEXT NOT NULL,
+    command    TEXT NOT NULL,
+    args       TEXT NOT NULL DEFAULT '[]',
+    env        TEXT NOT NULL DEFAULT '{}',
+    tags       TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (user_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_targets_user_id ON user_targets(user_id);

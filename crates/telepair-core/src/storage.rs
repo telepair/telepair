@@ -9,8 +9,8 @@ use crate::audit::{AuditEvent, AuditFilter};
 use crate::error::Result;
 use crate::permission::Role;
 use crate::session::{
-    CloseReason, InputMode, InviteToken, Participant, RedeemIdentity, RedeemOutcome, Session,
-    SessionListFilter, User,
+    CloseReason, CreateUserTargetParams, InputMode, InviteToken, OtpVerifyResult, Participant,
+    RedeemIdentity, RedeemOutcome, Session, SessionListFilter, User, UserTarget,
 };
 
 pub use sqlite::SqliteStorage;
@@ -34,11 +34,17 @@ pub trait Storage: Send + Sync {
     /// between the two statements would otherwise leave the session
     /// without its owner participant, making the owner appear unable to
     /// join their own session.
+    ///
+    /// `user_target_id` is `Some(nanoid)` when the session was launched
+    /// from a user-owned target rather than a global (targets.yaml) one.
+    /// The WS PTY spawn path reads this when `TargetEngine::resolve`
+    /// returns `None`.
     async fn create_session_with_owner(
         &self,
         owner_id: Uuid,
         target_name: &str,
         input_mode: InputMode,
+        user_target_id: Option<&str>,
     ) -> Result<Session>;
     async fn get_session(&self, id: &str) -> Result<Option<Session>>;
     /// Close a session and stamp `reason` into the `closed_reason`
@@ -168,6 +174,69 @@ pub trait Storage: Send + Sync {
     /// `Error::InvalidInput` if the row does not exist so callers
     /// can distinguish "already gone" (→ 404) from "real error".
     async fn revoke_invite(&self, token_sha256: &str) -> Result<()>;
+
+    // Auth — email registration
+    /// Create an unverified user row. Returns `Error::Conflict` if the email
+    /// is already registered. No `token_sha256` is set until `activate_user`.
+    async fn register_user(
+        &self,
+        email: &str,
+        password_hash: &str,
+        display_name: &str,
+    ) -> Result<User>;
+
+    async fn get_user_by_email(&self, email: &str) -> Result<Option<User>>;
+
+    /// Returns the bcrypt/argon2 hash for `email`. None if the user does
+    /// not exist or has no password set. Not on the trait — SqliteStorage
+    /// exposes it directly.
+
+    /// Insert an OTP row for `user_id`.
+    async fn create_otp(
+        &self,
+        user_id: Uuid,
+        code: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<()>;
+
+    /// Atomically check `code` against the latest eligible OTP row.
+    /// Increments `failure_count` on mismatch (locking at 5); marks
+    /// `used=true` on match.
+    async fn verify_otp(&self, user_id: Uuid, code: &str) -> Result<OtpVerifyResult>;
+
+    /// Returns the `created_at` of the most recently inserted OTP row
+    /// for `user_id`. Used by the 60-second rate-limit check.
+    async fn latest_otp_created_at(&self, user_id: Uuid) -> Result<Option<DateTime<Utc>>>;
+
+    /// Flip `verified=TRUE` and generate + store a new nanoid token.
+    /// Returns the raw token.
+    async fn activate_user(&self, user_id: Uuid) -> Result<String>;
+
+    /// Generate a fresh nanoid token for an already-verified user and
+    /// overwrite `token_sha256`. Previous tokens are immediately invalid.
+    async fn refresh_user_token(&self, user_id: Uuid) -> Result<String>;
+
+    /// Remove every user row where `verified=FALSE` and
+    /// `created_at < cutoff`.
+    async fn sweep_unverified_users(&self, cutoff: DateTime<Utc>) -> Result<u64>;
+
+    // User-owned targets
+    async fn create_user_target(&self, params: CreateUserTargetParams) -> Result<UserTarget>;
+    async fn list_user_targets(&self, user_id: Uuid) -> Result<Vec<UserTarget>>;
+    async fn update_user_target(
+        &self,
+        id: &str,
+        user_id: Uuid,
+        display: &str,
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+        tags: &[String],
+    ) -> Result<UserTarget>;
+    /// Delete a user target. Returns `Error::PermissionDenied` if
+    /// `user_id` does not own the target.
+    async fn delete_user_target(&self, id: &str, user_id: Uuid) -> Result<()>;
+    async fn find_user_target_by_id(&self, id: &str) -> Result<Option<UserTarget>>;
 
     // Audit log
     /// Append a single [`AuditEvent`] to the `audit_events` table.

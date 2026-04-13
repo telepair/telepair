@@ -93,6 +93,13 @@ function readInitialToken(): string {
 export type AuthErrorKey =
   | 'auth.error_invalid_token'
   | 'auth.error_connection_failed'
+  | 'auth.error_email_taken'
+  | 'auth.error_invalid_otp'
+  | 'auth.error_otp_locked'
+  | 'auth.error_invalid_credentials'
+  | 'auth.error_not_verified'
+  | 'auth.error_rate_limited'
+  | 'auth.error_smtp_unavailable'
   | null;
 
 const [token, setTokenSignal] = createSignal(readInitialToken());
@@ -257,6 +264,85 @@ async function validateToken(t: string): Promise<boolean> {
   }
 }
 
+/**
+ * Email-based registration. Sends the OTP to the user's inbox.
+ * Callers should transition to an OTP-entry step on `true`.
+ */
+async function emailRegister(
+  email: string,
+  password: string,
+  displayName: string,
+): Promise<boolean> {
+  setValidating(true);
+  try {
+    await api.register(email, password, displayName);
+    setErrorKey(null);
+    return true;
+  } catch (e) {
+    if (e instanceof ApiError) {
+      if (e.status === 409) setErrorKey('auth.error_email_taken');
+      else if (e.status === 503) setErrorKey('auth.error_smtp_unavailable');
+      else setErrorKey('auth.error_connection_failed');
+    } else {
+      setErrorKey('auth.error_connection_failed');
+    }
+    return false;
+  } finally {
+    setValidating(false);
+  }
+}
+
+/**
+ * OTP verification step. On success, stores the returned token (persistent)
+ * and loads the user identity — same behaviour as a successful `validateToken`.
+ */
+async function emailVerifyOtp(email: string, code: string): Promise<boolean> {
+  setValidating(true);
+  try {
+    const { token: t } = await api.verifyOtp(email, code);
+    setToken(t, { persist: true });
+    await loadIdentity();
+    setErrorKey(null);
+    return true;
+  } catch (e) {
+    if (e instanceof ApiError) {
+      if (e.status === 429) setErrorKey('auth.error_otp_locked');
+      else if (e.status === 400) setErrorKey('auth.error_invalid_otp');
+      else setErrorKey('auth.error_connection_failed');
+    } else {
+      setErrorKey('auth.error_connection_failed');
+    }
+    return false;
+  } finally {
+    setValidating(false);
+  }
+}
+
+/**
+ * Email+password login. Stores the token persistently and loads identity.
+ */
+async function emailLogin(email: string, password: string): Promise<boolean> {
+  setValidating(true);
+  try {
+    const { token: t } = await api.loginWithPassword(email, password);
+    setToken(t, { persist: true });
+    await loadIdentity();
+    setErrorKey(null);
+    return true;
+  } catch (e) {
+    if (e instanceof ApiError) {
+      if (e.status === 401) setErrorKey('auth.error_invalid_credentials');
+      else if (e.status === 403) setErrorKey('auth.error_not_verified');
+      else setErrorKey('auth.error_connection_failed');
+    } else {
+      setErrorKey('auth.error_connection_failed');
+    }
+    return false;
+  } finally {
+    setValidating(false);
+  }
+}
+
 function logout() {
   setToken('');
 }
@@ -293,6 +379,9 @@ export const auth = {
   identityChecked,
   setToken,
   validateToken,
+  emailRegister,
+  emailVerifyOtp,
+  emailLogin,
   loadIdentity,
   logout,
   logoutAndRedirect,

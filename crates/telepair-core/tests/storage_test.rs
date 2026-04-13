@@ -41,7 +41,7 @@ async fn create_and_get_session() {
     let store = setup().await;
     let (user, _) = store.create_user("dave", false).await.unwrap();
     let session = store
-        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized)
+        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized, None)
         .await
         .unwrap();
     assert_eq!(session.target_name, "local-shell");
@@ -56,7 +56,7 @@ async fn add_and_list_participants() {
     let (owner, _) = store.create_user("eve", false).await.unwrap();
     let (viewer, _) = store.create_user("frank", false).await.unwrap();
     let session = store
-        .create_session_with_owner(owner.id, "shell", InputMode::Serialized)
+        .create_session_with_owner(owner.id, "shell", InputMode::Serialized, None)
         .await
         .unwrap();
 
@@ -78,7 +78,7 @@ async fn close_session() {
     let store = setup().await;
     let (user, _) = store.create_user("grace", false).await.unwrap();
     let session = store
-        .create_session_with_owner(user.id, "shell", InputMode::Serialized)
+        .create_session_with_owner(user.id, "shell", InputMode::Serialized, None)
         .await
         .unwrap();
 
@@ -106,7 +106,7 @@ async fn create_session_with_owner_is_atomic() {
     let store = setup().await;
     let (user, _) = store.create_user("atomic", false).await.unwrap();
     let session = store
-        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized)
+        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized, None)
         .await
         .unwrap();
 
@@ -134,7 +134,7 @@ async fn create_session_with_owner_rolls_back_on_fk_violation() {
     let store = setup().await;
     let ghost_owner = uuid::Uuid::new_v4();
     let result = store
-        .create_session_with_owner(ghost_owner, "local-shell", InputMode::Serialized)
+        .create_session_with_owner(ghost_owner, "local-shell", InputMode::Serialized, None)
         .await;
     assert!(
         result.is_err(),
@@ -165,7 +165,7 @@ async fn list_sessions_offset_without_limit_returns_remaining_rows() {
     let (user, _) = store.create_user("paginator", false).await.unwrap();
     for _ in 0..3 {
         store
-            .create_session_with_owner(user.id, "local-shell", InputMode::Serialized)
+            .create_session_with_owner(user.id, "local-shell", InputMode::Serialized, None)
             .await
             .unwrap();
     }
@@ -196,11 +196,11 @@ async fn list_sessions_target_name_filter_narrows_results() {
     let store = setup().await;
     let (user, _) = store.create_user("deeplink", false).await.unwrap();
     let kept = store
-        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized)
+        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized, None)
         .await
         .unwrap();
     store
-        .create_session_with_owner(user.id, "other-target", InputMode::Serialized)
+        .create_session_with_owner(user.id, "other-target", InputMode::Serialized, None)
         .await
         .unwrap();
 
@@ -228,7 +228,7 @@ async fn corrupt_closed_at_is_reported_not_silently_dropped() {
     let store = SqliteStorage::new(&uri).await.unwrap();
     let (user, _) = store.create_user("victim", false).await.unwrap();
     let session = store
-        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized)
+        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized, None)
         .await
         .unwrap();
 
@@ -276,7 +276,7 @@ async fn deleting_session_cascades_to_participants_and_invites() {
     let store = SqliteStorage::new(&uri).await.unwrap();
     let (user, _) = store.create_user("doomed", false).await.unwrap();
     let session = store
-        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized)
+        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized, None)
         .await
         .unwrap();
     let (_, _raw) = store

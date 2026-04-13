@@ -5,18 +5,31 @@ import { auth } from '../stores/auth';
 import { useI18n, renderTemplate } from '../i18n';
 import LocaleSwitcher from '../components/LocaleSwitcher';
 
+type LoginMode = 'token' | 'email';
+
 export default function Login() {
   const { t } = useI18n();
   const navigate = useNavigate();
-  const [input, setInput] = createSignal('');
+  const [mode, setMode] = createSignal<LoginMode>('email');
+
+  // Token mode
+  const [tokenInput, setTokenInput] = createSignal('');
   const [showHelp, setShowHelp] = createSignal(false);
 
-  const handleSubmit = async (e: Event) => {
+  // Email mode
+  const [email, setEmail] = createSignal('');
+  const [password, setPassword] = createSignal('');
+
+  const handleTokenSubmit = async (e: Event) => {
     e.preventDefault();
-    const ok = await auth.validateToken(input());
-    if (ok) {
-      navigate('/', { replace: true });
-    }
+    const ok = await auth.validateToken(tokenInput());
+    if (ok) navigate('/', { replace: true });
+  };
+
+  const handleEmailSubmit = async (e: Event) => {
+    e.preventDefault();
+    const ok = await auth.emailLogin(email(), password());
+    if (ok) navigate('/', { replace: true });
   };
 
   return (
@@ -25,52 +38,109 @@ export default function Login() {
         <h1>telepair</h1>
         <p class="subtitle">{t('login.subtitle')}</p>
 
-        <form onSubmit={handleSubmit}>
-          <label for="token">{t('login.token_label')}</label>
-          <input
-            id="token"
-            type="password"
-            placeholder={t('login.token_placeholder')}
-            value={input()}
-            onInput={(e) => setInput(e.currentTarget.value)}
-            autofocus
-          />
-
-          <Show when={auth.errorKey()}>
-            {(key) => <p class="error-msg">{t(key())}</p>}
-          </Show>
-
-          <button type="submit" class="primary" disabled={auth.validating() || !input()}>
-            {auth.validating() ? t('login.validating') : t('login.connect')}
+        <div class="mode-tabs" role="tablist">
+          <button
+            role="tab"
+            aria-selected={mode() === 'email'}
+            class={`mode-tab ${mode() === 'email' ? 'active' : ''}`}
+            onClick={() => setMode('email')}
+          >
+            {t('login.mode_email')}
           </button>
-        </form>
+          <button
+            role="tab"
+            aria-selected={mode() === 'token'}
+            class={`mode-tab ${mode() === 'token' ? 'active' : ''}`}
+            onClick={() => setMode('token')}
+          >
+            {t('login.mode_token')}
+          </button>
+        </div>
 
-        <button
-          type="button"
-          class="help-toggle"
-          onClick={() => setShowHelp(!showHelp())}
-          aria-expanded={showHelp()}
-        >
-          {showHelp() ? t('login.help_hide') : t('login.help_show')}
-        </button>
+        <Show when={mode() === 'email'}>
+          <form onSubmit={handleEmailSubmit}>
+            <label for="email">{t('login.email_label')}</label>
+            <input
+              id="email"
+              type="email"
+              placeholder={t('login.email_placeholder')}
+              value={email()}
+              onInput={(e) => setEmail(e.currentTarget.value)}
+              autocomplete="email"
+              autofocus
+            />
+            <label for="password">{t('login.password_label')}</label>
+            <input
+              id="password"
+              type="password"
+              placeholder={t('login.password_placeholder')}
+              value={password()}
+              onInput={(e) => setPassword(e.currentTarget.value)}
+              autocomplete="current-password"
+            />
 
-        <Show when={showHelp()}>
-          <div class="help-panel">
-            {/* The help text mixes translated copy with literal <code>
-                tags for the on-disk path and CLI command. Splitting on
-                `{{ path }}` / `{{ cmd }}` lets the translation control
-                the surrounding sentence while keeping the technical
-                tokens untranslated and visually distinct. */}
-            <p>{renderTemplate(
-              t('login.help_first_run'),
-              { path: <code>~/.telepair/admin_token</code> },
-            )}</p>
-            <p>{renderTemplate(
-              t('login.help_lost'),
-              { cmd: <code>telepair admin show-token</code> },
-            )}</p>
-            <p>{t('login.help_joining')}</p>
-          </div>
+            <Show when={auth.errorKey()}>
+              {(key) => <p class="error-msg">{t(key())}</p>}
+            </Show>
+
+            <button
+              type="submit"
+              class="primary"
+              disabled={auth.validating() || !email() || !password()}
+            >
+              {auth.validating() ? t('login.signing_in') : t('login.sign_in')}
+            </button>
+          </form>
+
+          <p class="register-hint">
+            {t('login.no_account')}{' '}
+            <a href="/register">{t('login.register_link')}</a>
+          </p>
+        </Show>
+
+        <Show when={mode() === 'token'}>
+          <form onSubmit={handleTokenSubmit}>
+            <label for="token">{t('login.token_label')}</label>
+            <input
+              id="token"
+              type="password"
+              placeholder={t('login.token_placeholder')}
+              value={tokenInput()}
+              onInput={(e) => setTokenInput(e.currentTarget.value)}
+              autofocus
+            />
+
+            <Show when={auth.errorKey()}>
+              {(key) => <p class="error-msg">{t(key())}</p>}
+            </Show>
+
+            <button type="submit" class="primary" disabled={auth.validating() || !tokenInput()}>
+              {auth.validating() ? t('login.validating') : t('login.connect')}
+            </button>
+          </form>
+
+          <button
+            type="button"
+            class="help-toggle"
+            onClick={() => setShowHelp(!showHelp())}
+            aria-expanded={showHelp()}
+          >
+            {showHelp() ? t('login.help_hide') : t('login.help_show')}
+          </button>
+
+          <Show when={showHelp()}>
+            <div class="help-panel">
+              <p>{renderTemplate(
+                t('login.help_first_run'),
+                { path: <code>~/.telepair/admin_token</code> },
+              )}</p>
+              <p>{renderTemplate(
+                t('login.help_lost'),
+                { cmd: <code>telepair admin show-token</code> },
+              )}</p>
+              <p>{t('login.help_joining')}</p>
+            </div>
+          </Show>
         </Show>
 
         <LocaleSwitcher variant="card" />
@@ -100,8 +170,36 @@ export default function Login() {
         }
         .subtitle {
           color: var(--text-secondary);
-          margin-bottom: 24px;
+          margin-bottom: 20px;
           font-size: 14px;
+        }
+        .mode-tabs {
+          display: flex;
+          gap: 4px;
+          background: var(--bg-tertiary);
+          border-radius: 8px;
+          padding: 4px;
+          margin-bottom: 20px;
+        }
+        .mode-tab {
+          flex: 1;
+          background: transparent;
+          border: none;
+          border-radius: 6px;
+          padding: 7px 12px;
+          font-size: 13px;
+          font-weight: 500;
+          color: var(--text-secondary);
+          cursor: pointer;
+          transition: background 0.15s, color 0.15s;
+        }
+        .mode-tab:hover {
+          color: var(--text-primary);
+        }
+        .mode-tab.active {
+          background: var(--bg-secondary);
+          color: var(--text-primary);
+          box-shadow: 0 1px 3px rgba(0,0,0,0.15);
         }
         .login-card form {
           text-align: left;
@@ -114,17 +212,31 @@ export default function Login() {
           margin-bottom: 6px;
         }
         .login-card input {
-          margin-bottom: 16px;
+          margin-bottom: 14px;
         }
         .login-card button[type="submit"] {
           width: 100%;
           padding: 10px;
           font-size: 15px;
+          margin-top: 2px;
         }
         .error-msg {
           color: var(--error);
           font-size: 13px;
           margin-bottom: 12px;
+        }
+        .register-hint {
+          margin-top: 16px;
+          font-size: 13px;
+          color: var(--text-secondary);
+        }
+        .register-hint a {
+          color: var(--accent);
+          text-decoration: none;
+          font-weight: 500;
+        }
+        .register-hint a:hover {
+          text-decoration: underline;
         }
         .help-toggle {
           margin-top: 16px;

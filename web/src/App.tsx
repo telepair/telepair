@@ -4,6 +4,7 @@ import { Show, onMount } from 'solid-js';
 import { auth } from './stores/auth';
 import { I18nProvider } from './i18n';
 import Login from './pages/Login';
+import Register from './pages/Register';
 import Dashboard from './pages/Dashboard';
 import Session from './pages/Session';
 import Join from './pages/Join';
@@ -64,6 +65,7 @@ export default function App() {
     <I18nProvider>
       <Router>
         <Route path="/login" component={Login} />
+        <Route path="/register" component={Register} />
         <Route path="/join/:token" component={Join} />
         <Route path="/" component={() => <AuthGuard><Dashboard /></AuthGuard>} />
         <Route path="/session/:id" component={() => <AuthGuard><Session /></AuthGuard>} />

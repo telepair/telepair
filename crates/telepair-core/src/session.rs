@@ -119,6 +119,12 @@ pub struct Session {
     /// v0.1.0 closed rows created before the column existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_reason: Option<CloseReason>,
+    /// Nanoid of the `user_targets` row backing this session, if the
+    /// session was launched from a user-owned target rather than a
+    /// global (`targets.yaml`) target. The WS PTY spawn path reads
+    /// this when `TargetEngine::resolve` returns `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_target_id: Option<String>,
 }
 
 /// Filter criteria for `Storage::list_sessions_for_user` and the
@@ -185,6 +191,16 @@ pub struct User {
     /// spawn new sessions behind the scenes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scoped_session_id: Option<String>,
+    /// Populated for email-registered users. `None` for token-only
+    /// accounts (admin created at first run, invite-minted guests).
+    /// Never serialized — not sent over the API.
+    #[serde(skip)]
+    pub email: Option<String>,
+    /// `false` until the user confirms their email OTP. Token-only
+    /// accounts are always considered verified (they received their
+    /// token out-of-band). Never serialized — not sent over the API.
+    #[serde(skip)]
+    pub verified: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -252,6 +268,53 @@ pub enum RedeemIdentity<'a> {
     /// should retry with a new name; the rolled-back transaction
     /// guarantees the invite's `used_count` is not drained.
     NewGuest { name: &'a str },
+}
+
+/// A virtual target owned by an individual user, stored in `user_targets`.
+/// These are created via the Web UI and merged with global targets from
+/// `targets.yaml` at list time. The `source` field in the API response
+/// distinguishes them (`"user"` vs `"global"`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserTarget {
+    pub id: String,
+    pub user_id: Uuid,
+    pub name: String,
+    pub display: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Params for creating a user-owned target.
+#[derive(Debug, Clone)]
+pub struct CreateUserTargetParams {
+    pub user_id: Uuid,
+    pub name: String,
+    pub display: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: std::collections::HashMap<String, String>,
+    pub tags: Vec<String>,
+}
+
+/// Result of a `Storage::verify_otp` call.
+#[derive(Debug, PartialEq)]
+pub enum OtpVerifyResult {
+    /// Code matched and was marked used.
+    Success,
+    /// Code did not match. `remaining` is how many attempts are left
+    /// before the OTP is locked (starts at 4 and counts down).
+    Failure { remaining: u32 },
+    /// Five consecutive wrong codes — OTP is permanently locked.
+    Locked,
+    /// No un-used, un-locked OTP found, or the OTP has expired.
+    Expired,
 }
 
 /// Return value of [`crate::storage::Storage::redeem_invite`]. Carries
