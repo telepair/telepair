@@ -17,6 +17,8 @@ export function getAdminToken(): string {
 export async function login(page: Page): Promise<void> {
   const token = getAdminToken();
   await page.goto('/login');
+  // Switch to the token tab (the login page defaults to email mode).
+  await page.getByRole('tab', { name: /admin token/i }).click();
   await page.locator('#token').fill(token);
   await page.locator('button[type="submit"]').click();
   await page.waitForURL('/');
@@ -32,7 +34,9 @@ export async function login(page: Page): Promise<void> {
  */
 export async function gotoSession(page: Page): Promise<string> {
   await login(page);
-  await page.locator('.target-card').first().click();
+  // Click the first *global* target card (button.target-card). User-owned
+  // targets use a different wrapper structure (.user-target-card > .target-card-body).
+  await page.locator('button.target-card').first().click();
   // Wait for the modal to appear, then click Launch. Targeting by
   // role="dialog" + accessible name is more robust than a CSS class.
   const dialog = page.getByRole('dialog', { name: 'Start a session' });

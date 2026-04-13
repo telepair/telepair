@@ -121,11 +121,13 @@ interface CurrentUser {
   id: string;
   isAdmin: boolean;
   isGuest: boolean;
+  sessionEnabled: boolean;
 }
 const [currentUser, setCurrentUser] = createSignal<CurrentUser | null>(null);
 const currentUserId = () => currentUser()?.id ?? '';
 const currentUserIsAdmin = () => currentUser()?.isAdmin ?? null;
 const currentUserIsGuest = () => currentUser()?.isGuest ?? null;
+const currentUserSessionEnabled = () => currentUser()?.sessionEnabled ?? null;
 
 // In-flight `loadIdentity` promise, memoized so two concurrent
 // mounts (e.g. Dashboard + AdminGuard on a deep link) share one
@@ -218,6 +220,7 @@ async function loadIdentity(): Promise<void> {
         id: me.user_id,
         isAdmin: me.is_admin,
         isGuest: me.is_guest,
+        sessionEnabled: me.session_enabled,
       });
     } catch {
       // Non-fatal: see comment above. Specifically NOT calling
@@ -307,7 +310,7 @@ async function emailVerifyOtp(email: string, code: string): Promise<boolean> {
   } catch (e) {
     if (e instanceof ApiError) {
       if (e.status === 429) setErrorKey('auth.error_otp_locked');
-      else if (e.status === 400) setErrorKey('auth.error_invalid_otp');
+      else if (e.status === 400 || e.status === 401) setErrorKey('auth.error_invalid_otp');
       else setErrorKey('auth.error_connection_failed');
     } else {
       setErrorKey('auth.error_connection_failed');
@@ -376,6 +379,7 @@ export const auth = {
   currentUserId,
   currentUserIsAdmin,
   currentUserIsGuest,
+  currentUserSessionEnabled,
   identityChecked,
   setToken,
   validateToken,

@@ -119,18 +119,65 @@ describe('api.listSessions filter', () => {
 });
 
 describe('api.createSession', () => {
-  it('sends POST with JSON body', async () => {
+  it('serializes a global target as target_name', async () => {
     store['telepair_token'] = 'tok';
-    const session = { id: 'abc', target_name: 'shell', input_mode: 'serialized', status: 'active', owner_id: 'u1', created_at: '', closed_at: null };
+    const session = { id: 'abc', target_name: 'shell', input_mode: 'multiplexed', status: 'active', owner_id: 'u1', created_at: '', closed_at: null };
     mockFetch.mockResolvedValueOnce(jsonResponse(session));
 
-    const result = await api.createSession('shell');
+    const result = await api.createSession({
+      name: 'shell',
+      display: 'Shell',
+      tags: [],
+      source: 'global',
+      admin_only: false,
+    });
     const [url, init] = mockFetch.mock.calls[0];
     expect(url).toBe('/api/sessions');
     expect(init.method).toBe('POST');
     expect(init.headers['Content-Type']).toBe('application/json');
-    expect(JSON.parse(init.body)).toEqual({ target_name: 'shell', input_mode: undefined });
+    // Body MUST contain target_name and MUST NOT contain target_id —
+    // this is the on-wire shape the new Rust handler asserts on, and
+    // the namespace contract that prevents collision-shadowing.
+    expect(JSON.parse(init.body)).toEqual({ target_name: 'shell' });
     expect(result.id).toBe('abc');
+  });
+
+  it('serializes a user target as target_id (never target_name)', async () => {
+    // Regression guard for the collision bug: even when the user-owned
+    // target shares its `name` with a global target, the on-wire body
+    // MUST address the row by stable nanoid so the backend resolves
+    // user-target storage and never the global engine. A future
+    // refactor that quietly forwards `target.name` instead would put
+    // us right back in the v0.1.1 collision-shadowing failure mode.
+    store['telepair_token'] = 'tok';
+    const session = { id: 'abc', target_name: 'vps', input_mode: 'multiplexed', status: 'active', owner_id: 'u1', created_at: '', closed_at: null, user_target_id: 'nano-1' };
+    mockFetch.mockResolvedValueOnce(jsonResponse(session));
+
+    await api.createSession({
+      name: 'vps',
+      display: 'My VPS',
+      tags: [],
+      source: 'user',
+      id: 'nano-1',
+      admin_only: false,
+    });
+    const [, init] = mockFetch.mock.calls[0];
+    const body = JSON.parse(init.body);
+    expect(body).toEqual({ target_id: 'nano-1' });
+    expect(body.target_name).toBeUndefined();
+  });
+
+  it('passes input_mode through when set', async () => {
+    store['telepair_token'] = 'tok';
+    const session = { id: 'abc', target_name: 'shell', input_mode: 'serialized', status: 'active', owner_id: 'u1', created_at: '', closed_at: null };
+    mockFetch.mockResolvedValueOnce(jsonResponse(session));
+
+    await api.createSession(
+      { name: 'shell', display: 'Shell', tags: [], source: 'global', admin_only: false },
+      'serialized',
+    );
+    const [, init] = mockFetch.mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({ target_name: 'shell', input_mode: 'serialized' });
   });
 });
 

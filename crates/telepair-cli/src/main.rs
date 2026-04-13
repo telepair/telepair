@@ -449,16 +449,18 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Sweep unverified accounts older than 24h. These are registrations
-    // that started but were never completed — the OTP expired and the
-    // user never came back. Running at startup keeps the DB tidy without
+    // Sweep abandoned pending registrations older than 24h. These are
+    // signups that started but were never completed — the OTP expired
+    // and the user never came back. The pending row carries no
+    // authority (no `users` entry, no token), so dropping it is purely
+    // hygiene. Running at startup keeps the table tidy without
     // requiring a separate cron job.
     {
         let cutoff = Utc::now() - Duration::hours(24);
-        match storage.sweep_unverified_users(cutoff).await {
+        match storage.sweep_pending_registrations(cutoff).await {
             Ok(0) => {}
-            Ok(n) => tracing::info!("swept {n} unverified account(s) older than 24h"),
-            Err(e) => tracing::warn!("failed to sweep unverified accounts: {e}"),
+            Ok(n) => tracing::info!("swept {n} abandoned pending registration(s) older than 24h"),
+            Err(e) => tracing::warn!("failed to sweep pending registrations: {e}"),
         }
     }
 

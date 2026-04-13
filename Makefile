@@ -2,6 +2,11 @@
 # Single entry point for fmt / lint / test / build across Rust + frontend.
 # Run `make help` for the full target list.
 
+# Guard: must be run from the repo root (where Cargo.toml lives).
+ifeq ($(wildcard Cargo.toml),)
+$(error Run 'make' from the project root where Cargo.toml lives, not from a subdirectory)
+endif
+
 WEB := web
 
 .DEFAULT_GOAL := help

@@ -4,11 +4,12 @@ import { login, getAdminToken } from './helpers';
 test.describe('Authentication', () => {
   test('login with valid token redirects to dashboard', async ({ page }) => {
     await login(page);
-    await expect(page.getByRole('heading', { name: 'Targets' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Targets', exact: true })).toBeVisible();
   });
 
   test('login with invalid token shows error', async ({ page }) => {
     await page.goto('/login');
+    await page.getByRole('tab', { name: /admin token/i }).click();
     await page.locator('#token').fill('invalid-token-12345');
     await page.locator('button[type="submit"]').click();
 

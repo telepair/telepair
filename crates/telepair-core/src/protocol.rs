@@ -23,6 +23,15 @@ pub mod error_codes {
     /// Pairs with [`crate::protocol::CLOSE_CODE_TRANSIENT`] so the
     /// close frame actually conveys "retry me".
     pub const STORAGE_ERROR: &str = "STORAGE_ERROR";
+    /// The caller's `session_enabled` bit is FALSE — their account
+    /// was registered through the public email-signup flow and has
+    /// not been approved by an admin yet. The token is still valid
+    /// for reads (whoami, history), but session create / attach is
+    /// closed. Pairs with the HTTP 403 that `POST /api/sessions`
+    /// returns for the same reason. Terminal close, not transient —
+    /// the client must route the user to a "pending approval" UI
+    /// rather than retry.
+    pub const SESSION_DISABLED: &str = "SESSION_DISABLED";
 }
 
 /// Terminal WebSocket close code — the client treats this as a

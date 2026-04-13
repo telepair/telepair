@@ -320,3 +320,18 @@ export interface ReloadTargetsResult {
   path: string;
   targets: number;
 }
+
+/**
+ * Mirrors `AdminUserInfo` in `crates/telepair-gateway/src/http.rs`.
+ * Returned by `GET /api/admin/users` and
+ * `POST /api/admin/users/{id}/{enable,disable}`.
+ */
+export interface AdminUserInfo {
+  id: string;
+  name: string;
+  email: string | null;
+  is_admin: boolean;
+  session_enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}

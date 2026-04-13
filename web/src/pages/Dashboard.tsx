@@ -4,6 +4,7 @@ import { useNavigate, useSearchParams } from '@solidjs/router';
 import { auth } from '../stores/auth';
 import { sessionStore, type SessionsFilter } from '../stores/session';
 import type { CloseReason, InputMode, Session, TargetInfo, UserTargetInfo } from '../lib/protocol';
+import { api } from '../lib/api';
 import Banner from '../components/Banner';
 import { TargetCardSkeleton } from '../components/Skeleton';
 import CreateSessionDialog from '../components/CreateSessionDialog';
@@ -125,7 +126,7 @@ export default function Dashboard() {
     setLaunching(true);
     setLastMode(mode);
     try {
-      const session = await sessionStore.createSession(target.name, mode);
+      const session = await sessionStore.createSession(target, mode);
       setPendingTarget(null);
       navigate(`/session/${session.id}`);
     } catch (e) {
@@ -250,6 +251,14 @@ export default function Dashboard() {
           <Show when={auth.currentUserIsAdmin() === true}>
             <a
               class="admin-link"
+              href="/admin/users"
+              aria-label={t('dashboard.admin_users_link_aria')}
+              data-testid="admin-users-link"
+            >
+              {t('dashboard.admin_users_link')}
+            </a>
+            <a
+              class="admin-link"
               href="/admin/targets"
               aria-label={t('dashboard.admin_targets_link_aria')}
               data-testid="admin-targets-link"
@@ -273,6 +282,12 @@ export default function Dashboard() {
       <Show when={launchError()}>
         <Banner variant="error" onDismiss={() => setLaunchError('')}>
           {launchError()}
+        </Banner>
+      </Show>
+
+      <Show when={auth.currentUserSessionEnabled() === false && !auth.currentUserIsAdmin()}>
+        <Banner variant="warning" role="status">
+          {t('dashboard.pending_approval_banner')}
         </Banner>
       </Show>
 
@@ -369,21 +384,9 @@ export default function Dashboard() {
                         type="button"
                         class="edit-target-btn"
                         aria-label={t('dashboard.my_targets_edit_aria', { name: target.name })}
-                        onClick={() => {
-                          // Fetch the full user target by id from the target list.
-                          // The TargetInfo has id; we cast to build a minimal UserTargetInfo.
-                          setDrawerTarget({
-                            id: target.id!,
-                            user_id: '',
-                            name: target.name,
-                            display: target.display,
-                            command: '',
-                            args: [],
-                            env: {},
-                            tags: target.tags,
-                            created_at: '',
-                            updated_at: '',
-                          });
+                        onClick={async () => {
+                          const full = await api.getUserTarget(target.id!);
+                          setDrawerTarget(full);
                         }}
                       >
                         ✎

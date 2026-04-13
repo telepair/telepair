@@ -65,6 +65,42 @@ fn require_unscoped(user: &User) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Emit an `auth.session_access_denied` audit row. Shared by the
+/// HTTP `require_session_enabled` gate and the WS attach gate so
+/// both attach surfaces produce the same audit shape and cannot
+/// drift independently.
+pub(crate) async fn audit_session_access_denied(
+    state: &AppState,
+    user: &User,
+    path: &str,
+    session_id: Option<&str>,
+) {
+    let mut event = telepair_core::audit::AuditEvent::new(
+        telepair_core::audit::AuditEventType::AuthSessionAccessDenied,
+    )
+    .with_actor(user.id, user.name.clone())
+    .with_detail(serde_json::json!({ "path": path }));
+    if let Some(sid) = session_id {
+        event = event.with_session(sid.to_string());
+    }
+    state.audit.record(event).await;
+}
+
+/// Gate the session-create / WS-attach handlers on the user's
+/// `session_enabled` bit. Admins bypass so bootstrap cannot lock
+/// itself out. Rejections are audited via [`audit_session_access_denied`].
+async fn require_session_enabled(
+    state: &AppState,
+    user: &User,
+    path: &str,
+) -> Result<(), ApiError> {
+    if user.session_enabled || user.is_admin {
+        return Ok(());
+    }
+    audit_session_access_denied(state, user, path, None).await;
+    Err(ApiError(StatusCode::FORBIDDEN))
+}
+
 // --- Handlers ---
 
 pub async fn health() -> impl IntoResponse {
@@ -157,6 +193,12 @@ struct WhoamiResponse {
     name: String,
     is_admin: bool,
     is_guest: bool,
+    /// Mirrors `User.session_enabled`. The Dashboard renders a
+    /// "pending admin approval" banner and hides the session-create
+    /// form when this is FALSE — surfacing the bit up front means
+    /// the user learns about the gate on page load instead of
+    /// hitting a mystery 403 when they click Create.
+    session_enabled: bool,
 }
 
 pub async fn whoami(
@@ -168,6 +210,7 @@ pub async fn whoami(
         user_id: user.id.to_string(),
         is_admin: user.is_admin,
         is_guest: user.is_guest(),
+        session_enabled: user.session_enabled,
         name: user.name,
     }))
 }
@@ -228,17 +271,60 @@ pub async fn list_targets(
     Ok(Json(entries))
 }
 
+/// Request body for `POST /api/sessions`.
+///
+/// Callers MUST set exactly one of `target_id` (user-owned target,
+/// addressed by its stable nanoid) or `target_name` (global target from
+/// `targets.yaml`, addressed by its name). Sending both, neither, or an
+/// empty string for either is a 400 — see `pick_target_selector` for the
+/// classifier and the rationale below.
+///
+/// Why two fields instead of one polymorphic string: the namespaces
+/// overlap. A global `vps` target and a user's own `vps` target are
+/// distinct rows that need to round-trip independently from create to WS
+/// attach. Before this split, the handler resolved global-first /
+/// user-target-fallback by name, so a user could never launch their own
+/// `vps` while a global `vps` existed — and worse, a global target added
+/// *after* the session was created could shadow the user's target on the
+/// next WS attach.
 #[derive(Deserialize)]
 pub struct CreateSessionRequest {
-    pub target_name: String,
-    /// Strict parse: unknown values are rejected by axum's JSON extractor
-    /// with a 400 so typos are loud. Omitted field defaults to
-    /// `InputMode::Multiplexed` below — the collaborative default so
-    /// invited operators can actually type, which is the whole point of
-    /// "Google Docs for terminals". Owners who want a solo shell with
-    /// shoulder-surfing viewers can still opt into `serialized`.
+    /// Global target name from `targets.yaml`. Mutually exclusive with `target_id`.
+    #[serde(default)]
+    pub target_name: Option<String>,
+    /// User-owned target nanoid (`UserTarget.id`). Mutually exclusive with `target_name`.
+    #[serde(default)]
+    pub target_id: Option<String>,
+    /// Omitted field defaults to `InputMode::Multiplexed` below — the
+    /// collaborative default so invited operators can actually type,
+    /// which is the whole point of "Google Docs for terminals". Owners
+    /// who want a solo shell with shoulder-surfing viewers can still
+    /// opt into `serialized`.
     #[serde(default)]
     pub input_mode: Option<InputMode>,
+}
+
+/// Which kind of target a `CreateSessionRequest` is asking for.
+enum TargetSelector {
+    /// Global (`targets.yaml`) target, looked up in the in-memory engine by name.
+    Global(String),
+    /// User-owned target, looked up in storage by stable nanoid.
+    User(String),
+}
+
+/// Classify a `CreateSessionRequest` into exactly one selector or 400.
+///
+/// Empty strings count as "not set" so a frontend regression that posts
+/// `{"target_name":"","target_id":"abc"}` still resolves the user target
+/// instead of mysteriously 400ing on what looks like a populated body.
+fn pick_target_selector(body: &CreateSessionRequest) -> Result<TargetSelector, ApiError> {
+    let name = body.target_name.as_deref().filter(|s| !s.is_empty());
+    let id = body.target_id.as_deref().filter(|s| !s.is_empty());
+    match (name, id) {
+        (Some(n), None) => Ok(TargetSelector::Global(n.to_string())),
+        (None, Some(i)) => Ok(TargetSelector::User(i.to_string())),
+        _ => Err(ApiError(StatusCode::BAD_REQUEST)),
+    }
 }
 
 pub async fn create_session(
@@ -253,28 +339,41 @@ pub async fn create_session(
     // of scoping. This 403 is the teeth of the invite fix: even if a
     // guest token is valid, this path is closed.
     require_unscoped(&user)?;
+    // Self-served email signups land with `session_enabled = FALSE`
+    // and are inert until an admin approves them on the user
+    // management page. This is the load-bearing fix for the v0.1.2
+    // adversarial finding: before this gate, anyone with SMTP
+    // enabled could go signup → verify OTP → `POST /api/sessions`
+    // against `local-shell` and pop a shell on the gateway host.
+    require_session_enabled(&state, &user, "POST /api/sessions").await?;
 
     // Axum's default JSON rejection is 422; we want 400 so an unknown
     // `input_mode` value reads as "client sent garbage" instead of
     // "server doesn't know what to do with it".
     let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+    let selector = pick_target_selector(&body)?;
 
-    // Verify target exists and enforce admin-only restriction.
-    // Global targets (from targets.yaml) take priority; user-owned targets
-    // are checked as a fallback when the global engine misses.
-    let (admin_only, user_target_id) = {
-        let engine = state.targets.load();
-        match engine.find(&body.target_name) {
-            Some(t) => (t.admin_only, None),
-            None => {
-                // Check caller's user-owned targets
-                let user_ts = state.user_targets.list(user.id).await?;
-                match user_ts.into_iter().find(|ut| ut.name == body.target_name) {
-                    Some(ut) => (false, Some(ut.id)),
-                    None => {
-                        return Err(ApiError(StatusCode::NOT_FOUND));
-                    }
-                }
+    // Resolve the target without crossing namespaces. `target_name`
+    // looks up the global engine; `target_id` looks up the user-owned
+    // table. Neither falls back to the other — the whole point of
+    // splitting the API is that a missing target is the right answer
+    // when the namespace it lives in misses, not "try the other one".
+    let (target_name, admin_only, user_target_id) = match selector {
+        TargetSelector::Global(name) => {
+            let engine = state.targets.load();
+            match engine.find(&name) {
+                Some(t) => (name.clone(), t.admin_only, None),
+                None => return Err(ApiError(StatusCode::NOT_FOUND)),
+            }
+        }
+        TargetSelector::User(id) => {
+            // `get` already filters on `target.user_id == caller.id`,
+            // so non-owners receive `Ok(None)` — we map that to 404 so
+            // the row's existence stays hidden from anyone who doesn't
+            // own it (a 403 would let an attacker enumerate target ids).
+            match state.user_targets.get(&id, user.id).await? {
+                Some(ut) => (ut.name, false, Some(ut.id)),
+                None => return Err(ApiError(StatusCode::NOT_FOUND)),
             }
         }
     };
@@ -290,7 +389,7 @@ pub async fn create_session(
                     telepair_core::audit::AuditEventType::TargetAccessDenied,
                 )
                 .with_actor(user.id, user.name.clone())
-                .with_detail(serde_json::json!({ "target_name": body.target_name })),
+                .with_detail(serde_json::json!({ "target_name": target_name })),
             )
             .await;
         return Err(ApiError(StatusCode::FORBIDDEN));
@@ -300,12 +399,7 @@ pub async fn create_session(
 
     let session = state
         .sessions
-        .create_session_with_user_target(
-            &user,
-            &body.target_name,
-            mode,
-            user_target_id.as_deref(),
-        )
+        .create_session_with_user_target(&user, &target_name, mode, user_target_id.as_deref())
         .await?;
 
     // Reserve the target slot in the hub *before* returning 201 so a
@@ -318,10 +412,7 @@ pub async fn create_session(
     // `Error` before the client ever connected. The reservation is
     // upgraded to `Live` by `start_or_join` once the WS attaches, or
     // GCed after `pending_attach_ttl` if the client never shows.
-    state
-        .hub
-        .reserve_target(&session.id, &body.target_name)
-        .await;
+    state.hub.reserve_target(&session.id, &target_name).await;
 
     Ok((StatusCode::CREATED, Json(session)))
 }
@@ -977,6 +1068,22 @@ pub async fn update_user_target(
     Ok(Json(target))
 }
 
+/// `GET /api/user-targets/{id}` — fetch a single user-owned target (owner only).
+pub async fn get_user_target(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    require_unscoped(&user)?;
+    let target = state
+        .user_targets
+        .get(&id, user.id)
+        .await?
+        .ok_or(ApiError(StatusCode::NOT_FOUND))?;
+    Ok(Json(target))
+}
+
 /// `DELETE /api/user-targets/{id}` — delete a user-owned target (owner only).
 pub async fn delete_user_target(
     State(state): State<AppState>,
@@ -987,4 +1094,129 @@ pub async fn delete_user_target(
     require_unscoped(&user)?;
     state.user_targets.delete(&id, user.id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Admin user management ────────────────────────────────────────────
+//
+// These endpoints back the admin Users page introduced in v0.1.2.
+// They exist to let an operator flip `session_enabled` on a
+// self-registered email account — the bit that the public signup
+// flow forces FALSE and the `create_session` / WS attach gates
+// read.
+//
+// Scoped guests are *not* listed by `list_accounts` — they are
+// invite-minted, session-local, and disappear on close. A guest
+// that somehow reaches this page would have nothing to do.
+
+/// Wire shape for a row returned by `GET /api/admin/users`. This is
+/// a subset of the internal `User` struct with the email surfaced
+/// (the struct itself marks `email` as `#[serde(skip)]` because
+/// every *other* endpoint must treat it as a sensitive identifier).
+/// We accept that exposure here because the caller is already an
+/// admin — they have full target-reload and session-close rights.
+#[derive(Serialize)]
+struct AdminUserInfo {
+    id: String,
+    name: String,
+    email: Option<String>,
+    is_admin: bool,
+    session_enabled: bool,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl From<User> for AdminUserInfo {
+    fn from(u: User) -> Self {
+        Self {
+            id: u.id.to_string(),
+            name: u.name,
+            email: u.email,
+            is_admin: u.is_admin,
+            session_enabled: u.session_enabled,
+            created_at: u.created_at,
+            updated_at: u.updated_at,
+        }
+    }
+}
+
+/// `GET /api/admin/users` — admin-only. Lists every non-guest
+/// account so the admin UI can render the approval page. Newest
+/// first, matching the storage ORDER BY.
+pub async fn list_admin_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    require_admin(&user)?;
+    let rows = state.auth_service.list_accounts().await?;
+    let out: Vec<AdminUserInfo> = rows.into_iter().map(AdminUserInfo::from).collect();
+    Ok(Json(out))
+}
+
+/// Shared plumbing for the enable / disable admin handlers. Auth,
+/// admin gate, UUID parsing, self-mutation guard, and error
+/// mapping are identical; the last step dispatches to the service
+/// method for the requested value.
+async fn set_user_enabled(
+    state: &AppState,
+    headers: &HeaderMap,
+    target_id: &str,
+    enabled: bool,
+) -> Result<Json<AdminUserInfo>, ApiError> {
+    let actor = extract_user(state, headers).await?;
+    require_admin(&actor)?;
+
+    // Parse the path param into a UUID up-front so a malformed id
+    // reads as 400, not "user not found". The admin UI passes back
+    // whatever `list_admin_users` returned, so this should never
+    // fire in practice — but a typo in a curl probe should not
+    // surface as 404.
+    let target_uuid =
+        uuid::Uuid::parse_str(target_id).map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+
+    // Self-mutation guard: an admin disabling their own session
+    // bit would lock themselves out of session creation on the
+    // next request. The storage layer would happily honour it, so
+    // the guard lives here. Enabling yourself is a no-op (admins
+    // are never session-disabled in practice) but we reject it for
+    // symmetry — nothing sensible calls this.
+    if actor.id == target_uuid {
+        return Err(ApiError(StatusCode::BAD_REQUEST));
+    }
+
+    let result = state
+        .auth_service
+        .set_session_access(actor.id, &actor.name, target_uuid, enabled)
+        .await;
+
+    let updated = result.map_err(|e| match e {
+        Error::InvalidInput(_) => ApiError(StatusCode::NOT_FOUND),
+        other => ApiError::from(other),
+    })?;
+
+    Ok(Json(AdminUserInfo::from(updated)))
+}
+
+/// `POST /api/admin/users/{id}/enable` — admin-only. Flips
+/// `session_enabled = TRUE` on the target row and audits the
+/// mutation. 400 on self-mutation; 404 on unknown target id.
+pub async fn enable_admin_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    set_user_enabled(&state, &headers, &id, true).await
+}
+
+/// `POST /api/admin/users/{id}/disable` — admin-only. Flips
+/// `session_enabled = FALSE` on the target row and audits the
+/// mutation. The target keeps their bearer token (whoami / history
+/// still work); the next session create or WS attach they attempt
+/// fails closed via the `session_enabled` gate.
+pub async fn disable_admin_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    set_user_enabled(&state, &headers, &id, false).await
 }

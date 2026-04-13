@@ -111,20 +111,29 @@ CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_events(session_id, ts DESC
 CREATE INDEX IF NOT EXISTS idx_audit_actor   ON audit_events(actor_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_type    ON audit_events(event_type, ts DESC);
 
--- OTP verification codes for email-based registration.
--- Codes are 6-digit, short-lived (15 min), single-use, and have a
--- failure counter that locks the code after 5 wrong attempts.
-CREATE TABLE IF NOT EXISTS email_verifications (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id       TEXT    NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    code          TEXT    NOT NULL,
-    expires_at    TEXT    NOT NULL,
-    used          BOOLEAN NOT NULL DEFAULT FALSE,
-    failure_count INTEGER NOT NULL DEFAULT 0,
-    created_at    TEXT    NOT NULL
+-- Pending email-based registrations. The full credential set
+-- (display name, argon2 password hash, OTP code) lives here until
+-- the user proves mailbox ownership; only at that point does a row
+-- get materialized into `users`. Keeping this state out of `users`
+-- closes the pre-verification takeover window where a second
+-- registration with the same email could overwrite the password of
+-- a still-pending account.
+--
+-- A row is keyed by `email` (lowercased): a re-register from the
+-- same address overwrites the row in place, which is fine because
+-- the row carries no authority of its own — it has no entry in
+-- `users` and no token. Verification consumes the row in a single
+-- transaction with the `users` insert.
+CREATE TABLE IF NOT EXISTS pending_registrations (
+    email             TEXT    PRIMARY KEY,
+    display_name      TEXT    NOT NULL,
+    password_hash     TEXT    NOT NULL,
+    otp_code          TEXT    NOT NULL,
+    otp_expires_at    TEXT    NOT NULL,
+    otp_failure_count INTEGER NOT NULL DEFAULT 0,
+    created_at        TEXT    NOT NULL,
+    updated_at        TEXT    NOT NULL
 );
-
-CREATE INDEX IF NOT EXISTS idx_email_verif_user_id ON email_verifications(user_id, created_at DESC);
 
 -- Per-user virtual targets (SSH, commands, etc.) created via the Web UI.
 -- Merged with global targets from targets.yaml at list time.
@@ -143,3 +152,9 @@ CREATE TABLE IF NOT EXISTS user_targets (
 );
 
 CREATE INDEX IF NOT EXISTS idx_user_targets_user_id ON user_targets(user_id);
+
+-- Email uniqueness: the partial index lives in `run_migrations` (not
+-- here) because the `users.email` column itself is added by a guarded
+-- ALTER AFTER this file runs. Creating the index in this file would
+-- hit "no such column: email" on any DB built from the original v0.1.0
+-- shape. See `SqliteStorage::run_migrations`.

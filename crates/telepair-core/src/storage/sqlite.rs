@@ -11,8 +11,9 @@ use crate::audit::{AuditEvent, AuditEventType, AuditFilter};
 use crate::error::{Error, Result};
 use crate::permission::Role;
 use crate::session::{
-    CloseReason, CreateUserTargetParams, InputMode, InviteToken, OtpVerifyResult, Participant,
-    RedeemIdentity, RedeemOutcome, Session, SessionListFilter, SessionStatus, User, UserTarget,
+    CloseReason, CreateUserTargetParams, InputMode, InviteToken, LoginFailureOutcome, Participant,
+    PendingVerifyResult, RedeemIdentity, RedeemOutcome, Session, SessionListFilter, SessionStatus,
+    User, UserTarget,
 };
 use crate::storage::Storage;
 
@@ -22,7 +23,17 @@ pub struct SqliteStorage {
 
 impl SqliteStorage {
     pub async fn new(database_url: &str) -> Result<Self> {
-        let options = SqliteConnectOptions::from_str(database_url)?.foreign_keys(true);
+        // `busy_timeout` is the production-correctness knob for the
+        // multi-statement transactions in `verify_pending_registration`
+        // and `redeem_invite`: with WAL we can have many concurrent
+        // readers, but two writers racing to promote SHARED → RESERVED
+        // would otherwise return `SQLITE_BUSY` immediately. Sleeping
+        // for up to 5s gives the loser time to grab the lock once the
+        // winner commits, which is the behaviour every other test in
+        // this crate already implicitly relies on.
+        let options = SqliteConnectOptions::from_str(database_url)?
+            .foreign_keys(true)
+            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePool::connect_with(options).await?;
         let storage = Self { pool };
         storage.run_migrations().await?;
@@ -58,11 +69,55 @@ impl SqliteStorage {
         self.ensure_column("invite_tokens", "created_at", "TEXT")
             .await?;
         self.ensure_column("users", "email", "TEXT").await?;
-        self.ensure_column("users", "password_hash", "TEXT")
-            .await?;
+        self.ensure_column("users", "password_hash", "TEXT").await?;
         self.ensure_column("users", "verified", "BOOLEAN NOT NULL DEFAULT FALSE")
             .await?;
         self.ensure_column("sessions", "user_target_id", "TEXT")
+            .await?;
+        // Login throttle (Fix #3): per-user failed-attempt counter and
+        // lockout timestamp. Mirrors the OTP 5-strike pattern but lives
+        // on the `users` row directly because there is exactly one
+        // password per account, so a single counter suffices.
+        self.ensure_column("users", "login_failed_count", "INTEGER NOT NULL DEFAULT 0")
+            .await?;
+        self.ensure_column("users", "login_locked_until", "TEXT")
+            .await?;
+        // v0.1.2: gate session creation/attach behind an explicit
+        // capability bit so a self-registered email account is inert
+        // until an admin enables it. Existing rows default TRUE so the
+        // upgrade does not lock current users out; the registration
+        // path explicitly inserts FALSE for materialized email
+        // accounts (see `materialize_pending_registration`).
+        self.ensure_column("users", "session_enabled", "BOOLEAN NOT NULL DEFAULT TRUE")
+            .await?;
+
+        // Partial unique index on `users.email` — only covers rows
+        // where email is non-null. This MUST run after the ALTER
+        // above adds the column on legacy DBs, otherwise CREATE INDEX
+        // fails with "no such column: email". See the comment in
+        // `materialize_pending_registration` for why this guards the
+        // registration path from duplicate-email accounts.
+        sqlx::raw_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique \
+             ON users(email) WHERE email IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // v0.1.2 cleanup: the pre-verification takeover fix moves
+        // pending-account state out of `users` into the new
+        // `pending_registrations` table. Old DBs may still carry:
+        //   1. unverified `users` rows that were inserted by the
+        //      now-removed `register_user` path (no token in
+        //      circulation, but they tie up the email + display name).
+        //   2. an `email_verifications` table that no code references.
+        // Pre-1.0 we accept dropping in-flight signups; verified
+        // accounts are not touched.
+        sqlx::raw_sql("DELETE FROM users WHERE verified = 0 AND email IS NOT NULL")
+            .execute(&self.pool)
+            .await?;
+        sqlx::raw_sql("DROP TABLE IF EXISTS email_verifications")
+            .execute(&self.pool)
             .await?;
 
         Ok(())
@@ -73,13 +128,45 @@ impl SqliteStorage {
     /// NOT on the `Storage` trait — callers use `AuthService` which
     /// holds the concrete `SqliteStorage` type.
     pub async fn get_password_hash(&self, user_id: Uuid) -> Result<Option<String>> {
-        let row: Option<String> = sqlx::query_scalar(
-            "SELECT password_hash FROM users WHERE id = ?",
+        let row: Option<String> =
+            sqlx::query_scalar("SELECT password_hash FROM users WHERE id = ?")
+                .bind(user_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row)
+    }
+
+    /// Disambiguate a `user_targets` UPDATE/DELETE CAS that wrote 0
+    /// rows. The CAS in `update_user_target` / `delete_user_target`
+    /// folds three distinct rejection reasons into a single miss:
+    /// the row doesn't exist, the caller doesn't own it, or it's
+    /// referenced by an active session. The first two should map to
+    /// `403 PermissionDenied`; the third to `409 Conflict` with a
+    /// human-readable "close the session first" message so the Web
+    /// UI can render a meaningful hint instead of a generic error.
+    async fn classify_user_target_mutation_failure(&self, id: &str, user_id: Uuid) -> Error {
+        // Does the row belong to this user at all?
+        let owned: Option<i64> = match sqlx::query_scalar(
+            "SELECT 1 FROM user_targets WHERE id = ? AND user_id = ? LIMIT 1",
         )
+        .bind(id)
         .bind(user_id.to_string())
         .fetch_optional(&self.pool)
-        .await?;
-        Ok(row)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => return Error::Storage(e),
+        };
+        if owned.is_none() {
+            return Error::PermissionDenied(format!(
+                "target {id} not found or not owned by caller"
+            ));
+        }
+        // Row exists and is owned — the only remaining reason the
+        // CAS could have written 0 rows is the active-session guard.
+        Error::Conflict(format!(
+            "target {id} is in use by an active session; close the session first"
+        ))
     }
 
     /// Idempotently add `column` to `table` if it does not already
@@ -128,6 +215,11 @@ fn now_rfc3339() -> String {
     rfc3339(Utc::now())
 }
 
+/// Column list shared by every `SELECT … FROM users` that feeds
+/// `row_to_user`. Centralised so a new column only needs one change.
+const USER_COLS: &str =
+    "id, name, is_admin, scoped_session_id, email, session_enabled, created_at, updated_at";
+
 fn row_to_user(r: &SqliteRow) -> Result<User> {
     Ok(User {
         id: parse_uuid(r.get("id"))?,
@@ -135,7 +227,10 @@ fn row_to_user(r: &SqliteRow) -> Result<User> {
         is_admin: r.get("is_admin"),
         scoped_session_id: r.get("scoped_session_id"),
         email: r.try_get("email").ok().flatten(),
-        verified: r.try_get::<bool, _>("verified").unwrap_or(false),
+        // `session_enabled` defaults TRUE on legacy rows (the column
+        // ALTER specifies `DEFAULT TRUE`); the `try_get` fallback to
+        // `true` covers tests that select a narrower column set.
+        session_enabled: r.try_get::<bool, _>("session_enabled").unwrap_or(true),
         created_at: parse_datetime(r.get("created_at"))?,
         updated_at: parse_datetime(r.get("updated_at"))?,
     })
@@ -335,10 +430,7 @@ impl SqliteStorage {
     /// here as an inherent method (not on the `Storage` trait) so test
     /// assertions can verify inserts landed.
     pub async fn get_user(&self, id: Uuid) -> Result<Option<User>> {
-        let row = sqlx::query(
-            "SELECT id, name, is_admin, scoped_session_id, created_at, updated_at \
-             FROM users WHERE id = ?",
-        )
+        let row = sqlx::query(&format!("SELECT {USER_COLS} FROM users WHERE id = ?"))
         .bind(id.to_string())
         .fetch_optional(&self.pool)
         .await?;
@@ -351,6 +443,13 @@ impl SqliteStorage {
     /// always passes `None`; `create_scoped_guest` passes
     /// `Some(session_id)`. Keeping one INSERT statement means every
     /// path agrees on column ordering and default handling.
+    ///
+    /// Both call sites mint a verified, session-enabled row: admin
+    /// accounts (CLI bootstrap) need full access, and invite-minted
+    /// scoped guests can attach to exactly one session anyway (the
+    /// `scoped_session_id` gate carries the real authority — the
+    /// `session_enabled` bit is left TRUE so the WS attach handshake
+    /// does not double-reject them on the wrong axis).
     async fn insert_user(
         &self,
         name: &str,
@@ -364,8 +463,9 @@ impl SqliteStorage {
 
         sqlx::query(
             "INSERT INTO users \
-               (id, name, token_sha256, is_admin, scoped_session_id, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+               (id, name, token_sha256, is_admin, scoped_session_id, \
+                verified, session_enabled, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, TRUE, TRUE, ?, ?)",
         )
         .bind(id.to_string())
         .bind(name)
@@ -383,7 +483,7 @@ impl SqliteStorage {
             is_admin,
             scoped_session_id: scoped_session_id.map(|s| s.to_owned()),
             email: None,
-            verified: false,
+            session_enabled: true,
             created_at: now,
             updated_at: now,
         };
@@ -405,10 +505,7 @@ impl Storage for SqliteStorage {
     }
 
     async fn get_user_by_name(&self, name: &str) -> Result<Option<User>> {
-        let row = sqlx::query(
-            "SELECT id, name, is_admin, scoped_session_id, created_at, updated_at \
-             FROM users WHERE name = ?",
-        )
+        let row = sqlx::query(&format!("SELECT {USER_COLS} FROM users WHERE name = ?"))
         .bind(name)
         .fetch_optional(&self.pool)
         .await?;
@@ -1219,194 +1316,419 @@ impl Storage for SqliteStorage {
         rows.iter().map(row_to_audit_event).collect()
     }
 
-    // ── Auth — email registration ─────────────────────────────────────────
+    // ── Auth — email registration (v0.1.2 pending-row design) ────────────
 
-    async fn register_user(
+    async fn upsert_pending_registration(
         &self,
         email: &str,
-        password_hash: &str,
         display_name: &str,
-    ) -> Result<User> {
-        let id = Uuid::new_v4();
-        let now = Utc::now();
-        let now_str = rfc3339(now);
+        password_hash: &str,
+        otp_code: &str,
+        otp_expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        // Single statement: insert or replace the pending row keyed by
+        // email. Reset `otp_failure_count` and `created_at` on overwrite
+        // so a re-register from the same address starts a clean
+        // 5-strike window — the previous attempt's lockout state is
+        // intentionally discarded because re-registration is the
+        // user-driven recovery path. The pending row carries no
+        // authority of its own (no `users` row, no token), so
+        // overwriting it cannot impersonate or hijack anyone.
+        let now_str = now_rfc3339();
         sqlx::query(
-            "INSERT INTO users \
-             (id, name, token_sha256, is_admin, email, password_hash, verified, created_at, updated_at) \
-             VALUES (?, ?, '', FALSE, ?, ?, FALSE, ?, ?)",
+            "INSERT INTO pending_registrations \
+                 (email, display_name, password_hash, otp_code, otp_expires_at, \
+                  otp_failure_count, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, 0, ?, ?) \
+             ON CONFLICT(email) DO UPDATE SET \
+                 display_name      = excluded.display_name, \
+                 password_hash     = excluded.password_hash, \
+                 otp_code          = excluded.otp_code, \
+                 otp_expires_at    = excluded.otp_expires_at, \
+                 otp_failure_count = 0, \
+                 updated_at        = excluded.updated_at",
         )
-        .bind(id.to_string())
-        .bind(display_name)
         .bind(email)
+        .bind(display_name)
         .bind(password_hash)
+        .bind(otp_code)
+        .bind(rfc3339(otp_expires_at))
         .bind(&now_str)
         .bind(&now_str)
         .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            if let sqlx::Error::Database(ref db) = e {
-                if db.is_unique_violation() {
+        .await?;
+        Ok(())
+    }
+
+    async fn latest_pending_registration_at(&self, email: &str) -> Result<Option<DateTime<Utc>>> {
+        let row: Option<String> =
+            sqlx::query_scalar("SELECT updated_at FROM pending_registrations WHERE email = ?")
+                .bind(email)
+                .fetch_optional(&self.pool)
+                .await?;
+        parse_optional_datetime(row, "pending_registrations.updated_at")
+    }
+
+    async fn delete_pending_registration(&self, email: &str) -> Result<()> {
+        sqlx::query("DELETE FROM pending_registrations WHERE email = ?")
+            .bind(email)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn verify_pending_registration(
+        &self,
+        email: &str,
+        code: &str,
+    ) -> Result<PendingVerifyResult> {
+        use PendingVerifyResult::*;
+
+        // Atomic compare-and-consume on the pending row. SQLite
+        // serialises writes per database so either the `WHERE` guard
+        // matches (we win the row) or it doesn't (we lose and the
+        // second write sees the updated state). The same CAS shape
+        // the old `verify_otp` used, but now scoped to a single
+        // pending row keyed by email.
+
+        let now = Utc::now();
+        let now_str = rfc3339(now);
+
+        // Run inside a transaction so the consume + materialize
+        // happens atomically. A crash between the two halves would
+        // either leave a verified `users` row with no auth path
+        // (the pending row was already gone) or a stale pending row
+        // with a real `users` shadow (next verify would conflict on
+        // the unique email index).
+        //
+        // Importantly, the FIRST statement in this transaction is
+        // always a write — either the success-path DELETE-RETURNING
+        // or the failure-path UPDATE bump below. SQLite acquires
+        // RESERVED on the very first write, which means a SELECT
+        // can never escalate from SHARED → RESERVED mid-transaction
+        // (the canonical SQLite write-write deadlock pattern). With
+        // `busy_timeout = 5s` (set in `new`) the loser of any race
+        // simply waits for the winner to commit instead of failing.
+        let mut tx = self.pool.begin().await?;
+
+        // Atomic delete-and-return on the success conditions: the
+        // single statement either consumes the row (and hands us
+        // back the credentials we need to materialize the user) or
+        // returns nothing (and we fall through to the failure
+        // accounting below).
+        let consumed: Option<(String, String)> = sqlx::query_as(
+            "DELETE FROM pending_registrations \
+             WHERE email = ?1 \
+               AND otp_code = ?2 \
+               AND otp_expires_at > ?3 \
+               AND otp_failure_count < 5 \
+             RETURNING display_name, password_hash",
+        )
+        .bind(email)
+        .bind(code)
+        .bind(&now_str)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some((display_name, password_hash)) = consumed {
+            // Happy path. The pending row is already gone; finish
+            // up by inserting the user inside the same transaction.
+            // The user is materialized with `verified = TRUE`
+            // (because the OTP just proved mailbox ownership) and
+            // `session_enabled = FALSE` (because self-served signups
+            // must be approved by an admin before they can spawn or
+            // attach to sessions — the critical adversarial finding
+            // fix).
+            let id = Uuid::new_v4();
+            let (raw, sha256_hex) = generate_token();
+            sqlx::query(
+                "INSERT INTO users \
+                   (id, name, token_sha256, is_admin, scoped_session_id, \
+                    email, password_hash, verified, session_enabled, \
+                    created_at, updated_at) \
+                 VALUES (?, ?, ?, FALSE, NULL, ?, ?, TRUE, FALSE, ?, ?)",
+            )
+            .bind(id.to_string())
+            .bind(&display_name)
+            .bind(&sha256_hex)
+            .bind(email)
+            .bind(&password_hash)
+            .bind(&now_str)
+            .bind(&now_str)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                if let sqlx::Error::Database(ref db) = e
+                    && db.is_unique_violation()
+                {
+                    // Display name collision OR (much rarer) the
+                    // email is already in `users` from another
+                    // path. Either way the right answer is to fail
+                    // verification — the user has to retry with a
+                    // different display name.
                     return Error::Conflict(format!(
-                        "email or name already registered: {email}"
+                        "display name '{display_name}' is already taken — \
+                         please re-register with a different name"
                     ));
                 }
-            }
-            Error::Storage(e)
-        })?;
+                Error::Storage(e)
+            })?;
+            tx.commit().await?;
 
-        Ok(User {
-            id,
-            name: display_name.to_string(),
-            is_admin: false,
-            scoped_session_id: None,
-            email: Some(email.to_string()),
-            verified: false,
-            created_at: now,
-            updated_at: now,
-        })
+            let user = User {
+                id,
+                name: display_name,
+                is_admin: false,
+                scoped_session_id: None,
+                email: Some(email.to_string()),
+                session_enabled: false,
+                created_at: now,
+                updated_at: now,
+            };
+            return Ok(Success {
+                user,
+                raw_token: raw,
+            });
+        }
+
+        // No eligible row. Either the email has no pending row at all,
+        // the OTP code did not match, the OTP has expired, or the row
+        // is already locked. Try to bump the counter on a present-but-
+        // not-locked row so wrong codes still feed the 5-strike
+        // lockout.
+        // The bump is gated on `otp_expires_at > now` so wrong codes
+        // against an *expired* row do NOT burn a strike — letting them
+        // would give a stuffing attacker free access to the lockout
+        // budget by hammering long-dead pending rows. The auth service
+        // surfaces "expired" and "wrong code" identically to the
+        // caller, so collapsing the lockout-counting path here doesn't
+        // leak anything observable.
+        let bumped: Option<i64> = sqlx::query_scalar(
+            "UPDATE pending_registrations \
+             SET otp_failure_count = otp_failure_count + 1 \
+             WHERE email = ?1 \
+               AND otp_failure_count < 5 \
+               AND otp_expires_at > ?2 \
+             RETURNING otp_failure_count",
+        )
+        .bind(email)
+        .bind(&now_str)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        match bumped {
+            Some(new_count) if new_count >= 5 => Ok(Locked),
+            Some(new_count) => Ok(Failure {
+                remaining: (5 - new_count) as u32,
+            }),
+            None => {
+                // No row at all, or the row is already locked. We
+                // collapse both into Expired/Locked depending on the
+                // row's actual state — but the auth service surfaces
+                // the same generic error to the caller either way to
+                // avoid enumerating which addresses are pending.
+                let locked: Option<i64> = sqlx::query_scalar(
+                    "SELECT otp_failure_count FROM pending_registrations \
+                     WHERE email = ?",
+                )
+                .bind(email)
+                .fetch_optional(&self.pool)
+                .await?;
+                match locked {
+                    Some(fc) if fc >= 5 => Ok(Locked),
+                    _ => Ok(Expired),
+                }
+            }
+        }
+    }
+
+    async fn sweep_pending_registrations(&self, cutoff: DateTime<Utc>) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM pending_registrations WHERE updated_at < ?")
+            .bind(rfc3339(cutoff))
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     async fn get_user_by_email(&self, email: &str) -> Result<Option<User>> {
-        let row = sqlx::query(
-            "SELECT id, name, is_admin, scoped_session_id, email, verified, created_at, updated_at \
-             FROM users WHERE email = ?",
-        )
+        let row = sqlx::query(&format!("SELECT {USER_COLS} FROM users WHERE email = ?"))
         .bind(email)
         .fetch_optional(&self.pool)
         .await?;
         row.map(|r| row_to_user(&r)).transpose()
     }
 
-    async fn create_otp(
-        &self,
-        user_id: Uuid,
-        code: &str,
-        expires_at: DateTime<Utc>,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO email_verifications (user_id, code, expires_at, created_at) \
-             VALUES (?, ?, ?, ?)",
+    // ── Admin user management ─────────────────────────────────────────────
+
+    async fn list_accounts(&self) -> Result<Vec<User>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {USER_COLS} FROM users \
+             WHERE scoped_session_id IS NULL \
+             ORDER BY created_at DESC"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_user).collect()
+    }
+
+    async fn find_user_by_id(&self, user_id: Uuid) -> Result<Option<User>> {
+        let row = sqlx::query(&format!("SELECT {USER_COLS} FROM users WHERE id = ?"))
+        .bind(user_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| row_to_user(&r)).transpose()
+    }
+
+    async fn set_session_enabled(&self, user_id: Uuid, enabled: bool) -> Result<User> {
+        let now_str = now_rfc3339();
+        let row = sqlx::query(&format!(
+            "UPDATE users SET session_enabled = ?, updated_at = ? \
+             WHERE id = ? \
+             RETURNING {USER_COLS}"
+        ))
+        .bind(enabled)
+        .bind(&now_str)
+        .bind(user_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let row = row.ok_or_else(|| Error::InvalidInput(format!("user {user_id} not found")))?;
+        row_to_user(&row)
+    }
+
+    async fn refresh_user_token(&self, user_id: Uuid) -> Result<String> {
+        let (raw, hash) = generate_token();
+        sqlx::query("UPDATE users SET token_sha256 = ?, updated_at = ? WHERE id = ?")
+            .bind(&hash)
+            .bind(now_rfc3339())
+            .bind(user_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(raw)
+    }
+
+    async fn check_login_lockout(&self, user_id: Uuid) -> Result<Option<DateTime<Utc>>> {
+        // Read the row's stored lockout. Three states matter:
+        //   1. NULL: idle row, no lockout — return None.
+        //   2. > now: live lockout — return Some(time).
+        //   3. <= now: window has elapsed — lazily clear `login_failed_count`
+        //      and `login_locked_until` so the next failure starts a fresh
+        //      5-strike window instead of immediately re-locking on a
+        //      stale counter, then return None.
+        //
+        // The clear is the only write on this read path; concurrent
+        // record_login_failure calls during a clear-and-retry race resolve
+        // consistently because both branches in record_login_failure's CASE
+        // statement handle "no live lock" identically.
+        // The outer Option is "row exists"; the inner Option<String>
+        // is the nullable column value. Without the inner Option,
+        // sqlx's String decoder maps SQL NULL to an empty string,
+        // which then trips parse_optional_datetime with "premature
+        // end of input".
+        let raw: Option<Option<String>> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT login_locked_until FROM users WHERE id = ?",
         )
         .bind(user_id.to_string())
-        .bind(code)
-        .bind(rfc3339(expires_at))
-        .bind(now_rfc3339())
+        .fetch_optional(&self.pool)
+        .await?;
+        let stored = parse_optional_datetime(raw.flatten(), "users.login_locked_until")?;
+        let Some(until) = stored else {
+            return Ok(None);
+        };
+        let now = Utc::now();
+        if until > now {
+            return Ok(Some(until));
+        }
+        sqlx::query(
+            "UPDATE users SET login_failed_count = 0, login_locked_until = NULL WHERE id = ?",
+        )
+        .bind(user_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(None)
+    }
+
+    async fn record_login_failure(
+        &self,
+        user_id: Uuid,
+        lockout_duration: chrono::Duration,
+    ) -> Result<LoginFailureOutcome> {
+        // Atomic CAS that handles three branches in one UPDATE:
+        //
+        // 1. Live lock (`login_locked_until > now`): leave count and
+        //    lockout untouched. Returning the existing window prevents
+        //    a hammering attacker from sliding the unlock time forward
+        //    indefinitely — the test
+        //    `record_login_failure_while_locked_keeps_existing_lock`
+        //    pins this invariant.
+        // 2. Stale lock (`login_locked_until <= now`): the previous
+        //    window has expired; reset the counter to 1 and clear the
+        //    lock so this failure starts a fresh 5-strike window.
+        //    Defensive — `check_login_lockout` should normally clear
+        //    first, but a racing call may not have run yet.
+        // 3. No lock: increment the counter; if the post-bump count
+        //    crosses the 5-strike threshold, stamp `login_locked_until`
+        //    to `now + lockout_duration`.
+        //
+        // The literal `5` matches the OTP failure threshold so both
+        // throttles agree at a glance. Lockout duration is supplied by
+        // the caller (`AuthService`) so the storage layer stays free
+        // of policy constants.
+        let now = Utc::now();
+        let now_str = rfc3339(now);
+        let lock_until_str = rfc3339(now + lockout_duration);
+        let row: Option<(i64, Option<String>)> = sqlx::query_as(
+            "UPDATE users \
+             SET login_failed_count = CASE \
+                     WHEN login_locked_until IS NOT NULL AND login_locked_until > ?1 \
+                         THEN login_failed_count \
+                     WHEN login_locked_until IS NOT NULL AND login_locked_until <= ?1 \
+                         THEN 1 \
+                     ELSE login_failed_count + 1 \
+                 END, \
+                 login_locked_until = CASE \
+                     WHEN login_locked_until IS NOT NULL AND login_locked_until > ?1 \
+                         THEN login_locked_until \
+                     WHEN login_locked_until IS NOT NULL AND login_locked_until <= ?1 \
+                         THEN NULL \
+                     WHEN login_failed_count + 1 >= 5 \
+                         THEN ?2 \
+                     ELSE NULL \
+                 END \
+             WHERE id = ?3 \
+             RETURNING login_failed_count, login_locked_until",
+        )
+        .bind(&now_str)
+        .bind(&lock_until_str)
+        .bind(user_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let (count, locked_raw) =
+            row.ok_or_else(|| Error::Auth(format!("user {user_id} not found")))?;
+        let locked_until = parse_optional_datetime(locked_raw, "users.login_locked_until")?;
+        if let Some(until) = locked_until
+            && until > now
+        {
+            return Ok(LoginFailureOutcome::Locked { until });
+        }
+        let remaining = 5_i64.saturating_sub(count).max(0) as u32;
+        Ok(LoginFailureOutcome::Recorded { remaining })
+    }
+
+    async fn clear_login_failures(&self, user_id: Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE users SET login_failed_count = 0, login_locked_until = NULL WHERE id = ?",
+        )
+        .bind(user_id.to_string())
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    async fn verify_otp(&self, user_id: Uuid, code: &str) -> Result<OtpVerifyResult> {
-        use OtpVerifyResult::*;
-        let uid = user_id.to_string();
-        let now = now_rfc3339();
-
-        let row = sqlx::query(
-            "SELECT id, code, failure_count FROM email_verifications \
-             WHERE user_id = ? AND used = FALSE AND expires_at > ? \
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(&uid)
-        .bind(&now)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let Some(row) = row else {
-            return Ok(Expired);
-        };
-
-        let otp_id: i64 = row.get("id");
-        let stored_code: String = row.get("code");
-        let failure_count: i64 = row.get("failure_count");
-
-        if failure_count >= 5 {
-            return Ok(Locked);
-        }
-
-        if stored_code == code {
-            sqlx::query("UPDATE email_verifications SET used = TRUE WHERE id = ?")
-                .bind(otp_id)
-                .execute(&self.pool)
-                .await?;
-            Ok(Success)
-        } else {
-            let new_count = failure_count + 1;
-            sqlx::query(
-                "UPDATE email_verifications SET failure_count = ? WHERE id = ?",
-            )
-            .bind(new_count)
-            .bind(otp_id)
-            .execute(&self.pool)
-            .await?;
-            if new_count >= 5 {
-                Ok(Locked)
-            } else {
-                Ok(Failure {
-                    remaining: (5 - new_count) as u32,
-                })
-            }
-        }
-    }
-
-    async fn latest_otp_created_at(
-        &self,
-        user_id: Uuid,
-    ) -> Result<Option<DateTime<Utc>>> {
-        let row: Option<String> = sqlx::query_scalar(
-            "SELECT created_at FROM email_verifications WHERE user_id = ? \
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(user_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.and_then(|s| s.parse().ok()))
-    }
-
-    async fn activate_user(&self, user_id: Uuid) -> Result<String> {
-        let raw = nanoid::nanoid!(32);
-        let hash = hex::encode(Sha256::digest(raw.as_bytes()));
-        sqlx::query(
-            "UPDATE users SET verified = TRUE, token_sha256 = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(&hash)
-        .bind(now_rfc3339())
-        .bind(user_id.to_string())
-        .execute(&self.pool)
-        .await?;
-        Ok(raw)
-    }
-
-    async fn refresh_user_token(&self, user_id: Uuid) -> Result<String> {
-        let raw = nanoid::nanoid!(32);
-        let hash = hex::encode(Sha256::digest(raw.as_bytes()));
-        sqlx::query(
-            "UPDATE users SET token_sha256 = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(&hash)
-        .bind(now_rfc3339())
-        .bind(user_id.to_string())
-        .execute(&self.pool)
-        .await?;
-        Ok(raw)
-    }
-
-    async fn sweep_unverified_users(&self, cutoff: DateTime<Utc>) -> Result<u64> {
-        let result = sqlx::query(
-            "DELETE FROM users \
-             WHERE verified = FALSE AND email IS NOT NULL AND created_at < ?",
-        )
-        .bind(rfc3339(cutoff))
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
-    }
-
     // ── User-owned targets ────────────────────────────────────────────────
 
-    async fn create_user_target(
-        &self,
-        params: CreateUserTargetParams,
-    ) -> Result<UserTarget> {
+    async fn create_user_target(&self, params: CreateUserTargetParams) -> Result<UserTarget> {
         let id = nanoid::nanoid!(21);
         let now = Utc::now();
         let now_str = rfc3339(now);
@@ -1432,13 +1754,10 @@ impl Storage for SqliteStorage {
         .execute(&self.pool)
         .await
         .map_err(|e| {
-            if let sqlx::Error::Database(ref db) = e {
-                if db.is_unique_violation() {
-                    return Error::Conflict(format!(
-                        "target name '{}' already exists",
-                        params.name
-                    ));
-                }
+            if let sqlx::Error::Database(ref db) = e
+                && db.is_unique_violation()
+            {
+                return Error::Conflict(format!("target name '{}' already exists", params.name));
             }
             Error::Storage(e)
         })?;
@@ -1468,6 +1787,7 @@ impl Storage for SqliteStorage {
         rows.iter().map(row_to_user_target).collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn update_user_target(
         &self,
         id: &str,
@@ -1483,10 +1803,27 @@ impl Storage for SqliteStorage {
         let tags_json = serde_json::to_string(tags)?;
         let now_str = now_rfc3339();
 
+        // CAS guard: refuse to edit a target while any **active**
+        // session still references it. The old code only checked
+        // `(id, user_id)` — if the owner edited a target mid-session,
+        // the next PTY attach (global `TargetEngine::resolve` miss,
+        // then `user_targets` re-read) would silently pick up the
+        // new `command`/`args`/`env`, so the running session's
+        // identity drifted out from under it. The `NOT EXISTS`
+        // subquery lives inside the same UPDATE statement, so SQLite
+        // evaluates it against the same write-lock snapshot as the
+        // row match — no TOCTOU window between a separate probe and
+        // the update. Closed sessions don't block edits: they never
+        // re-attach, so the drift risk does not apply to them.
         let result = sqlx::query(
             "UPDATE user_targets \
              SET display = ?, command = ?, args = ?, env = ?, tags = ?, updated_at = ? \
-             WHERE id = ? AND user_id = ?",
+             WHERE id = ? AND user_id = ? \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM sessions \
+                   WHERE sessions.user_target_id = user_targets.id \
+                     AND sessions.status = 'active' \
+               )",
         )
         .bind(display)
         .bind(command)
@@ -1500,9 +1837,9 @@ impl Storage for SqliteStorage {
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(Error::PermissionDenied(format!(
-                "target {id} not found or not owned by caller"
-            )));
+            return Err(self
+                .classify_user_target_mutation_failure(id, user_id)
+                .await);
         }
 
         self.find_user_target_by_id(id)
@@ -1511,8 +1848,21 @@ impl Storage for SqliteStorage {
     }
 
     async fn delete_user_target(&self, id: &str, user_id: Uuid) -> Result<()> {
+        // Same CAS guard as `update_user_target`. Deleting a target
+        // that a live session depends on would turn that session into
+        // an orphan the next time the WS handler tried to resolve it,
+        // because the `user_targets` row backing the attach config is
+        // gone. Owners who really want to rebuild a target must close
+        // their session first — the error classifier below tells them
+        // exactly that.
         let result = sqlx::query(
-            "DELETE FROM user_targets WHERE id = ? AND user_id = ?",
+            "DELETE FROM user_targets \
+             WHERE id = ? AND user_id = ? \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM sessions \
+                   WHERE sessions.user_target_id = user_targets.id \
+                     AND sessions.status = 'active' \
+               )",
         )
         .bind(id)
         .bind(user_id.to_string())
@@ -1520,9 +1870,9 @@ impl Storage for SqliteStorage {
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(Error::PermissionDenied(format!(
-                "target {id} not found or not owned by caller"
-            )));
+            return Err(self
+                .classify_user_target_mutation_failure(id, user_id)
+                .await);
         }
         Ok(())
     }
@@ -1718,111 +2068,419 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_and_verify_otp_flow() {
+    async fn pending_registration_upsert_then_verify_creates_user() {
         let s = SqliteStorage::new_memory().await.unwrap();
         let expires = Utc::now() + chrono::Duration::minutes(15);
 
-        let user = s
-            .register_user("alice@example.com", "hash_placeholder", "alice")
+        s.upsert_pending_registration(
+            "alice@example.com",
+            "alice",
+            "hash_placeholder",
+            "123456",
+            expires,
+        )
+        .await
+        .unwrap();
+
+        // No `users` row exists yet — the pending state lives in
+        // its own table and carries no authority.
+        assert!(
+            s.get_user_by_email("alice@example.com")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Verify with the right code. The pending row is consumed
+        // and a fresh user materializes in the same transaction.
+        let result = s
+            .verify_pending_registration("alice@example.com", "123456")
             .await
             .unwrap();
+        let (user, token) = match result {
+            PendingVerifyResult::Success { user, raw_token } => (user, raw_token),
+            other => panic!("expected Success, got {other:?}"),
+        };
         assert_eq!(user.email.as_deref(), Some("alice@example.com"));
-        assert!(!user.verified);
+        assert_eq!(user.name, "alice");
+        // Critical: a self-served signup is inert until an admin
+        // approves it. Without this gate, anyone with email +
+        // SMTP enabled could spawn a shell on the gateway host.
+        assert!(
+            !user.session_enabled,
+            "self-registered accounts must start with session_enabled = FALSE"
+        );
 
-        // duplicate email is Conflict
-        let err = s
-            .register_user("alice@example.com", "h2", "alice2")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::Conflict(_)));
-
-        // create and verify OTP
-        s.create_otp(user.id, "123456", expires).await.unwrap();
-        let result = s.verify_otp(user.id, "123456").await.unwrap();
-        assert_eq!(result, OtpVerifyResult::Success);
-
-        // second use is Expired (already used)
-        let result2 = s.verify_otp(user.id, "123456").await.unwrap();
-        assert_eq!(result2, OtpVerifyResult::Expired);
-
-        // activate returns a bearer token
-        let raw_token = s.activate_user(user.id).await.unwrap();
-        assert!(!raw_token.is_empty());
-
-        // token validates
-        let authed = s.validate_token(&raw_token).await.unwrap();
+        // The minted token validates back to the same user.
+        let authed = s.validate_token(&token).await.unwrap();
         assert_eq!(authed.id, user.id);
-        assert!(authed.verified);
+
+        // The pending row is gone, so a second verify is Expired.
+        let second = s
+            .verify_pending_registration("alice@example.com", "123456")
+            .await
+            .unwrap();
+        assert!(matches!(second, PendingVerifyResult::Expired));
     }
 
     #[tokio::test]
-    async fn otp_failure_locking() {
+    async fn pending_registration_upsert_overwrites_in_place() {
+        // Re-registering the same address must overwrite the previous
+        // pending row in place AND reset the failure counter so the
+        // user-driven retry is not stuck behind a stale lockout. The
+        // pending row carries no authority so this is safe — it's
+        // the takeover-fix invariant from the v0.1.2 finding.
         let s = SqliteStorage::new_memory().await.unwrap();
-        let user = s
-            .register_user("bob@example.com", "h", "bob")
+        let expires = Utc::now() + chrono::Duration::minutes(15);
+        s.upsert_pending_registration("retry@example.com", "alice", "old_hash", "111111", expires)
             .await
             .unwrap();
-        let expires = Utc::now() + chrono::Duration::minutes(15);
-        s.create_otp(user.id, "999999", expires).await.unwrap();
 
-        for i in 0..5u32 {
-            let r = s.verify_otp(user.id, "000000").await.unwrap();
-            if i < 4 {
-                assert_eq!(r, OtpVerifyResult::Failure { remaining: 4 - i });
-            } else {
-                assert_eq!(r, OtpVerifyResult::Locked);
-            }
+        // Burn 3 wrong attempts on the original row.
+        for _ in 0..3 {
+            let _ = s
+                .verify_pending_registration("retry@example.com", "000000")
+                .await
+                .unwrap();
         }
-        // 6th attempt still locked
-        assert_eq!(
-            s.verify_otp(user.id, "999999").await.unwrap(),
-            OtpVerifyResult::Locked
+
+        // Re-register with a different password and display name —
+        // the row is overwritten and the failure counter resets.
+        s.upsert_pending_registration("retry@example.com", "alicia", "new_hash", "222222", expires)
+            .await
+            .unwrap();
+
+        // The old code is now wrong (overwritten) and counts as one
+        // bump; remaining must be 4 (not 1, which would imply the
+        // old counter survived).
+        let r = s
+            .verify_pending_registration("retry@example.com", "111111")
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, PendingVerifyResult::Failure { remaining: 4 }),
+            "expected fresh 5-strike window after re-register, got {r:?}"
         );
     }
 
     #[tokio::test]
-    async fn login_with_password_generates_token() {
+    async fn verify_pending_registration_failure_sequence_locks_at_five() {
         let s = SqliteStorage::new_memory().await.unwrap();
-        let user = s
-            .register_user("carol@example.com", "bogushash", "carol")
+        let expires = Utc::now() + chrono::Duration::minutes(15);
+        s.upsert_pending_registration("bob@example.com", "bob", "h", "999999", expires)
             .await
             .unwrap();
-        let _tok = s.activate_user(user.id).await.unwrap();
+
+        for i in 0..5u32 {
+            let r = s
+                .verify_pending_registration("bob@example.com", "000000")
+                .await
+                .unwrap();
+            if i < 4 {
+                assert!(
+                    matches!(r, PendingVerifyResult::Failure { remaining } if remaining == 4 - i)
+                );
+            } else {
+                assert!(matches!(r, PendingVerifyResult::Locked));
+            }
+        }
+        // After lockout, even the correct code must not succeed.
+        assert!(matches!(
+            s.verify_pending_registration("bob@example.com", "999999")
+                .await
+                .unwrap(),
+            PendingVerifyResult::Locked,
+        ));
+    }
+
+    #[tokio::test]
+    async fn verify_pending_registration_unknown_email_collapses_to_expired() {
+        // Unknown addresses must look identical to expired pending
+        // rows from the storage layer's perspective — the auth
+        // service then maps both to a single generic error so an
+        // unauthenticated caller cannot enumerate which addresses
+        // have started a registration.
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let r = s
+            .verify_pending_registration("ghost@example.com", "123456")
+            .await
+            .unwrap();
+        assert!(matches!(r, PendingVerifyResult::Expired));
+    }
+
+    #[tokio::test]
+    async fn delete_pending_registration_clears_rate_limit() {
+        // The SMTP-failure rollback primitive: the pending row is
+        // removed so the user is not stuck behind the 60-second
+        // rate limit on a code that was never delivered.
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let expires = Utc::now() + chrono::Duration::minutes(15);
+        s.upsert_pending_registration("rb@example.com", "rb", "h", "111111", expires)
+            .await
+            .unwrap();
+        assert!(
+            s.latest_pending_registration_at("rb@example.com")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        s.delete_pending_registration("rb@example.com")
+            .await
+            .unwrap();
+
+        assert!(
+            s.latest_pending_registration_at("rb@example.com")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_user_token_rotates_token() {
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let (user, _) = s.create_user("carol", false).await.unwrap();
         let tok2 = s.refresh_user_token(user.id).await.unwrap();
         let authed = s.validate_token(&tok2).await.unwrap();
         assert_eq!(authed.id, user.id);
     }
 
     #[tokio::test]
-    async fn schema_has_email_verifications_and_user_targets() {
+    async fn schema_has_pending_registrations_and_session_enabled() {
         let s = SqliteStorage::new_memory().await.unwrap();
-        // Verify new columns on existing tables exist via SELECT (no FK/data needed).
-        sqlx::query("SELECT email, password_hash, verified FROM users LIMIT 1")
+        // Pending-registration table is real and selectable.
+        sqlx::query("SELECT email, otp_failure_count FROM pending_registrations LIMIT 1")
             .execute(&s.pool)
             .await
             .unwrap();
-        sqlx::query("SELECT user_target_id FROM sessions LIMIT 1")
+        // session_enabled column is present on users.
+        sqlx::query("SELECT session_enabled FROM users LIMIT 1")
             .execute(&s.pool)
             .await
             .unwrap();
-        // Verify new tables exist by inserting with a real user.
+        // Legacy email_verifications table was dropped.
+        let err = sqlx::query("SELECT 1 FROM email_verifications")
+            .execute(&s.pool)
+            .await;
+        assert!(
+            err.is_err(),
+            "email_verifications must be dropped after migration"
+        );
+        // user_targets is still here.
         let (user, _) = s.create_user("schematest", false).await.unwrap();
-        let uid = user.id.to_string();
-        sqlx::query(
-            "INSERT INTO email_verifications (user_id, code, expires_at, created_at)
-             VALUES (?, '123456', '2099-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-        )
-        .bind(&uid)
-        .execute(&s.pool)
-        .await
-        .unwrap();
         sqlx::query(
             "INSERT INTO user_targets (id, user_id, name, display, command, created_at, updated_at)
              VALUES ('t1', ?, 'test', 'Test', 'bash', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
         )
-        .bind(&uid)
+        .bind(user.id.to_string())
         .execute(&s.pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_accounts_excludes_scoped_guests() {
+        // Admin-page listings must not surface invite-minted scoped
+        // guests — they have no admin-actionable state and are tied
+        // to a single session. The trait method enforces this so
+        // every caller gets the same shape.
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let (alice, _) = s.create_user("alice", false).await.unwrap();
+        let session = s
+            .create_session_with_owner(alice.id, "shell", InputMode::Serialized, None)
+            .await
+            .unwrap();
+        let (_guest, _) = s.create_scoped_guest("guest1", &session.id).await.unwrap();
+
+        let listed = s.list_accounts().await.unwrap();
+        assert!(listed.iter().any(|u| u.id == alice.id));
+        assert!(
+            listed.iter().all(|u| u.scoped_session_id.is_none()),
+            "scoped guests must not appear in list_accounts"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_session_enabled_flips_bit_and_returns_updated_user() {
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let expires = Utc::now() + chrono::Duration::minutes(15);
+        s.upsert_pending_registration("u@example.com", "u", "h", "123456", expires)
+            .await
+            .unwrap();
+        let user = match s
+            .verify_pending_registration("u@example.com", "123456")
+            .await
+            .unwrap()
+        {
+            PendingVerifyResult::Success { user, .. } => user,
+            other => panic!("expected Success, got {other:?}"),
+        };
+        assert!(!user.session_enabled);
+
+        let updated = s.set_session_enabled(user.id, true).await.unwrap();
+        assert!(updated.session_enabled);
+
+        // Round-trip via find_user_by_id.
+        let read_back = s.find_user_by_id(user.id).await.unwrap().unwrap();
+        assert!(read_back.session_enabled);
+    }
+
+    // ── Login throttling (Fix #3) ────────────────────────────────────────
+    //
+    // The throttle primitives operate on `users.id` directly and don't
+    // care how the row was created — `create_user` is the simplest path
+    // that gives us a real account row to point them at.
+
+    async fn seed_verified_user(s: &SqliteStorage, name: &str) -> Uuid {
+        let (u, _) = s.create_user(name, false).await.unwrap();
+        u.id
+    }
+
+    #[tokio::test]
+    async fn login_failure_increments_counter_and_reports_remaining() {
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let uid = seed_verified_user(&s, "throttle1").await;
+        let lock = chrono::Duration::minutes(15);
+
+        // First four wrong attempts: counter climbs, threshold not hit.
+        let outcomes = vec![
+            s.record_login_failure(uid, lock).await.unwrap(),
+            s.record_login_failure(uid, lock).await.unwrap(),
+            s.record_login_failure(uid, lock).await.unwrap(),
+            s.record_login_failure(uid, lock).await.unwrap(),
+        ];
+        assert_eq!(
+            outcomes,
+            vec![
+                LoginFailureOutcome::Recorded { remaining: 4 },
+                LoginFailureOutcome::Recorded { remaining: 3 },
+                LoginFailureOutcome::Recorded { remaining: 2 },
+                LoginFailureOutcome::Recorded { remaining: 1 },
+            ]
+        );
+
+        // Until the threshold is reached the row is not locked, so a
+        // probe sees no active lockout.
+        assert!(s.check_login_lockout(uid).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn login_failure_locks_at_fifth_strike() {
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let uid = seed_verified_user(&s, "throttle2").await;
+        let lock = chrono::Duration::minutes(15);
+
+        // Burn the four "remaining" hops first.
+        for _ in 0..4 {
+            s.record_login_failure(uid, lock).await.unwrap();
+        }
+        let before = Utc::now();
+        let fifth = s.record_login_failure(uid, lock).await.unwrap();
+
+        match fifth {
+            LoginFailureOutcome::Locked { until } => {
+                // The lock window is [now+lockout - epsilon, now+lockout + epsilon].
+                // We allow generous slack so a slow CI box doesn't flake.
+                let expected = before + lock;
+                let drift = (until - expected).num_seconds().abs();
+                assert!(
+                    drift < 5,
+                    "lock until {until} drifted {drift}s from {expected}"
+                );
+            }
+            other => panic!("expected Locked, got {other:?}"),
+        }
+
+        // The lockout is observable to the read-side check.
+        let probe = s.check_login_lockout(uid).await.unwrap();
+        assert!(probe.is_some(), "user must register as locked");
+    }
+
+    #[tokio::test]
+    async fn record_login_failure_while_locked_keeps_existing_lock() {
+        // A persistent attacker that keeps hammering during the
+        // lockout window must not extend it indefinitely (a
+        // self-reinforcing lock would let an attacker permanently
+        // keep a real user out by spamming wrong passwords on every
+        // attempted unlock). The CAS pins the existing window.
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let uid = seed_verified_user(&s, "throttle3").await;
+        let lock = chrono::Duration::minutes(15);
+
+        for _ in 0..5 {
+            s.record_login_failure(uid, lock).await.unwrap();
+        }
+        let until_first = match s.check_login_lockout(uid).await.unwrap() {
+            Some(t) => t,
+            None => panic!("expected lockout after 5 strikes"),
+        };
+
+        // Slam the door a few more times — the existing window must
+        // not get pushed out.
+        for _ in 0..3 {
+            let r = s.record_login_failure(uid, lock).await.unwrap();
+            match r {
+                LoginFailureOutcome::Locked { until } => {
+                    assert_eq!(
+                        until, until_first,
+                        "lockout window must not be extended by hammering",
+                    );
+                }
+                other => panic!("expected Locked while locked, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_login_failures_resets_counter_and_lockout() {
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let uid = seed_verified_user(&s, "throttle4").await;
+        let lock = chrono::Duration::minutes(15);
+
+        for _ in 0..5 {
+            s.record_login_failure(uid, lock).await.unwrap();
+        }
+        assert!(s.check_login_lockout(uid).await.unwrap().is_some());
+
+        s.clear_login_failures(uid).await.unwrap();
+        assert!(s.check_login_lockout(uid).await.unwrap().is_none());
+
+        // After clear the next failure starts a fresh 5-strike window.
+        let r = s.record_login_failure(uid, lock).await.unwrap();
+        assert_eq!(r, LoginFailureOutcome::Recorded { remaining: 4 });
+    }
+
+    #[tokio::test]
+    async fn check_login_lockout_lazily_clears_expired_window() {
+        // Once the lockout window has passed in wall time, the next
+        // login attempt must see a clean slate — `check_login_lockout`
+        // is the chokepoint that turns "stale lock" into "idle row"
+        // so the user is not stuck behind a counter that already
+        // expired. Negative lockout duration simulates a window that
+        // is already in the past at write time, sidestepping the need
+        // to actually sleep in tests.
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let uid = seed_verified_user(&s, "throttle5").await;
+        let already_expired = chrono::Duration::seconds(-1);
+        for _ in 0..5 {
+            s.record_login_failure(uid, already_expired).await.unwrap();
+        }
+
+        // The lock is in the past, so check must return None AND
+        // reset the counter so the user is not stuck behind a stale
+        // lockout the moment they try again.
+        let probe = s.check_login_lockout(uid).await.unwrap();
+        assert!(probe.is_none(), "expired lockout must read as None");
+
+        let r = s
+            .record_login_failure(uid, chrono::Duration::minutes(15))
+            .await
+            .unwrap();
+        assert_eq!(
+            r,
+            LoginFailureOutcome::Recorded { remaining: 4 },
+            "post-clear failure must start a fresh window",
+        );
     }
 }

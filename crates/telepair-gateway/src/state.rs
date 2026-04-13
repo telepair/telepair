@@ -72,7 +72,7 @@ impl AppState {
         ));
         let targets = Arc::new(ArcSwap::from_pointee(engine));
         let hub = Arc::new(SessionHub::new(sessions.clone()));
-        let auth_service = Arc::new(AuthService::new(storage.clone(), smtp));
+        let auth_service = Arc::new(AuthService::new(storage.clone(), smtp, audit.clone()));
         let user_targets = Arc::new(UserTargetService::new(storage.clone()));
         // Production: start the idle-session reaper so orphaned PTYs
         // don't leak when all clients disconnect. The JoinHandle is
@@ -113,7 +113,7 @@ impl AppState {
         ));
         let targets = Arc::new(ArcSwap::from_pointee(engine));
         let hub = Arc::new(SessionHub::new(sessions.clone()));
-        let auth_service = Arc::new(AuthService::new(storage.clone(), None));
+        let auth_service = Arc::new(AuthService::new(storage.clone(), None, audit.clone()));
         let user_targets = Arc::new(UserTargetService::new(storage.clone()));
         Self {
             auth,

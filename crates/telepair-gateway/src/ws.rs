@@ -76,6 +76,46 @@ async fn cleanup_orphan_session(state: &AppState, session_id: &str) {
     }
 }
 
+/// Resolve the `(command, args, env)` tuple for a live WS attach. The
+/// session row's `user_target_id` is the only authority on which
+/// namespace to consult — `Some(_)` means the session was launched from
+/// a user-owned target and must resolve via the storage-backed
+/// `UserTargetService`; `None` means the launch came from a global
+/// target and must resolve via the in-memory `TargetEngine`. There is
+/// no fallback in either direction.
+///
+/// Why no fallback: namespaces overlap. A user named their VPS `vps`
+/// and so did the admin in `targets.yaml`. Without this strict split,
+/// a global `vps` added between session create and WS attach would
+/// shadow the user's target and launch the admin's command (with
+/// admin-supplied env) on the user's session — see
+/// `resolve_session_pty_does_not_fall_back_when_user_target_missing`.
+async fn resolve_session_pty(
+    user_target_id: Option<&str>,
+    target_name: &str,
+    state: &AppState,
+) -> Result<
+    (
+        String,
+        Vec<String>,
+        std::collections::HashMap<String, String>,
+    ),
+    String,
+> {
+    if let Some(id) = user_target_id {
+        return match state.user_targets.resolve_by_id(id).await {
+            Ok(Some(t)) => Ok(t),
+            Ok(None) => Err(format!("user target {id} not found")),
+            Err(e) => Err(format!("failed to resolve user target {id}: {e}")),
+        };
+    }
+    state
+        .targets
+        .load()
+        .resolve(target_name)
+        .ok_or_else(|| format!("target {target_name} not found"))
+}
+
 /// Build the two WebSocket frames that `send_error` will write for a
 /// given protocol error: a JSON `ServerMessage::Error` text frame the
 /// client's `onmessage` handler can surface, followed by a `Close`
@@ -176,6 +216,34 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         return;
     }
 
+    // `session_enabled = FALSE` gate: a self-served email signup
+    // that has not been approved by an admin cannot attach to any
+    // session — not even one they somehow became a participant of
+    // before being disabled. Scoped guests are seeded with the bit
+    // ON at mint time and the scope pin above has already been
+    // enforced, so this check only ever fires on disabled real
+    // accounts. Admins bypass it so the bootstrap path cannot lock
+    // itself out. The rejection is audited as
+    // `auth.session_access_denied` to mirror the HTTP-side gate and
+    // give operators a single place to correlate disabled-account
+    // probes across both attach surfaces.
+    if !user.session_enabled && !user.is_admin {
+        crate::http::audit_session_access_denied(
+            &state,
+            &user,
+            "WS /ws/session/{id}",
+            Some(&session_id),
+        )
+        .await;
+        send_error(
+            &mut ws_tx,
+            error_codes::SESSION_DISABLED,
+            "account is pending admin approval".into(),
+        )
+        .await;
+        return;
+    }
+
     // Run session lookup and participant listing concurrently — both depend
     // only on session_id and account for ~half the handshake DB time.
     let (session_res, participants_res) = tokio::join!(
@@ -261,48 +329,33 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         .unwrap_or_else(|| if is_owner { Role::Owner } else { Role::Viewer });
 
     let hub = &state.hub;
-    // `load()` is wait-free; `resolve` returns owned strings so the
-    // guard drops before we hand the tuple to `start_or_join`.
-    let (cmd, args, env) = match state.targets.load().resolve(&session.target_name) {
-        Some(resolved) => resolved,
-        None => {
-            // Global target not found — try the user-owned target recorded
-            // on the session row at create time.
-            if let Some(ref ut_id) = session.user_target_id {
-                match state.user_targets.resolve_by_id(ut_id).await {
-                    Ok(Some(resolved)) => resolved,
-                    Ok(None) => {
-                        cleanup_orphan_session(&state, &session_id).await;
-                        send_error(
-                            &mut ws_tx,
-                            error_codes::TARGET_NOT_FOUND,
-                            format!("user target {} not found", ut_id),
-                        )
-                        .await;
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::error!("failed to resolve user target {ut_id}: {e}");
-                        cleanup_orphan_session(&state, &session_id).await;
-                        send_error(
-                            &mut ws_tx,
-                            error_codes::TARGET_NOT_FOUND,
-                            format!("failed to resolve user target {ut_id}"),
-                        )
-                        .await;
-                        return;
-                    }
-                }
-            } else {
-                cleanup_orphan_session(&state, &session_id).await;
-                send_error(
-                    &mut ws_tx,
-                    error_codes::TARGET_NOT_FOUND,
-                    format!("target {} not found", session.target_name),
-                )
-                .await;
-                return;
-            }
+    // Resolve the target via the namespace recorded on the session row at
+    // create time. If `user_target_id` is `Some`, this session was launched
+    // from a user-owned target — we MUST resolve by id and never consult
+    // the global engine, otherwise a global target with a colliding name
+    // added between create and attach would silently launch the wrong PTY
+    // (with arbitrary admin-supplied env). The reverse is also true: a
+    // session created against a global target does not get to fall back to
+    // a user-owned target with the same name. See the `resolve_session_pty`
+    // tests below for the regression coverage.
+    let resolved = resolve_session_pty(
+        session.user_target_id.as_deref(),
+        &session.target_name,
+        &state,
+    )
+    .await;
+    let (cmd, args, env) = match resolved {
+        Ok(tuple) => tuple,
+        Err(err) => {
+            tracing::warn!(
+                session = %session_id,
+                target = %session.target_name,
+                user_target_id = ?session.user_target_id,
+                "failed to resolve session target: {err}",
+            );
+            cleanup_orphan_session(&state, &session_id).await;
+            send_error(&mut ws_tx, error_codes::TARGET_NOT_FOUND, err).await;
+            return;
         }
     };
     let SessionAttachment {
@@ -595,7 +648,152 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use telepair_agent::virtual_target::TargetEngine;
     use telepair_core::protocol::{CLOSE_CODE_TERMINAL, CLOSE_CODE_TRANSIENT};
+    use telepair_core::session::CreateUserTargetParams;
+    use telepair_core::storage::Storage;
+
+    /// Build a `TargetEngine` whose only virtual target is `vps`,
+    /// staging a global namespace collision against any user-owned
+    /// `vps` we create in storage. Goes through `from_yaml` so the
+    /// `local-shell` auto-injection runs (production never sees an
+    /// engine without it).
+    fn engine_with_global_vps_echoing(echo: &str) -> TargetEngine {
+        let yaml = format!(
+            "targets:\n  - name: vps\n    display: Global VPS\n    type: virtual\n    command: /bin/echo\n    args: [\"{echo}\"]\n",
+        );
+        TargetEngine::from_yaml(&yaml).expect("yaml fixture must parse")
+    }
+
+    /// The whole reason `resolve_session_pty` exists: a session whose
+    /// row carries `user_target_id = Some(_)` MUST resolve via the
+    /// user-target storage table even when a global target with the
+    /// same `target_name` exists in the engine. The pre-fix code
+    /// resolved global-first and would launch the admin's `/bin/echo
+    /// global` on the user's session, complete with admin-controlled
+    /// args and env — a privilege boundary blast.
+    #[tokio::test]
+    async fn resolve_session_pty_uses_user_target_when_id_is_set() {
+        let state = AppState::new_test().await;
+        state
+            .targets
+            .store(Arc::new(engine_with_global_vps_echoing("global")));
+        let (alice, _) = state.storage.create_user("alice", false).await.unwrap();
+        let user_target = state
+            .storage
+            .create_user_target(CreateUserTargetParams {
+                user_id: alice.id,
+                name: "vps".into(),
+                display: "Alice VPS".into(),
+                command: "/bin/echo".into(),
+                args: vec!["user".into()],
+                env: Default::default(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+
+        let (cmd, args, _env) = resolve_session_pty(Some(&user_target.id), "vps", &state)
+            .await
+            .expect("user target must resolve");
+
+        assert_eq!(cmd, "/bin/echo");
+        assert_eq!(
+            args,
+            vec!["user".to_string()],
+            "must launch the user-owned command, not the colliding global one"
+        );
+    }
+
+    /// Counterpart: a global-launched session (`user_target_id` is
+    /// `None`) must resolve via the engine even when a user owns a
+    /// target with the same name. No silent reverse fallback.
+    #[tokio::test]
+    async fn resolve_session_pty_uses_global_when_id_is_none() {
+        let state = AppState::new_test().await;
+        state
+            .targets
+            .store(Arc::new(engine_with_global_vps_echoing("global")));
+        let (alice, _) = state.storage.create_user("alice", false).await.unwrap();
+        // Stage a colliding user target so the test would catch a
+        // reverse fallback that started reading user_targets by name.
+        state
+            .storage
+            .create_user_target(CreateUserTargetParams {
+                user_id: alice.id,
+                name: "vps".into(),
+                display: "Alice VPS".into(),
+                command: "/bin/echo".into(),
+                args: vec!["user".into()],
+                env: Default::default(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+
+        let (cmd, args, _env) = resolve_session_pty(None, "vps", &state)
+            .await
+            .expect("global target must resolve");
+
+        assert_eq!(cmd, "/bin/echo");
+        assert_eq!(
+            args,
+            vec!["global".to_string()],
+            "must launch the global command, not the colliding user-owned one"
+        );
+    }
+
+    /// If the recorded `user_target_id` no longer exists (e.g. the
+    /// owner deleted it after the session row was written and the
+    /// referential guard was somehow bypassed), the resolver MUST NOT
+    /// fall back to whatever global target happens to share the name.
+    /// Returning an error is the only safe answer — the WS handler
+    /// surfaces it as `TARGET_NOT_FOUND` and tears the session down.
+    #[tokio::test]
+    async fn resolve_session_pty_does_not_fall_back_when_user_target_missing() {
+        let state = AppState::new_test().await;
+        state
+            .targets
+            .store(Arc::new(engine_with_global_vps_echoing("global")));
+
+        // Pass a nanoid that does not exist in the user_targets table.
+        let result = resolve_session_pty(Some("nonexistent-nanoid"), "vps", &state).await;
+        assert!(
+            result.is_err(),
+            "missing user target must NOT fall back to the global engine"
+        );
+    }
+
+    /// And the symmetric case for global launches: a session created
+    /// against a global target whose row was later removed from
+    /// `targets.yaml` must error rather than picking up some
+    /// arbitrary user-owned target with the same name.
+    #[tokio::test]
+    async fn resolve_session_pty_global_miss_does_not_fall_back_to_user() {
+        let state = AppState::new_test().await;
+        // Empty engine = only `local-shell`. The `vps` global is gone.
+        let (alice, _) = state.storage.create_user("alice", false).await.unwrap();
+        state
+            .storage
+            .create_user_target(CreateUserTargetParams {
+                user_id: alice.id,
+                name: "vps".into(),
+                display: "Alice VPS".into(),
+                command: "/bin/echo".into(),
+                args: vec!["user".into()],
+                env: Default::default(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+
+        let result = resolve_session_pty(None, "vps", &state).await;
+        assert!(
+            result.is_err(),
+            "missing global target must NOT fall back to a user-owned target with the same name"
+        );
+    }
 
     /// Pull the `CloseFrame` out of a `Message::Close`, or panic with a
     /// descriptive error so test failures point at the right thing.

@@ -196,13 +196,23 @@ pub struct User {
     /// Never serialized — not sent over the API.
     #[serde(skip)]
     pub email: Option<String>,
-    /// `false` until the user confirms their email OTP. Token-only
-    /// accounts are always considered verified (they received their
-    /// token out-of-band). Never serialized — not sent over the API.
-    #[serde(skip)]
-    pub verified: bool,
+    /// Whether this account may create new sessions or attach to
+    /// existing ones. Defaults to TRUE for admin-created accounts and
+    /// invite-minted guests; the email-registration path explicitly
+    /// inserts FALSE so a self-served signup is inert until an admin
+    /// approves it on the user management page. The HTTP
+    /// `POST /api/sessions` handler and the WS attach handshake both
+    /// gate on this bit; without it, anyone with SMTP enabled could
+    /// turn a public signup into shell access against the gateway
+    /// host (the v0.1.2 critical adversarial finding).
+    #[serde(default = "default_session_enabled")]
+    pub session_enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_session_enabled() -> bool {
+    true
 }
 
 impl User {
@@ -303,18 +313,48 @@ pub struct CreateUserTargetParams {
     pub tags: Vec<String>,
 }
 
-/// Result of a `Storage::verify_otp` call.
-#[derive(Debug, PartialEq)]
-pub enum OtpVerifyResult {
-    /// Code matched and was marked used.
-    Success,
-    /// Code did not match. `remaining` is how many attempts are left
-    /// before the OTP is locked (starts at 4 and counts down).
+/// Result of a [`crate::storage::Storage::verify_pending_registration`]
+/// call. Folds the OTP check, the locked-row signal, and the
+/// "consume + materialize" success step into a single atomic outcome
+/// so the auth service does not have to coordinate three separate
+/// transactions.
+///
+/// `Expired` deliberately collapses both "no pending row exists" and
+/// "row exists but OTP has elapsed" — the public API must not let an
+/// unauthenticated caller distinguish "this email never registered"
+/// from "this email registered and the OTP timed out". The internal
+/// audit log still records the precise reason via
+/// `auth.login_failed`-style detail blobs.
+#[derive(Debug)]
+pub enum PendingVerifyResult {
+    /// Code matched. The pending row was deleted, the user row was
+    /// inserted with `verified = TRUE` and `session_enabled = FALSE`,
+    /// and `raw_token` is the freshly minted bearer the auth service
+    /// must return to the client exactly once.
+    Success { user: User, raw_token: String },
+    /// Code did not match. `remaining` counts down from 4 to 0; on
+    /// the next failure the row transitions to `Locked`.
     Failure { remaining: u32 },
-    /// Five consecutive wrong codes — OTP is permanently locked.
+    /// Five consecutive wrong codes on the same pending row — the
+    /// row is now locked. The user must re-register from scratch
+    /// (which deletes the locked row via the upsert path).
     Locked,
-    /// No un-used, un-locked OTP found, or the OTP has expired.
+    /// No matching pending row, or the OTP has expired.
     Expired,
+}
+
+/// Result of a `Storage::record_login_failure` call. Mirrors the OTP
+/// 5-strike pattern but operates on the `users` row directly: there is
+/// only ever one counter per user, not one per row.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LoginFailureOutcome {
+    /// Counter incremented but the threshold has not been reached.
+    /// `remaining` counts down to zero — when it hits zero on the next
+    /// failure, the row transitions to `Locked`.
+    Recorded { remaining: u32 },
+    /// Threshold reached: the row now has `login_locked_until` set
+    /// and subsequent login attempts are rejected until that time.
+    Locked { until: DateTime<Utc> },
 }
 
 /// Return value of [`crate::storage::Storage::redeem_invite`]. Carries

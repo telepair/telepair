@@ -176,6 +176,25 @@ const fakeBetaSession = {
   closed_at: null,
 };
 
+// Helper builders so the createSession tests below stay readable. The
+// store now takes a full TargetInfo so the api layer can pick the
+// right namespace field — these mirror what `listTargets` returns.
+const globalTarget = (name: string) => ({
+  name,
+  display: name,
+  tags: [],
+  source: 'global' as const,
+  admin_only: false,
+});
+const userTarget = (name: string, id: string) => ({
+  name,
+  display: name,
+  tags: [],
+  source: 'user' as const,
+  id,
+  admin_only: false,
+});
+
 describe('sessionStore.createSession', () => {
   it('creates session and appends to list when no target filter', async () => {
     // Clear sessions first
@@ -183,7 +202,7 @@ describe('sessionStore.createSession', () => {
     await sessionStore.fetchSessions();
 
     mockFetch.mockResolvedValueOnce(jsonResponse(fakeSession, 201));
-    const result = await sessionStore.createSession('local-shell');
+    const result = await sessionStore.createSession(globalTarget('local-shell'));
     expect(result.id).toBe('sess-1');
     expect(sessionStore.sessions()).toContainEqual(fakeSession);
   });
@@ -195,7 +214,7 @@ describe('sessionStore.createSession', () => {
     await sessionStore.fetchSessions('active', 'local-shell');
 
     mockFetch.mockResolvedValueOnce(jsonResponse(fakeSession, 201));
-    await sessionStore.createSession('local-shell');
+    await sessionStore.createSession(globalTarget('local-shell'));
     expect(sessionStore.sessions()).toContainEqual(fakeSession);
   });
 
@@ -210,12 +229,41 @@ describe('sessionStore.createSession', () => {
     await sessionStore.fetchSessions('active', 'local-shell');
 
     mockFetch.mockResolvedValueOnce(jsonResponse(fakeBetaSession, 201));
-    await sessionStore.createSession('prod-db');
+    await sessionStore.createSession(globalTarget('prod-db'));
 
     // List must still contain only the alpha session from the fetch.
     const ids = sessionStore.sessions().map((s) => s.id);
     expect(ids).toContain('sess-1');
     expect(ids).not.toContain('sess-2');
+  });
+
+  it('addresses user-owned targets by target_id, not target_name', async () => {
+    // Regression guard for Fix #2 collision-shadowing: a user-owned
+    // target with the same `name` as a global one MUST round-trip
+    // through the store as `target_id`, otherwise the store would
+    // serialise the name and the backend would launch the global
+    // target. The store passes the full TargetInfo to api.createSession,
+    // and api.ts does the namespace pick — this test pins both halves.
+    mockFetch.mockResolvedValueOnce(jsonResponse([]));
+    await sessionStore.fetchSessions();
+
+    const userVps = {
+      id: 'sess-3',
+      owner_id: 'u1',
+      target_name: 'vps',
+      input_mode: 'multiplexed',
+      status: 'active',
+      created_at: '2026-04-04T12:02:00Z',
+      closed_at: null,
+      user_target_id: 'nano-1',
+    };
+    mockFetch.mockResolvedValueOnce(jsonResponse(userVps, 201));
+    await sessionStore.createSession(userTarget('vps', 'nano-1'));
+
+    const lastCall = mockFetch.mock.calls[mockFetch.mock.calls.length - 1];
+    const body = JSON.parse((lastCall[1] as RequestInit).body as string);
+    expect(body).toEqual({ target_id: 'nano-1' });
+    expect(body.target_name).toBeUndefined();
   });
 });
 

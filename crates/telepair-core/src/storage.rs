@@ -9,8 +9,9 @@ use crate::audit::{AuditEvent, AuditFilter};
 use crate::error::Result;
 use crate::permission::Role;
 use crate::session::{
-    CloseReason, CreateUserTargetParams, InputMode, InviteToken, OtpVerifyResult, Participant,
-    RedeemIdentity, RedeemOutcome, Session, SessionListFilter, User, UserTarget,
+    CloseReason, CreateUserTargetParams, InputMode, InviteToken, LoginFailureOutcome, Participant,
+    PendingVerifyResult, RedeemIdentity, RedeemOutcome, Session, SessionListFilter, User,
+    UserTarget,
 };
 
 pub use sqlite::SqliteStorage;
@@ -176,53 +177,132 @@ pub trait Storage: Send + Sync {
     async fn revoke_invite(&self, token_sha256: &str) -> Result<()>;
 
     // Auth — email registration
-    /// Create an unverified user row. Returns `Error::Conflict` if the email
-    /// is already registered. No `token_sha256` is set until `activate_user`.
-    async fn register_user(
+    //
+    // The pending-row design (v0.1.2): a self-served signup writes a
+    // single row to `pending_registrations` carrying the display name,
+    // password hash, and OTP. The row carries no authority — it has
+    // no `users` entry and no token — so a re-register from the same
+    // address can overwrite it freely without opening the
+    // pre-verification takeover window the old `users.verified=FALSE`
+    // path enabled. The successful OTP verify is the *only* moment a
+    // `users` row materializes, and it happens in the same transaction
+    // that consumes the pending row.
+    //
+    // Listing users + flipping `session_enabled` powers the admin
+    // approval flow: a freshly verified self-signup is inert (no
+    // session create / attach) until an admin enables the row.
+
+    /// Insert or refresh the pending registration for `email`. The row
+    /// is keyed by lowercased email; a re-register from the same
+    /// address overwrites the previous row in place, resets the OTP
+    /// failure counter to zero, and refreshes `updated_at`. Carries
+    /// no authority of its own — there is no `users` row and no
+    /// token until [`Self::verify_pending_registration`] consumes it.
+    async fn upsert_pending_registration(
         &self,
         email: &str,
-        password_hash: &str,
         display_name: &str,
-    ) -> Result<User>;
+        password_hash: &str,
+        otp_code: &str,
+        otp_expires_at: DateTime<Utc>,
+    ) -> Result<()>;
+
+    /// Returns the `updated_at` of the pending row for `email`, if
+    /// any. Used by the auth service's 60-second OTP rate limit.
+    async fn latest_pending_registration_at(&self, email: &str) -> Result<Option<DateTime<Utc>>>;
+
+    /// Delete the pending row for `email`, if any. Used by the
+    /// SMTP-failure rollback path so a user whose code was never
+    /// delivered is not stranded behind the rate limit on a row that
+    /// no one can verify.
+    async fn delete_pending_registration(&self, email: &str) -> Result<()>;
+
+    /// Atomically verify a pending registration's OTP. On
+    /// [`PendingVerifyResult::Success`] the pending row is consumed
+    /// AND a fresh `users` row is inserted (with `session_enabled =
+    /// FALSE`, awaiting admin approval) AND a bearer token is minted,
+    /// all in a single transaction. On code mismatch the failure
+    /// counter advances (Failure → Locked at 5). The pending row is
+    /// gated by `otp_expires_at > now` and `otp_failure_count < 5`;
+    /// "no eligible row" collapses to `Expired`, identical to a
+    /// missing row, so the public API cannot be used to enumerate
+    /// pending addresses.
+    async fn verify_pending_registration(
+        &self,
+        email: &str,
+        code: &str,
+    ) -> Result<PendingVerifyResult>;
+
+    /// Hard-delete every pending row whose `updated_at < cutoff`.
+    /// Returns the number of rows removed. Used by the (future)
+    /// background sweeper to keep the table from accreting abandoned
+    /// signups.
+    async fn sweep_pending_registrations(&self, cutoff: DateTime<Utc>) -> Result<u64>;
 
     async fn get_user_by_email(&self, email: &str) -> Result<Option<User>>;
 
-    /// Returns the bcrypt/argon2 hash for `email`. None if the user does
-    /// not exist or has no password set. Not on the trait — SqliteStorage
-    /// exposes it directly.
-
-    /// Insert an OTP row for `user_id`.
-    async fn create_otp(
-        &self,
-        user_id: Uuid,
-        code: &str,
-        expires_at: DateTime<Utc>,
-    ) -> Result<()>;
-
-    /// Atomically check `code` against the latest eligible OTP row.
-    /// Increments `failure_count` on mismatch (locking at 5); marks
-    /// `used=true` on match.
-    async fn verify_otp(&self, user_id: Uuid, code: &str) -> Result<OtpVerifyResult>;
-
-    /// Returns the `created_at` of the most recently inserted OTP row
-    /// for `user_id`. Used by the 60-second rate-limit check.
-    async fn latest_otp_created_at(&self, user_id: Uuid) -> Result<Option<DateTime<Utc>>>;
-
-    /// Flip `verified=TRUE` and generate + store a new nanoid token.
-    /// Returns the raw token.
-    async fn activate_user(&self, user_id: Uuid) -> Result<String>;
+    // `get_password_hash` is not on the trait — SqliteStorage exposes it
+    // directly so auth-service code can read credentials without making
+    // the method part of the public Storage contract.
 
     /// Generate a fresh nanoid token for an already-verified user and
     /// overwrite `token_sha256`. Previous tokens are immediately invalid.
     async fn refresh_user_token(&self, user_id: Uuid) -> Result<String>;
 
-    /// Remove every user row where `verified=FALSE` and
-    /// `created_at < cutoff`.
-    async fn sweep_unverified_users(&self, cutoff: DateTime<Utc>) -> Result<u64>;
+    // ── Admin user management (v0.1.2) ────────────────────────────────
+    //
+    // The admin approval flow needs a list of users to render and a
+    // way to flip `session_enabled` per row. Both endpoints are
+    // admin-gated in the HTTP layer; the storage primitives stay
+    // agnostic so tests can drive them directly.
+
+    /// List every account row, newest-first. Excludes invite-minted
+    /// scoped guests (`scoped_session_id IS NOT NULL`) since those are
+    /// session-local and not user-actionable on the admin page.
+    async fn list_accounts(&self) -> Result<Vec<User>>;
+
+    /// Look up a user row by id. Returns `Ok(None)` on miss so the
+    /// admin enable/disable handler can render a 404 instead of a 500.
+    async fn find_user_by_id(&self, user_id: Uuid) -> Result<Option<User>>;
+
+    /// Flip `session_enabled` on a user row. Returns the post-update
+    /// `User` so the caller can echo it into an audit row and the API
+    /// response. Returns `Error::InvalidInput` if the row does not
+    /// exist — the admin handler maps that to a 404.
+    async fn set_session_enabled(&self, user_id: Uuid, enabled: bool) -> Result<User>;
+
+    /// Returns the active password-login lockout for `user_id`, or
+    /// `None` if the user is not currently locked out. The "lazy
+    /// clear" semantics are deliberate: when a row's
+    /// `login_locked_until` has fallen into the past this method
+    /// resets `login_failed_count` and `login_locked_until` to their
+    /// idle state in the same call, so the next failed attempt starts
+    /// a fresh 5-strike window instead of immediately re-locking on
+    /// the stale counter. The returned `Some(time)` is always strictly
+    /// in the future.
+    async fn check_login_lockout(&self, user_id: Uuid) -> Result<Option<DateTime<Utc>>>;
+
+    /// Atomically increment `login_failed_count`. When the post-bump
+    /// count crosses the 5-strike threshold the row is transitioned
+    /// to `Locked` with `login_locked_until = now + lockout_duration`.
+    /// Mirrors the OTP failure-counter semantics so the rate limit
+    /// behaves consistently across both auth paths.
+    async fn record_login_failure(
+        &self,
+        user_id: Uuid,
+        lockout_duration: chrono::Duration,
+    ) -> Result<LoginFailureOutcome>;
+
+    /// Reset `login_failed_count` to zero and clear
+    /// `login_locked_until`. Called on successful login so a single
+    /// good password wipes out any prior bad attempts. Idempotent on
+    /// rows that are already in the idle state.
+    async fn clear_login_failures(&self, user_id: Uuid) -> Result<()>;
 
     // User-owned targets
     async fn create_user_target(&self, params: CreateUserTargetParams) -> Result<UserTarget>;
     async fn list_user_targets(&self, user_id: Uuid) -> Result<Vec<UserTarget>>;
+    #[allow(clippy::too_many_arguments)]
     async fn update_user_target(
         &self,
         id: &str,
