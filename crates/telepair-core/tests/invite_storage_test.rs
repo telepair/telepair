@@ -176,7 +176,11 @@ async fn revoke_invite_hard_deletes_row() {
 }
 
 #[tokio::test]
-async fn revoke_invite_twice_is_404() {
+async fn revoke_invite_twice_is_idempotent() {
+    // Two admins racing a revoke, or a user retrying after a network
+    // timeout, must not get a spurious error on the second call. The
+    // storage layer erases the "did the row really exist?" distinction
+    // so the HTTP DELETE can answer 204 either way.
     let (store, session_id) = setup().await;
 
     let (invite, _) = store
@@ -186,10 +190,11 @@ async fn revoke_invite_twice_is_404() {
 
     store.revoke_invite(&invite.token_sha256).await.unwrap();
 
-    // Second call must error — the UI uses this to drop stale rows
-    // when two admins revoke concurrently.
-    let err = store.revoke_invite(&invite.token_sha256).await;
-    assert!(err.is_err());
+    // Second call is a no-op — already gone, so nothing to delete.
+    store.revoke_invite(&invite.token_sha256).await.unwrap();
+
+    // And an arbitrary unknown sha is also a no-op (not an error).
+    store.revoke_invite(&"0".repeat(64)).await.unwrap();
 }
 
 #[tokio::test]

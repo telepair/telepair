@@ -59,6 +59,7 @@ fn default_params(role: Role) -> CreateInviteParams {
         role,
         max_uses: 3,
         expires_in_minutes: Some(60),
+        expires_in_secs: None,
         expires_at: None,
     }
 }
@@ -140,6 +141,7 @@ async fn create_clamps_huge_ttl_to_ceiling() {
                 role: Role::Viewer,
                 max_uses: 1,
                 expires_in_minutes: Some(30 * 24 * 60),
+                expires_in_secs: None,
                 expires_at: None,
             },
         )
@@ -171,6 +173,7 @@ async fn create_rejects_negative_ttl() {
                 role: Role::Viewer,
                 max_uses: 1,
                 expires_in_minutes: Some(-10),
+                expires_in_secs: None,
                 expires_at: None,
             },
         )
@@ -194,6 +197,7 @@ async fn create_rejects_past_absolute_expiry() {
                 role: Role::Viewer,
                 max_uses: 1,
                 expires_in_minutes: None,
+                expires_in_secs: None,
                 expires_at: Some(Utc::now() - Duration::minutes(5)),
             },
         )
@@ -227,6 +231,7 @@ async fn create_rejects_absolute_expiry_beyond_ceiling() {
                 role: Role::Viewer,
                 max_uses: 1,
                 expires_in_minutes: None,
+                expires_in_secs: None,
                 expires_at: Some(too_far),
             },
         )
@@ -250,6 +255,7 @@ async fn create_rejects_absolute_expiry_beyond_ceiling() {
                 role: Role::Viewer,
                 max_uses: 1,
                 expires_in_minutes: None,
+                expires_in_secs: None,
                 expires_at: Some(inside),
             },
         )
@@ -626,10 +632,13 @@ async fn revoke_rejects_non_owner() {
 }
 
 #[tokio::test]
-async fn revoke_cross_session_pretends_not_found() {
-    // Probing for another session's invites must read as 404, not
-    // "wrong session". We check that by asking `revoke` for a real
-    // token_sha256 but with the wrong session_id in the URL.
+async fn revoke_cross_session_is_idempotent_noop() {
+    // Probing for another session's invites must be indistinguishable
+    // from "never existed": both read as Ok(()) on the wire so the
+    // caller cannot enumerate cross-session invites. Critically, the
+    // target invite in session A must remain untouched — idempotency
+    // is about the response shape, not about granting cross-session
+    // write access.
     let fx = setup().await;
     let owner_a = seed_user(&fx, "owner-a").await;
     let owner_b = seed_user(&fx, "owner-b").await;
@@ -648,11 +657,33 @@ async fn revoke_cross_session_pretends_not_found() {
         .unwrap();
     let sha_a = rows[0].token_sha256.clone();
 
-    // Owner B tries to revoke it via their own session id.
-    let err = fx
-        .invites
+    // Owner B tries to revoke it via their own session id — no-op.
+    fx.invites
         .revoke(&owner_b, &session_b.id, &sha_a)
         .await
-        .unwrap_err();
-    assert!(matches!(err, Error::InvalidInput(_)));
+        .unwrap();
+
+    // Owner A's invite must still be there — the probe returned OK,
+    // but the actual row is untouched.
+    let rows = fx
+        .invites
+        .list_for_session(&owner_a, &session_a.id)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "cross-session probe must not delete");
+}
+
+#[tokio::test]
+async fn revoke_unknown_sha_is_idempotent_noop() {
+    // A double-revoke or a request against a fabricated sha is a
+    // no-op so the HTTP layer can answer 204 without leaking whether
+    // the invite ever existed.
+    let fx = setup().await;
+    let owner = seed_user(&fx, "owner").await;
+    let session = seed_session(&fx, &owner).await;
+
+    fx.invites
+        .revoke(&owner, &session.id, &"0".repeat(64))
+        .await
+        .unwrap();
 }

@@ -1386,10 +1386,11 @@ async fn revoke_session_invite_hard_deletes() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-/// Revoking an already-revoked invite (or an unknown sha) returns 400
-/// — the UI treats this as "already gone" and refreshes its state.
+/// Revoking an already-revoked invite is idempotent — a double-DELETE
+/// resolves to 204 so the UI doesn't have to special-case "already
+/// gone" with an error toast when two admins race a revoke.
 #[tokio::test]
-async fn revoke_session_invite_twice_is_bad_request() {
+async fn revoke_session_invite_twice_is_idempotent() {
     let (_, app, owner_token) = setup().await;
     let session_id = create_session(&app, &owner_token).await;
     mint_invite(&app, &owner_token, &session_id).await;
@@ -1421,7 +1422,7 @@ async fn revoke_session_invite_twice_is_bad_request() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-    // Second revoke — "already gone".
+    // Second revoke — still 204. Idempotent.
     let resp = app
         .clone()
         .oneshot(
@@ -1432,15 +1433,31 @@ async fn revoke_session_invite_twice_is_bad_request() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // A completely fabricated sha is also 204 — the server must not
+    // leak whether the token ever existed.
+    let fake_sha = "0".repeat(64);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/sessions/{session_id}/invites/{fake_sha}"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
 
 /// Cross-session probe: stranger has their own session, tries to
 /// revoke an invite that belongs to someone else's session via their
-/// own path. Must read as 400 (invite not found in *this* session),
-/// not leak that the invite exists elsewhere.
+/// own path. Must read as 204 (indistinguishable from "already gone"),
+/// with the real invite untouched — idempotency on the wire + strict
+/// session scoping for side effects.
 #[tokio::test]
-async fn revoke_session_invite_rejects_cross_session_probe() {
+async fn revoke_session_invite_cross_session_probe_is_silent_noop() {
     let (state, app, owner_a_token) = setup().await;
     let session_a = create_session(&app, &owner_a_token).await;
     mint_invite(&app, &owner_a_token, &session_a).await;
@@ -1475,11 +1492,11 @@ async fn revoke_session_invite_rejects_cross_session_probe() {
         )
         .await
         .unwrap();
-    // 400 (invalid input — "not found in this session"). If the
-    // service ever started leaking a distinction between "invite
-    // exists elsewhere" and "invite doesn't exist", that's a
-    // regression.
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // 204. A 400 here would light up the UI with an error toast AND
+    // leak that the attempted DELETE went down a different path from
+    // a regular "already gone" — a 204/400 branch on the wire is a
+    // yes/no oracle on "does this sha exist in session Y?".
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // Owner A's invite must still be intact — the stranger's probe
     // must not have side effects.
@@ -1496,4 +1513,150 @@ async fn revoke_session_invite_rejects_cross_session_probe() {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(rows.len(), 1, "cross-session probe must not delete");
+}
+
+/// Regression for a QA finding where a caller that sent
+/// `expires_in_secs` got silently ignored: the backend only accepted
+/// `expires_in_minutes`, `serde` dropped the unknown field on the
+/// floor, and the response came back with `expires_at: null`. The
+/// fix adds `expires_in_secs` as a first-class field, resolved to an
+/// absolute `expires_at` at the HTTP boundary so the service-layer
+/// validation (past / ceiling) catches bad values uniformly.
+#[tokio::test]
+async fn create_invite_with_expires_in_secs_populates_expires_at() {
+    let (_state, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    let before = chrono::Utc::now();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/sessions/{session_id}/invites"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    r#"{"role":"viewer","max_uses":2,"expires_in_secs":120}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let expires_at_raw = body["expires_at"]
+        .as_str()
+        .expect("expires_at must be populated when expires_in_secs is supplied");
+    let expires_at = chrono::DateTime::parse_from_rfc3339(expires_at_raw)
+        .expect("expires_at should be a valid RFC3339 timestamp")
+        .with_timezone(&chrono::Utc);
+    let delta = expires_at - before;
+    assert!(
+        delta >= chrono::Duration::seconds(110) && delta <= chrono::Duration::seconds(130),
+        "expires_at should be ~120 seconds in the future, got delta {delta:?}"
+    );
+}
+
+/// `expires_in_secs` wins over `expires_in_minutes` when both are
+/// supplied — the finer-grained field is treated as the more recent
+/// expression of caller intent. Prevents a silent "one of these wins"
+/// situation that pre-fix callers had no way to check against.
+#[tokio::test]
+async fn create_invite_expires_in_secs_beats_minutes() {
+    let (_state, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    let before = chrono::Utc::now();
+    let resp = app
+        .oneshot(
+            Request::post(format!("/api/sessions/{session_id}/invites"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                // 30 s vs 60 min: seconds must win.
+                .body(Body::from(
+                    r#"{"role":"viewer","expires_in_secs":30,"expires_in_minutes":60}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let expires_at = chrono::DateTime::parse_from_rfc3339(body["expires_at"].as_str().unwrap())
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let delta = expires_at - before;
+    assert!(
+        delta <= chrono::Duration::seconds(45),
+        "expires_in_secs must take precedence over expires_in_minutes, got delta {delta:?}"
+    );
+}
+
+/// Regression for F6-q1: the `CreateInvite` response must echo back
+/// the effective `max_uses` (defaulting to 1 when omitted) and any
+/// `expires_at` so the UI / CLI renders the server-of-record values
+/// rather than guessing from the request. Before this was explicit in
+/// a test, future refactors could quietly drop these fields from the
+/// response body.
+#[tokio::test]
+async fn create_invite_response_echoes_max_uses_and_expires_at() {
+    let (_state, app, owner_token) = setup().await;
+    let session_id = create_session(&app, &owner_token).await;
+
+    // Omit max_uses entirely; the default (1) must surface in the response.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/sessions/{session_id}/invites"))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"viewer"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["max_uses"].as_i64(), Some(1));
+    assert_eq!(body["role"].as_str(), Some("viewer"));
+    // No TTL requested → expires_at is null.
+    assert!(body["expires_at"].is_null());
+    assert!(
+        body["token"].as_str().is_some_and(|t| !t.is_empty()),
+        "raw token must flow through the response"
+    );
+}
+
+/// Regression for a QA finding where `/api/join/{token}` was assumed
+/// to exist and returned 405 (the mistaken read was a real bug). The
+/// canonical redeem endpoint is `POST /api/invite/redeem`; no route
+/// exists at `/api/join/*`, so any method on that path must 404 via
+/// the router fallback rather than misleadingly 405.
+#[tokio::test]
+async fn api_join_path_is_unrouted_404() {
+    let (_state, app, _owner_token) = setup().await;
+
+    for method in ["GET", "POST", "PUT", "DELETE"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/api/join/some-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{method} /api/join/<token> must 404, got {}",
+            resp.status()
+        );
+    }
 }

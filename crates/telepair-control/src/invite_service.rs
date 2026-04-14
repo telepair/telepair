@@ -32,11 +32,19 @@ pub const MAX_INVITE_TTL_MINUTES: i64 = 7 * 24 * 60;
 /// Input DTO for [`InviteService::create`]. The HTTP layer parses
 /// whatever body shape it likes and translates into this struct — the
 /// service does not care about JSON.
+///
+/// All three TTL inputs can be passed; the service resolves precedence
+/// `expires_at` > `expires_in_secs` > `expires_in_minutes` and applies
+/// [`MAX_INVITE_TTL_MINUTES`] clamping + positivity validation in one
+/// place. Keeping resolution out of the HTTP layer means a CLI or other
+/// non-HTTP caller cannot bypass the ceiling by pre-computing an
+/// absolute timestamp.
 #[derive(Debug, Clone)]
 pub struct CreateInviteParams {
     pub role: Role,
     pub max_uses: i32,
     pub expires_in_minutes: Option<i64>,
+    pub expires_in_secs: Option<i64>,
     pub expires_at: Option<DateTime<Utc>>,
 }
 
@@ -181,13 +189,14 @@ impl InviteService {
             )));
         }
 
-        // Resolve expiry. The two input paths intentionally carry
-        // different policies:
+        // Resolve expiry. Precedence: `expires_at` > `expires_in_secs`
+        // > `expires_in_minutes`. The two input flavours intentionally
+        // carry different policies:
         //
-        // * `expires_in_minutes` is silently clamped to the ceiling
-        //   because the UI slider can overshoot as a benign UX
-        //   mistake and clamping is friendlier than a 400. See the
-        //   `create_clamps_huge_ttl_to_ceiling` test.
+        // * Relative TTL (`expires_in_secs`/`_minutes`) is silently
+        //   clamped to the ceiling because UI sliders can overshoot as
+        //   a benign UX mistake and clamping is friendlier than a 400.
+        //   See `create_clamps_huge_ttl_to_ceiling`.
         //
         // * `expires_at` is an explicit wall-clock pick, so silently
         //   rewriting it would lie to the caller — a client asking
@@ -198,34 +207,40 @@ impl InviteService {
         //   caller could bypass the hard ceiling by passing an
         //   absolute timestamp.
         //
-        // Negative / zero relative TTL is rejected in either case so
-        // a slider overshoot does not silently produce a
-        // never-expires invite.
+        // Negative / zero relative TTL is rejected so a slider
+        // overshoot does not silently produce a never-expires invite.
         let now = Utc::now();
-        let expires_at = match (params.expires_at, params.expires_in_minutes) {
-            (Some(at), _) => {
-                if at <= now {
-                    return Err(Error::InvalidInput(
-                        "expires_at must be in the future".into(),
-                    ));
-                }
-                if at > now + Duration::minutes(MAX_INVITE_TTL_MINUTES) {
-                    return Err(Error::InvalidInput(format!(
-                        "expires_at must not exceed {MAX_INVITE_TTL_MINUTES} minutes from now"
-                    )));
-                }
-                Some(at)
+        let max_ttl = Duration::minutes(MAX_INVITE_TTL_MINUTES);
+        let expires_at = if let Some(at) = params.expires_at {
+            if at <= now {
+                return Err(Error::InvalidInput(
+                    "expires_at must be in the future".into(),
+                ));
             }
-            (None, Some(minutes)) if minutes > 0 => {
-                let clamped = minutes.min(MAX_INVITE_TTL_MINUTES);
-                Some(now + Duration::minutes(clamped))
+            if at > now + max_ttl {
+                return Err(Error::InvalidInput(format!(
+                    "expires_at must not exceed {MAX_INVITE_TTL_MINUTES} minutes from now"
+                )));
             }
-            (None, Some(_)) => {
+            Some(at)
+        } else if let Some(secs) = params.expires_in_secs {
+            if secs <= 0 {
+                return Err(Error::InvalidInput(
+                    "expires_in_secs must be positive".into(),
+                ));
+            }
+            let clamped = Duration::seconds(secs).min(max_ttl);
+            Some(now + clamped)
+        } else if let Some(minutes) = params.expires_in_minutes {
+            if minutes <= 0 {
                 return Err(Error::InvalidInput(
                     "expires_in_minutes must be positive".into(),
                 ));
             }
-            (None, None) => None,
+            let clamped = Duration::minutes(minutes).min(max_ttl);
+            Some(now + clamped)
+        } else {
+            None
         };
 
         let (invite, raw_token) = self
@@ -454,28 +469,36 @@ impl InviteService {
         Ok(rows.into_iter().map(InviteSummary::from_token).collect())
     }
 
-    /// Revoke (hard-delete) an invite row. Requires ownership +
-    /// that the invite actually belongs to the stated session —
-    /// the path parameter `session_id` must match what the invite
-    /// row points at. Mismatch returns `InvalidInput` (→ 400) so a
-    /// caller poking at `/api/sessions/X/invites/<token>` cannot
-    /// probe for the existence of invites in session Y.
+    /// Revoke (hard-delete) an invite row. Idempotent by design:
+    /// an unknown sha, an already-revoked sha, and a cross-session
+    /// probe all resolve to `Ok(())` so the HTTP layer can answer 204
+    /// without leaking whether the invite exists. Cross-session side
+    /// effects are still prevented — the storage delete only fires
+    /// when the invite actually belongs to `session_id`.
+    ///
+    /// Ownership is still required (non-owners get `PermissionDenied` →
+    /// 403); idempotency only collapses the "did the row exist?"
+    /// distinction, not the auth gate.
     pub async fn revoke(&self, owner: &User, session_id: &str, token_sha256: &str) -> Result<()> {
         self.sessions.require_owner(owner, session_id).await?;
         // Single indexed PK lookup — direct SHA-256 hit, O(1) even
         // when a session has hundreds of invites. The alternative
         // (list-and-filter) parsed every row in the session just to
         // find one.
-        let target = self
+        let Some(target) = self
             .storage
             .find_invite_by_sha256(token_sha256)
             .await?
             .filter(|r| r.session_id == session_id)
-            .ok_or_else(|| {
-                Error::InvalidInput(format!(
-                    "invite {token_sha256} not found in session {session_id}"
-                ))
-            })?;
+        else {
+            // Two shapes collapsed into "no-op": (1) already revoked
+            // or never existed, (2) the sha exists but belongs to a
+            // different session. Both read the same from the wire so
+            // a probe can't enumerate cross-session invites, and a
+            // race between two admins revoking the same row reports
+            // success to both.
+            return Ok(());
+        };
         let role = target.role;
         let token_prefix = target.token_prefix().to_string();
         self.storage.revoke_invite(&target.token_sha256).await?;

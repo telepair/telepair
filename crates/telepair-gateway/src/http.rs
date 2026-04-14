@@ -550,16 +550,21 @@ pub struct CreateInviteRequest {
     pub role: Role,
     #[serde(default = "default_max_uses")]
     pub max_uses: i32,
-    /// Optional TTL in minutes — mutually exclusive with `expires_at`.
-    /// The UI uses this because it's easier than picking an absolute
-    /// wall-clock time in a form; the backend resolves it to an absolute
-    /// `DateTime<Utc>` before hitting storage so the DB only ever sees
-    /// concrete timestamps.
+    /// Optional TTL in minutes — mutually exclusive with `expires_at`
+    /// and `expires_in_secs`. The UI uses this because it's easier
+    /// than picking an absolute wall-clock time in a form; the backend
+    /// resolves it to an absolute `DateTime<Utc>` before hitting storage
+    /// so the DB only ever sees concrete timestamps.
     #[serde(default)]
     pub expires_in_minutes: Option<i64>,
-    /// Optional absolute expiry. If both `expires_in_minutes` and
-    /// `expires_at` are set, this wins — callers shouldn't pass both
-    /// but if they do we prefer the one with less ambiguity.
+    /// Optional TTL in seconds — wins over `expires_in_minutes` when
+    /// both are set. Exists because sub-minute invites are convenient
+    /// for tests and demos (and the QA sweep caught the gap).
+    #[serde(default)]
+    pub expires_in_secs: Option<i64>,
+    /// Optional absolute expiry. If both a TTL field and `expires_at`
+    /// are set, this wins — callers shouldn't pass both but if they
+    /// do we prefer the one with less ambiguity.
     #[serde(default)]
     pub expires_at: Option<DateTime<Utc>>,
 }
@@ -582,8 +587,8 @@ pub async fn create_invite(
     // signal regardless of which field was wrong.
     let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
 
-    // Everything else — ownership, alive gate, role/max_uses/TTL
-    // validation, token mint — lives inside `InviteService::create`.
+    // Ownership, alive gate, TTL precedence/clamping, role/max_uses
+    // validation, token mint — all live inside `InviteService::create`.
     // The HTTP layer is pure transport + serialization.
     let result = state
         .invites
@@ -594,6 +599,7 @@ pub async fn create_invite(
                 role: body.role,
                 max_uses: body.max_uses,
                 expires_in_minutes: body.expires_in_minutes,
+                expires_in_secs: body.expires_in_secs,
                 expires_at: body.expires_at,
             },
         )
@@ -799,11 +805,13 @@ pub async fn list_session_invites(
 
 /// `DELETE /api/sessions/:id/invites/:token_sha256`
 ///
-/// Hard-deletes the invite row. Owner-only; the path-parameter session
-/// id must match what the invite points at (mismatch surfaces as 404 so
-/// a caller can't probe for invites belonging to other sessions).
-/// Double-revoke returns 404 — the UI treats that as "already gone" and
-/// refreshes its list.
+/// Hard-deletes the invite row. Owner-only; idempotent — always returns
+/// 204 on success regardless of whether the row was actually present.
+/// Double-revoke, an unknown sha, and a cross-session probe (valid sha
+/// pointing at a session the caller doesn't own) all collapse into the
+/// same 204 shape so an attacker cannot use this surface as a yes/no
+/// oracle for invite existence. The UI treats 204 as "it's gone now"
+/// and refreshes its list.
 pub async fn revoke_session_invite(
     State(state): State<AppState>,
     headers: HeaderMap,
