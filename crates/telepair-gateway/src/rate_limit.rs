@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// Minimum interval between register attempts from the same source
@@ -59,6 +59,17 @@ impl RegisterRateLimiter {
         }
     }
 
+    /// `expect` on a poisoned mutex is the right thing here: the only
+    /// way to poison is a panic while holding the lock, and the
+    /// critical section is a single HashMap insert with no allocations
+    /// or user code — a poison means the process is already in an
+    /// unrecoverable state.
+    fn lock(&self) -> MutexGuard<'_, HashMap<IpAddr, Instant>> {
+        self.last_seen
+            .lock()
+            .expect("register limiter mutex poisoned")
+    }
+
     /// Record an attempt from `ip`. On [`RateLimitDecision::Allowed`]
     /// the stored instant is refreshed so the next call within the
     /// window throttles. On [`RateLimitDecision::Throttled`] the
@@ -66,15 +77,7 @@ impl RegisterRateLimiter {
     /// does not extend their own cooldown by retrying.
     pub fn check(&self, ip: IpAddr) -> RateLimitDecision {
         let now = Instant::now();
-        // `expect` on a poisoned mutex is the right thing here: the
-        // only way to poison is a panic while holding the lock, and
-        // the critical section is a single HashMap insert with no
-        // allocations or user code — a poison means the process is
-        // already in an unrecoverable state.
-        let mut map = self
-            .last_seen
-            .lock()
-            .expect("register limiter mutex poisoned");
+        let mut map = self.lock();
         if let Some(&prev) = map.get(&ip) {
             let elapsed = now.duration_since(prev);
             if elapsed < self.min_interval {
@@ -93,18 +96,15 @@ impl RegisterRateLimiter {
     pub fn purge_expired(&self) {
         let now = Instant::now();
         let cutoff = self.min_interval;
-        let mut map = self
-            .last_seen
-            .lock()
-            .expect("register limiter mutex poisoned");
-        map.retain(|_, last| now.duration_since(*last) < cutoff);
+        self.lock()
+            .retain(|_, last| now.duration_since(*last) < cutoff);
     }
 
     /// Test-only observability: number of distinct IPs currently
     /// tracked. Production code has no reason to read this.
     #[cfg(test)]
     pub(crate) fn tracked_ips(&self) -> usize {
-        self.last_seen.lock().expect("poisoned").len()
+        self.lock().len()
     }
 }
 

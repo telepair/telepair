@@ -134,3 +134,9 @@ input:focus {
   0%   { background-position: 200% 0; }
   100% { background-position: -200% 0; }
 }
+
+.terminal-readonly {
+  opacity: 0.75;
+  cursor: not-allowed;
+}
+.terminal-readonly .xterm-cursor-layer { display: none; }

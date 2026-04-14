@@ -319,6 +319,16 @@ fn now_rfc3339() -> String {
 const USER_COLS: &str = "id, name, is_admin, scoped_session_id, email, session_enabled, \
      approval_state, created_at, updated_at";
 
+/// Parameterised INSERT for password-auth users (OTP-verified and
+/// admin-created). Bind order is: id, name, token_sha256, is_admin,
+/// email, password_hash, session_enabled, approval_state, created_at,
+/// updated_at — `verified` is TRUE on both paths so it's hardcoded.
+const INSERT_PASSWORD_USER_SQL: &str = "INSERT INTO users \
+       (id, name, token_sha256, is_admin, scoped_session_id, \
+        email, password_hash, verified, session_enabled, \
+        approval_state, created_at, updated_at) \
+     VALUES (?, ?, ?, ?, NULL, ?, ?, TRUE, ?, ?, ?, ?)";
+
 fn row_to_user(r: &SqliteRow) -> Result<User> {
     // `approval_state` defaults `'approved'` on legacy rows; a corrupt
     // value (unknown string) falls back to `Approved` rather than
@@ -1557,38 +1567,35 @@ impl Storage for SqliteStorage {
             // fix).
             let id = Uuid::new_v4();
             let (raw, sha256_hex) = generate_token();
-            sqlx::query(
-                "INSERT INTO users \
-                   (id, name, token_sha256, is_admin, scoped_session_id, \
-                    email, password_hash, verified, session_enabled, \
-                    approval_state, created_at, updated_at) \
-                 VALUES (?, ?, ?, FALSE, NULL, ?, ?, TRUE, FALSE, 'pending', ?, ?)",
-            )
-            .bind(id.to_string())
-            .bind(&display_name)
-            .bind(&sha256_hex)
-            .bind(email)
-            .bind(&password_hash)
-            .bind(&now_str)
-            .bind(&now_str)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                if let sqlx::Error::Database(ref db) = e
-                    && db.is_unique_violation()
-                {
-                    // Display name collision OR (much rarer) the
-                    // email is already in `users` from another
-                    // path. Either way the right answer is to fail
-                    // verification — the user has to retry with a
-                    // different display name.
-                    return Error::Conflict(format!(
-                        "display name '{display_name}' is already taken — \
+            sqlx::query(INSERT_PASSWORD_USER_SQL)
+                .bind(id.to_string())
+                .bind(&display_name)
+                .bind(&sha256_hex)
+                .bind(false)
+                .bind(email)
+                .bind(&password_hash)
+                .bind(false)
+                .bind(ApprovalState::Pending.as_str())
+                .bind(&now_str)
+                .bind(&now_str)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    if let sqlx::Error::Database(ref db) = e
+                        && db.is_unique_violation()
+                    {
+                        // Display name collision OR (much rarer) the
+                        // email is already in `users` from another
+                        // path. Either way the right answer is to fail
+                        // verification — the user has to retry with a
+                        // different display name.
+                        return Error::Conflict(format!(
+                            "display name '{display_name}' is already taken — \
                          please re-register with a different name"
-                    ));
-                }
-                Error::Storage(e)
-            })?;
+                        ));
+                    }
+                    Error::Storage(e)
+                })?;
             tx.commit().await?;
 
             let user = User {
@@ -1690,34 +1697,29 @@ impl Storage for SqliteStorage {
         let now = Utc::now();
         let now_str = rfc3339(now);
 
-        sqlx::query(
-            "INSERT INTO users \
-               (id, name, token_sha256, is_admin, scoped_session_id, \
-                email, password_hash, verified, session_enabled, \
-                approval_state, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, NULL, ?, ?, TRUE, ?, 'approved', ?, ?)",
-        )
-        .bind(id.to_string())
-        .bind(name)
-        .bind(&sha256_hex)
-        .bind(is_admin)
-        .bind(email)
-        .bind(password_hash)
-        .bind(session_enabled)
-        .bind(&now_str)
-        .bind(&now_str)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            if let sqlx::Error::Database(ref db) = e
-                && db.is_unique_violation()
-            {
-                return Error::Conflict(format!(
-                    "a user with name '{name}' or email '{email}' already exists"
-                ));
-            }
-            Error::Storage(e)
-        })?;
+        sqlx::query(INSERT_PASSWORD_USER_SQL)
+            .bind(id.to_string())
+            .bind(name)
+            .bind(&sha256_hex)
+            .bind(is_admin)
+            .bind(email)
+            .bind(password_hash)
+            .bind(session_enabled)
+            .bind(ApprovalState::Approved.as_str())
+            .bind(&now_str)
+            .bind(&now_str)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                if let sqlx::Error::Database(ref db) = e
+                    && db.is_unique_violation()
+                {
+                    return Error::Conflict(format!(
+                        "a user with name '{name}' or email '{email}' already exists"
+                    ));
+                }
+                Error::Storage(e)
+            })?;
 
         let user = User {
             id,

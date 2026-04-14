@@ -187,18 +187,9 @@ export default function Terminal(props: TerminalProps) {
   });
 
   return (
-    <>
-      <div
-        ref={containerRef}
-        style={{ width: '100%', height: '100%', overflow: 'hidden' }}
-      />
-      <style>{`
-        .terminal-readonly {
-          opacity: 0.75;
-          cursor: not-allowed;
-        }
-        .terminal-readonly .xterm-cursor-layer { display: none; }
-      `}</style>
-    </>
+    <div
+      ref={containerRef}
+      style={{ width: '100%', height: '100%', overflow: 'hidden' }}
+    />
   );
 }
