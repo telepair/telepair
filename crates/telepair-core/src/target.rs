@@ -39,24 +39,48 @@ pub struct TargetConfig {
     pub targets: Vec<Target>,
 }
 
+/// Replace `${VAR}` placeholders with the corresponding environment
+/// variable value. Unresolved variables pass through verbatim.
+///
+/// `$$` is **only** treated as an escape when it immediately precedes
+/// `{` — `$${VAR}` emits a literal `${VAR}` with no lookup. Any other
+/// `$$` sequence (e.g. `$$` as shell PID, or secrets like `pa$$word`)
+/// passes through untouched. Earlier versions of this helper collapsed
+/// every `$$` to a single `$`, which silently mutated argv and env for
+/// virtual targets whose commands legitimately contained `$$`.
 pub fn substitute_env_vars(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '$' && chars.peek() == Some(&'{') {
-            chars.next();
-            let var_name: String = chars.by_ref().take_while(|&c| c != '}').collect();
-            match std::env::var(&var_name) {
+    let mut rest = input;
+    while let Some(idx) = rest.find('$') {
+        result.push_str(&rest[..idx]);
+        let tail = &rest[idx..];
+
+        if let Some(after) = tail.strip_prefix("$${")
+            && let Some(close) = after.find('}')
+        {
+            result.push('$');
+            result.push('{');
+            result.push_str(&after[..close]);
+            result.push('}');
+            rest = &after[close + 1..];
+        } else if let Some(after) = tail.strip_prefix("${")
+            && let Some(close) = after.find('}')
+        {
+            let var_name = &after[..close];
+            match std::env::var(var_name) {
                 Ok(val) => result.push_str(&val),
                 Err(_) => {
                     result.push_str("${");
-                    result.push_str(&var_name);
+                    result.push_str(var_name);
                     result.push('}');
                 }
             }
+            rest = &after[close + 1..];
         } else {
-            result.push(ch);
+            result.push('$');
+            rest = &tail[1..];
         }
     }
+    result.push_str(rest);
     result
 }

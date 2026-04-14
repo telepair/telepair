@@ -527,7 +527,14 @@ fn verify_password(password: &str, hash: &str) -> Result<()> {
 
 fn generate_otp() -> String {
     use argon2::password_hash::rand_core::RngCore;
-    let n = OsRng.next_u32() % 1_000_000;
+    let limit = 1_000_000u32;
+    let threshold = u32::MAX - (u32::MAX % limit);
+    let n = loop {
+        let candidate = OsRng.next_u32();
+        if candidate < threshold {
+            break candidate % limit;
+        }
+    };
     format!("{n:06}")
 }
 
