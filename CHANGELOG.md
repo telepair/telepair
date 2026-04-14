@@ -7,6 +7,141 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-04-14
+
+Patch release focused on **admin maturity**: a dedicated system-info
+page, searchable and paginated user management, auditable JSON/CSV
+exports, and a validate-and-preview flow for virtual-target config.
+Internally, account status tracking is split so "awaiting approval"
+is no longer conflated with "disabled by admin", giving the audit
+trail and admin UI an unambiguous vocabulary.
+
+**One breaking API change**: `GET /api/admin/users` now returns a
+wrapped object (`{users, total}`) to support pagination, instead of a
+bare array. The `AdminUserInfo` row gains an `approval_state` field
+(`"approved" | "pending"`). Clients built against 0.1.3 need to read
+`users` out of the response. No WebSocket wire-format changes.
+
+In-place upgrade from 0.1.3 works without wiping the database. The
+`users.approval_state` column is added idempotently at boot, and
+pre-0.1.4 pending signups — previously signalled by
+`verified = TRUE AND session_enabled = FALSE` — are backfilled to
+`approval_state = 'pending'` exactly once at migration time so they
+do not silently promote to `approved` on first read.
+
+### Added — Admin system-info page
+
+- `GET /api/admin/system` — admin-only endpoint reporting version,
+  build metadata, uptime, DB path/size, active session count, total
+  user count, and `targets.yaml` path plus sha when configured.
+- `SessionHub::active_count` and `AppState` startup metadata so the
+  endpoint can report live runtime stats without scraping the DB.
+- Frontend `AdminSystem` page (`/admin/system`) with a card grid
+  layout. A new shared `AdminNav` component links Users / Targets /
+  Audit / System across admin pages, and the dashboard topbar gains
+  a "System" entry point.
+
+### Added — Admin user search, filter, and pagination
+
+- `GET /api/admin/users` accepts `q` (name/email substring),
+  `status` (`enabled | disabled | pending`), `limit` (default 50,
+  max 500), and `offset` query parameters. Response is now
+  `{users, total}` — **breaking vs. v0.1.3**.
+- `SqliteStorage::list_accounts_filtered` implements the filtered
+  query with parameterised SQL (no string concatenation) and
+  index-friendly ordering.
+- Frontend `AdminUsers` page gains a debounced search box, a status
+  dropdown, and load-more pagination matching the sessions list.
+
+### Added — Audit log export
+
+- `GET /api/admin/audit/export?format=json|csv` — streams the full
+  audit log as downloadable JSON or RFC 4180-compliant CSV.
+- Frontend `AdminAudit` page gains JSON and CSV download buttons
+  alongside the existing filters.
+
+### Added — Virtual target validate / preview flow
+
+- `POST /api/admin/targets/validate` — parses a proposed
+  `targets.yaml` payload, returns structured parse errors, and when
+  valid reports an `added / removed / changed` diff against the
+  currently loaded config. No state is mutated.
+- `TargetEngine::diff` in `telepair-agent` produces the diff set
+  consumed by the validate endpoint.
+- Frontend `AdminTargets` page now runs validate before reload and
+  shows a confirmation dialog with the preview diff. A sha256 of
+  the validated bytes is carried into the subsequent reload request
+  so the file cannot change between preview and apply (see Security
+  below).
+
+### Added — Approval-state separation
+
+- `users.approval_state` column (`approved | pending`) tracks
+  whether a self-serve signup has passed admin approval separately
+  from `session_enabled`. Previously `session_enabled = FALSE`
+  covered both "admin disabled an active user" and "awaiting
+  approval", making admin UX and the audit trail ambiguous.
+- `ApprovalState` enum surfaced in `AdminUserInfo` responses.
+  Frontend `AdminUsers` now renders pending vs. disabled as
+  distinct states with tailored actions.
+
+### Changed
+
+- **Breaking**: `GET /api/admin/users` response is now
+  `{users: [...], total: N}` instead of a bare array.
+- `AdminUserInfo` DTO gains `approval_state`.
+- Dashboard admin section includes a "System" link.
+
+### Fixed
+
+- Session detail: "Invite" and "Close" buttons are hidden after a
+  session ends, preventing 404-producing clicks against a closed
+  session.
+- `SqliteStorage::get_account`: on upgrade from a pre-0.1.4 DB
+  without the `approval_state` column, pending signups
+  (`verified = TRUE AND session_enabled = FALSE`) are now
+  backfilled to `approval_state = 'pending'` exactly once at
+  migration time, avoiding a silent promotion to `approved` on
+  first read.
+- `AdminTargets` e2e: toast regex updated for the validate-first
+  reload flow.
+
+### Security
+
+- **CSV formula injection**: audit-export CSV now prefixes any
+  string field starting with `=`, `+`, `-`, `@`, tab, or carriage
+  return with a single quote, neutralising Excel/LibreOffice
+  formula execution when an audit log is opened as a spreadsheet.
+- **RFC 4180 quoting**: string fields in CSV exports are correctly
+  quoted with double-quote doubling, preventing field corruption
+  when an event value contains a comma, quote, or newline.
+- **targets.yaml TOCTOU**: the validate endpoint returns a sha256
+  of the parsed bytes, and the reload endpoint verifies this sha
+  against the current file contents before applying, rejecting
+  with `409 Conflict` on mismatch. This closes a window where an
+  attacker with write access to `targets.yaml` could preview one
+  config and apply another.
+
+### Performance
+
+- `system_info` uses `SELECT COUNT(*) FROM users` instead of
+  loading all rows to count.
+- Audit-export CSV pre-allocates a buffer sized for the known event
+  count, avoiding per-row reallocations on large exports.
+- `SessionHub` GC logic extracted into a shared helper, eliminating
+  duplicated pruning across join / leave / close paths.
+
+### Testing
+
+- Cargo test count: **300 → 311** (all green). New coverage for
+  `system_info` fields, user filtering and pagination, audit export
+  formatting, CSV injection neutralisation, the validate endpoint,
+  `TargetEngine::diff`, the sha-guarded reload path, and the
+  `approval_state` backfill migration.
+- Vitest count: **143 → 143** (stable, all green).
+- Playwright e2e: `admin-targets` spec updated for the
+  validate-first flow with preview dialog.
+
 ## [0.1.3] - 2026-04-14
 
 Patch release adding **change-password flow**, **admin audit log page**,
@@ -830,7 +965,8 @@ role-based permissions, invite links, and real-time chat.
 - GitHub Actions CI pipeline and release workflow.
 - MIT license across the workspace.
 
-[Unreleased]: https://github.com/telepair/telepair/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/telepair/telepair/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/telepair/telepair/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/telepair/telepair/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/telepair/telepair/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/telepair/telepair/compare/v0.1.0...v0.1.1
