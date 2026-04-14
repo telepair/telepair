@@ -268,6 +268,27 @@ pub trait Storage: Send + Sync {
 
     async fn get_user_by_email(&self, email: &str) -> Result<Option<User>>;
 
+    /// Materialize a real `users` row directly from the admin CLI,
+    /// bypassing the OTP / SMTP flow. Used by
+    /// `telepair admin users create` so a single-node install without
+    /// SMTP can still onboard regular users. The row is written as
+    /// `verified = TRUE`, `approval_state = 'approved'` (no admin
+    /// review needed — the admin is the one running the CLI), with
+    /// `session_enabled` under caller control. Returns the full
+    /// `User` row plus the fresh raw bearer token.
+    ///
+    /// Errors collapse via [`Error::Conflict`] on either a display
+    /// name collision or a duplicate email — the CLI surfaces the
+    /// message to the operator verbatim.
+    async fn admin_create_password_user(
+        &self,
+        email: &str,
+        name: &str,
+        password_hash: &str,
+        is_admin: bool,
+        session_enabled: bool,
+    ) -> Result<(User, String)>;
+
     // `get_password_hash` is not on the trait — SqliteStorage exposes it
     // directly so auth-service code can read credentials without making
     // the method part of the public Storage contract.

@@ -150,6 +150,13 @@ pub enum AuditEventType {
     /// Actor is the owner who made the change.
     #[serde(rename = "participant.role_changed")]
     ParticipantRoleChanged,
+    /// An admin provisioned a new account directly via the
+    /// `telepair admin users create` CLI, bypassing the OTP flow.
+    /// Detail: `{target_user_id, target_user_name, email, is_admin,
+    /// session_enabled}`. Actor is `None` because the CLI runs as
+    /// the host operator, not an authenticated HTTP caller.
+    #[serde(rename = "auth.admin_user_created")]
+    AuthAdminUserCreated,
 }
 
 impl AuditEventType {
@@ -173,6 +180,7 @@ impl AuditEventType {
             Self::AuthSessionAccessDenied => "auth.session_access_denied",
             Self::AuthPasswordChanged => "auth.password_changed",
             Self::ParticipantRoleChanged => "participant.role_changed",
+            Self::AuthAdminUserCreated => "auth.admin_user_created",
         }
     }
 }
@@ -199,6 +207,7 @@ impl FromStr for AuditEventType {
             "auth.session_access_denied" => Ok(Self::AuthSessionAccessDenied),
             "auth.password_changed" => Ok(Self::AuthPasswordChanged),
             "participant.role_changed" => Ok(Self::ParticipantRoleChanged),
+            "auth.admin_user_created" => Ok(Self::AuthAdminUserCreated),
             _ => Err(format!("unknown audit event type: {s}")),
         }
     }
