@@ -576,6 +576,23 @@ impl SessionHub {
         counts
     }
 
+    /// Total number of live + pending sessions. Used by the admin
+    /// system info endpoint. Runs the same lazy GC as
+    /// `count_live_sessions_per_target` so expired pending entries
+    /// don't inflate the count.
+    pub async fn active_count(&self) -> usize {
+        let mut sessions = self.sessions.write().await;
+        let now = Instant::now();
+        let ttl = self.pending_attach_ttl;
+        sessions.retain(|_, entry| match entry {
+            SessionEntry::Pending { reserved_at, .. } => {
+                now.duration_since(*reserved_at) < ttl
+            }
+            SessionEntry::Live(_) => true,
+        });
+        sessions.len()
+    }
+
     /// Reserve a hub slot for a session whose DB row was just
     /// committed but whose WS handler has not yet attached. Without
     /// this, [`Self::count_live_sessions_per_target`] would report

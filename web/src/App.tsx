@@ -11,6 +11,7 @@ import Join from './pages/Join';
 import AdminTargets from './pages/AdminTargets';
 import AdminUsers from './pages/AdminUsers';
 import AdminAudit from './pages/AdminAudit';
+import AdminSystem from './pages/AdminSystem';
 import ChangePassword from './pages/ChangePassword';
 import ToastContainer from './components/Toast';
 
@@ -100,6 +101,14 @@ export default function App() {
               <AdminGuard>
                 <AdminAudit />
               </AdminGuard>
+            </AuthGuard>
+          )}
+        />
+        <Route
+          path="/admin/system"
+          component={() => (
+            <AuthGuard>
+              <AdminGuard><AdminSystem /></AdminGuard>
             </AuthGuard>
           )}
         />

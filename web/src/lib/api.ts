@@ -13,6 +13,9 @@ import type {
   AdminTargetInfo,
   AdminUserInfo,
   ReloadTargetsResult,
+  SystemInfo,
+  ValidateTargetsResult,
+  AdminUsersResponse,
 } from './protocol';
 
 /**
@@ -39,6 +42,13 @@ export interface ListAdminAuditOptions {
   actor_id?: string;
   event_type?: string;
   session_id?: string;
+}
+
+export interface ListAdminUsersOptions {
+  q?: string;
+  status?: string;
+  limit?: number;
+  offset?: number;
 }
 
 import { auth } from '../stores/auth';
@@ -330,6 +340,14 @@ export const api = {
     return request('/admin/targets/reload', { method: 'POST' });
   },
 
+  getSystemInfo(): Promise<SystemInfo> {
+    return request('/admin/system');
+  },
+
+  validateTargets(): Promise<ValidateTargetsResult> {
+    return request('/admin/targets/validate', { method: 'POST' });
+  },
+
   // ── Admin: audit ────────────────────────────────────────────────────────────
 
   listAdminAudit(opts: ListAdminAuditOptions = {}): Promise<AuditEvent[]> {
@@ -345,10 +363,27 @@ export const api = {
     return request(qs ? `/admin/audit?${qs}` : '/admin/audit');
   },
 
+  auditExportUrl(format: 'json' | 'csv', opts: ListAdminAuditOptions = {}): string {
+    const params = new URLSearchParams();
+    params.set('format', format);
+    if (opts.event_type) params.set('event_type', opts.event_type);
+    if (opts.session_id) params.set('session_id', opts.session_id);
+    if (opts.since) params.set('since', opts.since);
+    if (opts.until) params.set('until', opts.until);
+    if (opts.actor_id) params.set('actor_id', opts.actor_id);
+    return `${BASE}/admin/audit/export?${params.toString()}`;
+  },
+
   // ── Admin: users ────────────────────────────────────────────────────────────
 
-  listAdminUsers(): Promise<AdminUserInfo[]> {
-    return request('/admin/users');
+  listAdminUsers(opts: ListAdminUsersOptions = {}): Promise<AdminUsersResponse> {
+    const params = new URLSearchParams();
+    if (opts.q) params.set('q', opts.q);
+    if (opts.status) params.set('status', opts.status);
+    if (opts.limit != null) params.set('limit', String(opts.limit));
+    if (opts.offset != null) params.set('offset', String(opts.offset));
+    const qs = params.toString();
+    return request(qs ? `/admin/users?${qs}` : '/admin/users');
   },
 
   enableAdminUser(id: string): Promise<AdminUserInfo> {

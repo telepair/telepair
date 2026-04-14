@@ -1419,3 +1419,47 @@ pub async fn list_admin_audit(
     let rows = state.audit.query(filter).await?;
     Ok(Json(rows))
 }
+
+// --- Admin system info ---
+
+/// `GET /api/admin/system` — admin-only. Returns a snapshot of
+/// server-level diagnostics: version, filesystem paths, SMTP status,
+/// live session count, registered user count, and uptime in seconds.
+/// Intended for the admin UI's health overview and for operators who
+/// want a quick sanity-check without SSH'ing into the box.
+pub async fn system_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    require_admin(&user)?;
+
+    let live_sessions = state.hub.active_count().await;
+    // Use the filtered-list path with limit=0 so we get the COUNT(*)
+    // back without materializing every user row into memory.
+    let registered_users = state
+        .auth_service
+        .list_accounts_filtered(&AccountFilter {
+            query: None,
+            status: None,
+            limit: 0,
+            offset: 0,
+        })
+        .await
+        .map(|(_, total)| total)
+        .unwrap_or(0);
+
+    let uptime = state.startup.elapsed().as_secs();
+    let db_path = state.data_dir.join("telepair.db");
+
+    Ok(Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "data_dir": state.data_dir.display().to_string(),
+        "db_path": db_path.display().to_string(),
+        "targets_path": state.targets_path.as_ref().map(|p| p.display().to_string()),
+        "smtp_configured": state.smtp_configured,
+        "live_sessions": live_sessions,
+        "registered_users": registered_users,
+        "uptime_seconds": uptime,
+    })))
+}

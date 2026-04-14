@@ -53,6 +53,12 @@ pub struct AppState {
     pub auth_service: Arc<AuthService>,
     /// Per-user virtual target CRUD and PTY resolution.
     pub user_targets: Arc<UserTargetService>,
+    /// Records the instant the server started, for uptime reporting.
+    pub startup: std::time::Instant,
+    /// Resolved data directory path (e.g. `~/.telepair`).
+    pub data_dir: PathBuf,
+    /// Whether SMTP was configured at startup.
+    pub smtp_configured: bool,
 }
 
 impl AppState {
@@ -61,7 +67,9 @@ impl AppState {
         engine: TargetEngine,
         targets_path: Option<PathBuf>,
         smtp: Option<Arc<SmtpConfig>>,
+        data_dir: PathBuf,
     ) -> Self {
+        let smtp_configured = smtp.is_some();
         let auth = Arc::new(TokenAuthProvider::new(storage.clone()));
         let audit = Arc::new(AuditSink::new(storage.clone()));
         let sessions = Arc::new(SessionService::new(storage.clone(), audit.clone()));
@@ -94,6 +102,9 @@ impl AppState {
             storage,
             auth_service,
             user_targets,
+            startup: std::time::Instant::now(),
+            data_dir,
+            smtp_configured,
         }
     }
 
@@ -126,6 +137,9 @@ impl AppState {
             storage,
             auth_service,
             user_targets,
+            startup: std::time::Instant::now(),
+            data_dir: PathBuf::from("/tmp/telepair-test"),
+            smtp_configured: false,
         }
     }
 
