@@ -1,6 +1,6 @@
 // web/src/pages/AdminAudit.tsx
 import { createSignal, createResource, For, Show } from 'solid-js';
-import { api, errorMessage } from '../lib/api';
+import { api, errorMessage, readErrorMessage } from '../lib/api';
 import { AuditEventType } from '../lib/protocol';
 import type { AuditEvent } from '../lib/protocol';
 import type { ListAdminAuditOptions } from '../lib/api';
@@ -104,7 +104,7 @@ export default function AdminAudit() {
       const resp = await fetch(url, {
         headers: { Authorization: `Bearer ${auth.token()}` },
       });
-      if (!resp.ok) throw new Error(await resp.text());
+      if (!resp.ok) throw new Error(await readErrorMessage(resp));
       const blob = await resp.blob();
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
@@ -112,7 +112,10 @@ export default function AdminAudit() {
         ?.match(/filename="(.+)"/)?.[1]
         ?? `telepair-audit.${format}`;
       a.click();
-      URL.revokeObjectURL(a.href);
+      // `a.click()` has already kicked off the download; the browser
+      // holds its own reference to the blob, so we can release ours on
+      // the next tick.
+      setTimeout(() => URL.revokeObjectURL(a.href), 0);
     } catch (e) {
       toast.error(t('admin_audit.export_failed', { msg: errorMessage(e) }));
     }

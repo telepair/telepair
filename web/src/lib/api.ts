@@ -98,6 +98,36 @@ export function __setAuthExpiredHandler(fn: () => void) {
   handleAuthExpired = fn;
 }
 
+/**
+ * Read a non-2xx response body and collapse it to a toast-ready
+ * string. The gateway wraps `ApiError` bodies as `{"error": "..."}`
+ * JSON, so we extract the `error` field when present. For handlers
+ * that emit richer JSON (e.g. `POST /admin/targets/reload` returns
+ * `{"reason", "message", "targets"}`), the raw body is preserved so
+ * callers like `AdminTargets.parseReloadError` can still parse the
+ * full shape from `ApiError.message`. Plain-text bodies (some older
+ * 500 paths, proxies, static file errors) fall through unchanged.
+ */
+export async function readErrorMessage(resp: Response): Promise<string> {
+  const raw = await resp.text();
+  try {
+    const parsed = JSON.parse(raw);
+    if (
+      parsed
+      && typeof parsed === 'object'
+      && typeof (parsed as { error?: unknown }).error === 'string'
+      // Keep richer shapes (e.g. {reason, message, targets}) as raw
+      // so callers that need the whole body still see it.
+      && !('reason' in (parsed as object))
+    ) {
+      return (parsed as { error: string }).error;
+    }
+  } catch {
+    // Not JSON — fall through to raw text.
+  }
+  return raw;
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   // Read the in-memory signal — the single source of truth for the
   // current tab's credential. The signal is primed at module init from
@@ -127,7 +157,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     if (resp.status === 401 && !PUBLIC_PATHS.has(path)) {
       handleAuthExpired();
     }
-    throw new ApiError(resp.status, await resp.text());
+    throw new ApiError(resp.status, await readErrorMessage(resp));
   }
 
   // 204 No Content (DELETE endpoints) has no body — calling

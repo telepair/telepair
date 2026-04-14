@@ -196,6 +196,51 @@ describe('error handling', () => {
       expect((e as InstanceType<typeof ApiError>).status).toBe(404);
     }
   });
+
+  it('extracts the `error` field from a JSON error body', async () => {
+    // The gateway wraps ApiError bodies as `{"error": "..."}`. The
+    // request helper must unwrap that so toasts show a clean message
+    // instead of the raw JSON blob.
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: 'Current password is incorrect.' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    try {
+      await api.changePassword('wrong', 'newpw-12345');
+      expect.fail('expected ApiError');
+    } catch (e) {
+      expect(e).toBeInstanceOf(ApiError);
+      expect((e as InstanceType<typeof ApiError>).message).toBe(
+        'Current password is incorrect.',
+      );
+    }
+  });
+
+  it('preserves richer JSON bodies (e.g. reload structured errors) as raw text', async () => {
+    // `POST /admin/targets/reload` returns `{reason, message, targets}`
+    // on 4xx; `AdminTargets.parseReloadError` relies on the raw body
+    // reaching `ApiError.message` so it can route by `reason`.
+    const body = {
+      reason: 'still_referenced',
+      message: 'refusing to drop targets with live sessions',
+      targets: [{ target: 'db', active_sessions: 2 }],
+    };
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify(body), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    try {
+      await api.reloadTargets('deadbeef');
+      expect.fail('expected ApiError');
+    } catch (e) {
+      expect(e).toBeInstanceOf(ApiError);
+      expect(JSON.parse((e as InstanceType<typeof ApiError>).message)).toEqual(body);
+    }
+  });
 });
 
 describe('401 auth-expired interceptor', () => {

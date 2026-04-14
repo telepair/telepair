@@ -25,23 +25,57 @@ use crate::state::AppState;
 /// failures always surface as 401/403. `StatusCode` also lifts in, for
 /// the handful of sites that short-circuit with a hard-coded status
 /// (e.g. `return Err(StatusCode::BAD_REQUEST.into())` on body validation).
-pub struct ApiError(StatusCode);
+///
+/// The response body is a minimal JSON object `{"error": "..."}` when a
+/// message is available, or the canonical status reason otherwise.
+pub struct ApiError {
+    pub(crate) status: StatusCode,
+    message: Option<String>,
+}
+
+impl ApiError {
+    fn bare(status: StatusCode) -> Self {
+        Self {
+            status,
+            message: None,
+        }
+    }
+}
 
 impl From<Error> for ApiError {
     fn from(e: Error) -> Self {
-        Self(StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+        Self {
+            status: StatusCode::from_u16(e.http_status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            message: Some(e.to_string()),
+        }
     }
 }
 
 impl From<StatusCode> for ApiError {
     fn from(s: StatusCode) -> Self {
-        Self(s)
+        Self::bare(s)
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        self.0.into_response()
+        // 5xx bodies never echo `Error::Display` — `Storage`/`Io`/`Yaml`
+        // can contain SQL fragments, file paths, or other server-side
+        // detail that must not leak to clients. Client errors (4xx) keep
+        // their message so frontend toasts stay actionable.
+        let canonical = || {
+            self.status
+                .canonical_reason()
+                .unwrap_or("error")
+                .to_string()
+        };
+        let msg = if self.status.is_server_error() {
+            canonical()
+        } else {
+            self.message.unwrap_or_else(canonical)
+        };
+        (self.status, Json(serde_json::json!({ "error": msg }))).into_response()
     }
 }
 
@@ -52,7 +86,7 @@ pub async fn extract_user(state: &AppState, headers: &HeaderMap) -> Result<User,
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or(ApiError(StatusCode::UNAUTHORIZED))?;
+        .ok_or(ApiError::bare(StatusCode::UNAUTHORIZED))?;
 
     Ok(state.auth.validate(token).await?)
 }
@@ -64,7 +98,7 @@ pub async fn extract_user(state: &AppState, headers: &HeaderMap) -> Result<User,
 /// authenticated, they just don't have the scope for this route.
 fn require_unscoped(user: &User) -> Result<(), ApiError> {
     if user.is_guest() {
-        return Err(ApiError(StatusCode::FORBIDDEN));
+        return Err(ApiError::bare(StatusCode::FORBIDDEN));
     }
     Ok(())
 }
@@ -102,7 +136,7 @@ async fn require_session_enabled(
         return Ok(());
     }
     audit_session_access_denied(state, user, path, None).await;
-    Err(ApiError(StatusCode::FORBIDDEN))
+    Err(ApiError::bare(StatusCode::FORBIDDEN))
 }
 
 // --- Handlers ---
@@ -128,7 +162,7 @@ pub async fn register(
     State(state): State<AppState>,
     body: Result<Json<RegisterRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
     state
         .auth_service
         .register(&body.email, &body.password, &body.display_name)
@@ -150,7 +184,7 @@ pub async fn verify_otp(
     State(state): State<AppState>,
     body: Result<Json<VerifyOtpRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
     let token = state
         .auth_service
         .verify_otp(&body.email, &body.code)
@@ -171,7 +205,7 @@ pub async fn login(
     State(state): State<AppState>,
     body: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
     let token = if let Some(t) = body.token {
         // Validate existing bearer token (admin / guest path).
         state.auth.validate(&t).await?;
@@ -179,7 +213,7 @@ pub async fn login(
     } else if let (Some(email), Some(password)) = (body.email, body.password) {
         state.auth_service.login(&email, &password).await?
     } else {
-        return Err(ApiError(StatusCode::BAD_REQUEST));
+        return Err(ApiError::bare(StatusCode::BAD_REQUEST));
     };
     Ok(Json(serde_json::json!({"token": token})))
 }
@@ -233,7 +267,7 @@ pub async fn change_password(
     headers: HeaderMap,
     body: Result<Json<ChangePasswordRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
     let user = extract_user(&state, &headers).await?;
     let new_token = state
         .auth_service
@@ -350,7 +384,7 @@ fn pick_target_selector(body: &CreateSessionRequest) -> Result<TargetSelector, A
     match (name, id) {
         (Some(n), None) => Ok(TargetSelector::Global(n.to_string())),
         (None, Some(i)) => Ok(TargetSelector::User(i.to_string())),
-        _ => Err(ApiError(StatusCode::BAD_REQUEST)),
+        _ => Err(ApiError::bare(StatusCode::BAD_REQUEST)),
     }
 }
 
@@ -377,7 +411,7 @@ pub async fn create_session(
     // Axum's default JSON rejection is 422; we want 400 so an unknown
     // `input_mode` value reads as "client sent garbage" instead of
     // "server doesn't know what to do with it".
-    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
     let selector = pick_target_selector(&body)?;
 
     // Resolve the target without crossing namespaces. `target_name`
@@ -390,7 +424,7 @@ pub async fn create_session(
             let engine = state.targets.load();
             match engine.find(&name) {
                 Some(t) => (name.clone(), t.admin_only, None),
-                None => return Err(ApiError(StatusCode::NOT_FOUND)),
+                None => return Err(ApiError::bare(StatusCode::NOT_FOUND)),
             }
         }
         TargetSelector::User(id) => {
@@ -400,7 +434,7 @@ pub async fn create_session(
             // own it (a 403 would let an attacker enumerate target ids).
             match state.user_targets.get(&id, user.id).await? {
                 Some(ut) => (ut.name, false, Some(ut.id)),
-                None => return Err(ApiError(StatusCode::NOT_FOUND)),
+                None => return Err(ApiError::bare(StatusCode::NOT_FOUND)),
             }
         }
     };
@@ -419,7 +453,7 @@ pub async fn create_session(
                 .with_detail(serde_json::json!({ "target_name": target_name })),
             )
             .await;
-        return Err(ApiError(StatusCode::FORBIDDEN));
+        return Err(ApiError::bare(StatusCode::FORBIDDEN));
     }
 
     let mode = body.input_mode.unwrap_or(InputMode::Multiplexed);
@@ -546,7 +580,7 @@ pub async fn create_invite(
     // Axum's default JSON rejection is 422; every other handler in this
     // file remaps to 400 so clients get a consistent "you sent garbage"
     // signal regardless of which field was wrong.
-    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
 
     // Everything else — ownership, alive gate, role/max_uses/TTL
     // validation, token mint — lives inside `InviteService::create`.
@@ -618,7 +652,7 @@ pub async fn update_participant_role(
     Path((session_id, target_user_id)): Path<(String, String)>,
     body: Result<Json<UpdateRoleRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let body = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?.0;
+    let body = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?.0;
     let user = extract_user(&state, &headers).await?;
     state
         .sessions
@@ -626,15 +660,15 @@ pub async fn update_participant_role(
         .await?;
 
     let target_uid =
-        Uuid::parse_str(&target_user_id).map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+        Uuid::parse_str(&target_user_id).map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
 
     // Cannot change own role — the owner role is immutable.
     if target_uid == user.id {
-        return Err(ApiError(StatusCode::BAD_REQUEST));
+        return Err(ApiError::bare(StatusCode::BAD_REQUEST));
     }
     // Cannot promote to owner.
     if body.role == Role::Owner {
-        return Err(ApiError(StatusCode::BAD_REQUEST));
+        return Err(ApiError::bare(StatusCode::BAD_REQUEST));
     }
 
     // Verify the target is an active participant and get old role.
@@ -642,7 +676,7 @@ pub async fn update_participant_role(
         .sessions
         .find_active_participant_role(&session_id, target_uid)
         .await?
-        .ok_or(ApiError(StatusCode::NOT_FOUND))?;
+        .ok_or(ApiError::bare(StatusCode::NOT_FOUND))?;
 
     if old_role == body.role {
         // No-op: role already matches.
@@ -721,7 +755,10 @@ pub async fn redeem_invite(
     // the caller gets a real error instead of a spurious guest mint.
     let existing_user = match extract_user(&state, &headers).await {
         Ok(u) => Some(u),
-        Err(ApiError(StatusCode::UNAUTHORIZED)) => None,
+        Err(ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            ..
+        }) => None,
         Err(other) => return Err(other),
     };
 
@@ -730,7 +767,7 @@ pub async fn redeem_invite(
     // frontend's error-handling code which branches on "bad request"
     // (show form error) vs "server error" (show toast + retry) — the
     // old 422 made bogus redeems look like a server crash.
-    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
 
     // Everything else — preview, scoped-guest check, closed-session
     // gate, existing-member no-op, atomic consume, guest mint,
@@ -869,7 +906,7 @@ struct AdminTargetEnvKey {
 /// without the gate inlined each time.
 fn require_admin(user: &User) -> Result<(), ApiError> {
     if !user.is_admin {
-        return Err(ApiError(StatusCode::FORBIDDEN));
+        return Err(ApiError::bare(StatusCode::FORBIDDEN));
     }
     Ok(())
 }
@@ -998,7 +1035,7 @@ pub async fn reload_targets(
     let ReloadTargetsBody { expected_sha256 } = match body {
         Ok(Json(b)) => b,
         Err(JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_)) => {
-            return Err(ApiError(StatusCode::BAD_REQUEST));
+            return Err(ApiError::bare(StatusCode::BAD_REQUEST));
         }
         Err(_) => ReloadTargetsBody::default(),
     };
@@ -1036,7 +1073,7 @@ pub async fn reload_targets(
     .await
     .map_err(|e| {
         tracing::error!(error = %e, "targets reload: spawn_blocking join error");
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR)
+        ApiError::bare(StatusCode::INTERNAL_SERVER_ERROR)
     })?;
 
     let (new_engine, file_sha256) = match parse_result {
@@ -1220,7 +1257,7 @@ pub async fn validate_targets(
     .await
     .map_err(|e| {
         tracing::error!(error = %e, "targets validate: spawn_blocking join error");
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR)
+        ApiError::bare(StatusCode::INTERNAL_SERVER_ERROR)
     })?;
 
     let (new_engine, expected_sha256) = match parse_result {
@@ -1296,8 +1333,8 @@ pub async fn create_user_target(
 ) -> Result<impl IntoResponse, ApiError> {
     let user = extract_user(&state, &headers).await?;
     require_unscoped(&user)?;
-    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
-    let name = body.name.ok_or(ApiError(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
+    let name = body.name.ok_or(ApiError::bare(StatusCode::BAD_REQUEST))?;
     let target = state
         .user_targets
         .create(
@@ -1324,7 +1361,7 @@ pub async fn update_user_target(
 ) -> Result<impl IntoResponse, ApiError> {
     let user = extract_user(&state, &headers).await?;
     require_unscoped(&user)?;
-    let Json(body) = body.map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
     let target = state
         .user_targets
         .update(
@@ -1354,7 +1391,7 @@ pub async fn get_user_target(
         .user_targets
         .get(&id, user.id)
         .await?
-        .ok_or(ApiError(StatusCode::NOT_FOUND))?;
+        .ok_or(ApiError::bare(StatusCode::NOT_FOUND))?;
     Ok(Json(target))
 }
 
@@ -1487,7 +1524,7 @@ async fn set_user_enabled(
     // fire in practice — but a typo in a curl probe should not
     // surface as 404.
     let target_uuid =
-        uuid::Uuid::parse_str(target_id).map_err(|_| ApiError(StatusCode::BAD_REQUEST))?;
+        uuid::Uuid::parse_str(target_id).map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
 
     // Self-mutation guard: an admin disabling their own session
     // bit would lock themselves out of session creation on the
@@ -1496,7 +1533,7 @@ async fn set_user_enabled(
     // are never session-disabled in practice) but we reject it for
     // symmetry — nothing sensible calls this.
     if actor.id == target_uuid {
-        return Err(ApiError(StatusCode::BAD_REQUEST));
+        return Err(ApiError::bare(StatusCode::BAD_REQUEST));
     }
 
     let result = state
@@ -1505,7 +1542,7 @@ async fn set_user_enabled(
         .await;
 
     let updated = result.map_err(|e| match e {
-        Error::InvalidInput(_) => ApiError(StatusCode::NOT_FOUND),
+        Error::InvalidInput(_) => ApiError::bare(StatusCode::NOT_FOUND),
         other => ApiError::from(other),
     })?;
 
@@ -1645,7 +1682,7 @@ pub async fn export_audit(
 
     let format = query.format.as_deref().unwrap_or("");
     if format != "json" && format != "csv" {
-        return Err(ApiError(StatusCode::BAD_REQUEST));
+        return Err(ApiError::bare(StatusCode::BAD_REQUEST));
     }
 
     let actor_id = query
@@ -1673,7 +1710,7 @@ pub async fn export_audit(
     let rows = state.audit.query(filter).await?;
 
     if rows.len() as i64 > EXPORT_MAX_ROWS {
-        return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE));
+        return Err(ApiError::bare(StatusCode::PAYLOAD_TOO_LARGE));
     }
 
     let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
@@ -1736,8 +1773,8 @@ pub async fn export_audit(
             .body(axum::body::Body::from(csv))
             .unwrap())
     } else {
-        let json_bytes =
-            serde_json::to_vec(&rows).map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?;
+        let json_bytes = serde_json::to_vec(&rows)
+            .map_err(|_| ApiError::bare(StatusCode::INTERNAL_SERVER_ERROR))?;
         Ok(axum::http::Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/json")
