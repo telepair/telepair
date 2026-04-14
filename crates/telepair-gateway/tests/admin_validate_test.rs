@@ -66,7 +66,7 @@ async fn validate_no_changes() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(json["valid"].as_bool().unwrap(), true);
+    assert!(json["valid"].as_bool().unwrap());
     assert!(json["diff"]["added"].as_array().unwrap().is_empty());
     assert!(json["diff"]["removed"].as_array().unwrap().is_empty());
     assert!(json["diff"]["changed"].as_array().unwrap().is_empty());
@@ -104,7 +104,7 @@ targets:
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(json["valid"].as_bool().unwrap(), true);
+    assert!(json["valid"].as_bool().unwrap());
     assert_eq!(json["diff"]["added"], serde_json::json!(["gamma"]));
     assert_eq!(json["diff"]["removed"], serde_json::json!(["beta"]));
     assert_eq!(json["diff"]["changed"], serde_json::json!(["alpha"]));
@@ -131,7 +131,7 @@ async fn validate_invalid_yaml_returns_errors() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(json["valid"].as_bool().unwrap(), false);
+    assert!(!json["valid"].as_bool().unwrap());
     assert!(json["errors"].is_array());
 }
 

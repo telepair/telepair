@@ -1695,9 +1695,8 @@ impl Storage for SqliteStorage {
 
         if let Some(ref q) = filter.query {
             let like = format!("%{q}%");
-            conditions.push(
-                "(name LIKE ? COLLATE NOCASE OR email LIKE ? COLLATE NOCASE)".to_owned(),
-            );
+            conditions
+                .push("(name LIKE ? COLLATE NOCASE OR email LIKE ? COLLATE NOCASE)".to_owned());
             binds.push(like.clone());
             binds.push(like);
         }
@@ -2667,20 +2666,33 @@ mod tests {
             .unwrap();
 
         // No filter → all 3 (admin=enabled, alice=disabled, bob=pending)
-        let filter = AccountFilter { query: None, status: None, limit: 50, offset: 0 };
+        let filter = AccountFilter {
+            query: None,
+            status: None,
+            limit: 50,
+            offset: 0,
+        };
         let (rows, total) = s.list_accounts_filtered(&filter).await.unwrap();
         assert_eq!(total, 3);
         assert_eq!(rows.len(), 3);
 
         // Filter by query "ali" → alice only
-        let filter = AccountFilter { query: Some("ali".into()), status: None, limit: 50, offset: 0 };
+        let filter = AccountFilter {
+            query: Some("ali".into()),
+            status: None,
+            limit: 50,
+            offset: 0,
+        };
         let (rows, total) = s.list_accounts_filtered(&filter).await.unwrap();
         assert_eq!(total, 1);
         assert_eq!(rows[0].name, "alice");
 
         // Filter by status Enabled → admin only (approval_state='approved' AND session_enabled=TRUE)
         let filter = AccountFilter {
-            query: None, status: Some(AccountStatus::Enabled), limit: 50, offset: 0,
+            query: None,
+            status: Some(AccountStatus::Enabled),
+            limit: 50,
+            offset: 0,
         };
         let (rows, total) = s.list_accounts_filtered(&filter).await.unwrap();
         assert_eq!(total, 1);
@@ -2688,7 +2700,10 @@ mod tests {
 
         // Filter by status Disabled → alice (approval_state='approved' AND session_enabled=FALSE)
         let filter = AccountFilter {
-            query: None, status: Some(AccountStatus::Disabled), limit: 50, offset: 0,
+            query: None,
+            status: Some(AccountStatus::Disabled),
+            limit: 50,
+            offset: 0,
         };
         let (rows, total) = s.list_accounts_filtered(&filter).await.unwrap();
         assert_eq!(total, 1);
@@ -2696,14 +2711,22 @@ mod tests {
 
         // Filter by status Pending → bob (approval_state='pending')
         let filter = AccountFilter {
-            query: None, status: Some(AccountStatus::Pending), limit: 50, offset: 0,
+            query: None,
+            status: Some(AccountStatus::Pending),
+            limit: 50,
+            offset: 0,
         };
         let (rows, total) = s.list_accounts_filtered(&filter).await.unwrap();
         assert_eq!(total, 1);
         assert_eq!(rows[0].name, "bob");
 
         // Pagination: limit 1, offset 1 — total unaffected
-        let filter = AccountFilter { query: None, status: None, limit: 1, offset: 1 };
+        let filter = AccountFilter {
+            query: None,
+            status: None,
+            limit: 1,
+            offset: 1,
+        };
         let (rows, total) = s.list_accounts_filtered(&filter).await.unwrap();
         assert_eq!(total, 3);
         assert_eq!(rows.len(), 1);

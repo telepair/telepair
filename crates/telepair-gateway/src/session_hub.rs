@@ -561,14 +561,7 @@ impl SessionHub {
     /// timeout. Cheap: one walk of a small HashMap.
     pub async fn count_live_sessions_per_target(&self) -> HashMap<String, u32> {
         let mut sessions = self.sessions.write().await;
-        let now = Instant::now();
-        let pending_ttl = self.pending_attach_ttl;
-        sessions.retain(|_, entry| match entry {
-            SessionEntry::Pending { reserved_at, .. } => {
-                now.duration_since(*reserved_at) < pending_ttl
-            }
-            SessionEntry::Live(_) => true,
-        });
+        self.gc_expired_pending(&mut sessions);
         let mut counts: HashMap<String, u32> = HashMap::new();
         for entry in sessions.values() {
             *counts.entry(entry.target_name().to_string()).or_insert(0) += 1;
@@ -582,15 +575,19 @@ impl SessionHub {
     /// don't inflate the count.
     pub async fn active_count(&self) -> usize {
         let mut sessions = self.sessions.write().await;
+        self.gc_expired_pending(&mut sessions);
+        sessions.len()
+    }
+
+    /// Drop pending reservations older than `pending_attach_ttl`.
+    /// Callers must hold the write lock on `sessions`.
+    fn gc_expired_pending(&self, sessions: &mut HashMap<String, SessionEntry>) {
         let now = Instant::now();
         let ttl = self.pending_attach_ttl;
         sessions.retain(|_, entry| match entry {
-            SessionEntry::Pending { reserved_at, .. } => {
-                now.duration_since(*reserved_at) < ttl
-            }
+            SessionEntry::Pending { reserved_at, .. } => now.duration_since(*reserved_at) < ttl,
             SessionEntry::Live(_) => true,
         });
-        sessions.len()
     }
 
     /// Reserve a hub slot for a session whose DB row was just

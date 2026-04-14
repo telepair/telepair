@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 use telepair_core::error::{Error, Result};
-use telepair_core::target::{substitute_env_vars, Target, TargetConfig, TargetKind};
+use telepair_core::target::{Target, TargetConfig, TargetKind, substitute_env_vars};
 
 #[derive(Debug)]
 pub struct TargetEngine {

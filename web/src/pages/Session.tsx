@@ -407,7 +407,7 @@ export default function SessionPage() {
         <span class="status-dot" data-status={status()} />
         <div class="topbar-actions">
           <LocaleSwitcher variant="topbar" />
-          <Show when={role() === 'owner'}>
+          <Show when={role() === 'owner' && !endedReasonKey()}>
             <button class="action-btn" onClick={() => setShowInvite(true)}>{t('session.invite')}</button>
             <button
               class={closeArmed() ? 'action-btn danger armed' : 'action-btn danger'}
