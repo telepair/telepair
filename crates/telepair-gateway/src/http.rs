@@ -12,6 +12,7 @@ use telepair_control::user_target_service::{CreateTargetParams, UpdateTargetPara
 use telepair_core::error::Error;
 use telepair_core::permission::Role;
 use telepair_core::session::{InputMode, SessionListFilter, SessionStatus, User};
+use telepair_core::storage::{AccountFilter, AccountStatus};
 use telepair_core::target::TargetKind;
 
 use uuid::Uuid;
@@ -1261,18 +1262,52 @@ impl From<User> for AdminUserInfo {
     }
 }
 
+/// Query params accepted by `GET /api/admin/users`.
+#[derive(Deserialize)]
+pub struct AdminUsersQuery {
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
 /// `GET /api/admin/users` — admin-only. Lists every non-guest
-/// account so the admin UI can render the approval page. Newest
-/// first, matching the storage ORDER BY.
+/// account so the admin UI can render the approval page. Supports
+/// optional filtering by name/email (`q`), account status, and
+/// pagination (`limit`/`offset`). Returns `{ users: [...], total: N }`.
 pub async fn list_admin_users(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<AdminUsersQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = extract_user(&state, &headers).await?;
     require_admin(&user)?;
-    let rows = state.auth_service.list_accounts().await?;
-    let out: Vec<AdminUserInfo> = rows.into_iter().map(AdminUserInfo::from).collect();
-    Ok(Json(out))
+
+    let status = query.status.as_deref().and_then(|s| match s {
+        "enabled" => Some(AccountStatus::Enabled),
+        "disabled" => Some(AccountStatus::Disabled),
+        "pending" => Some(AccountStatus::Pending),
+        _ => None,
+    });
+
+    let filter = AccountFilter {
+        query: query.q.filter(|s| !s.is_empty()),
+        status,
+        limit: query.limit.filter(|&n| n > 0).unwrap_or(50).min(500),
+        offset: query.offset.filter(|&n| n >= 0).unwrap_or(0),
+    };
+
+    let (rows, total) = state.auth_service.list_accounts_filtered(&filter).await?;
+    let users: Vec<AdminUserInfo> = rows.into_iter().map(AdminUserInfo::from).collect();
+
+    Ok(Json(serde_json::json!({
+        "users": users,
+        "total": total,
+    })))
 }
 
 /// Shared plumbing for the enable / disable admin handlers. Auth,

@@ -118,7 +118,8 @@ async fn list_admin_users_returns_every_account_with_session_enabled_flag() {
         .unwrap();
     let (status, body) = body_json(resp).await;
     assert_eq!(status, StatusCode::OK);
-    let arr = body.as_array().expect("expected array");
+    let arr = body["users"].as_array().expect("expected users array");
+    assert_eq!(body["total"].as_i64().unwrap(), 3);
     // 3 seeded accounts: admin, regular, pending. Scoped guests
     // should NOT appear — we seeded none here.
     assert_eq!(arr.len(), 3, "got {body}");
@@ -136,6 +137,65 @@ async fn list_admin_users_returns_every_account_with_session_enabled_flag() {
         .expect("admin missing");
     assert_eq!(admin_row["is_admin"], true);
     assert_eq!(admin_row["session_enabled"], true);
+}
+
+// ── list_admin_users filters ──────────────────────────────────────────
+
+#[tokio::test]
+async fn list_users_with_query_filter() {
+    let (app, admin_token, _, _, _, _storage) = setup().await;
+    let resp = app
+        .oneshot(
+            Request::get("/api/admin/users?q=admin")
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"].as_i64().unwrap(), 1);
+    assert_eq!(body["users"].as_array().unwrap().len(), 1);
+    assert_eq!(body["users"][0]["name"].as_str().unwrap(), "admin");
+}
+
+#[tokio::test]
+async fn list_users_with_status_filter() {
+    let (app, admin_token, _, _, _, _storage) = setup().await;
+    // The setup creates "pending" with session_enabled=false, verified=true
+    // That maps to "disabled" status (session_enabled=false AND verified=true)
+    let resp = app
+        .oneshot(
+            Request::get("/api/admin/users?status=disabled")
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"].as_i64().unwrap(), 1);
+    assert_eq!(body["users"][0]["name"].as_str().unwrap(), "pending");
+}
+
+#[tokio::test]
+async fn list_users_with_pagination() {
+    let (app, admin_token, _, _, _, _storage) = setup().await;
+    let resp = app
+        .oneshot(
+            Request::get("/api/admin/users?limit=1&offset=0")
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["users"].as_array().unwrap().len(), 1);
+    assert!(body["total"].as_i64().unwrap() >= 3);
 }
 
 // ── enable ───────────────────────────────────────────────────────────

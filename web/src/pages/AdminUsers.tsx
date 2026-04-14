@@ -1,22 +1,72 @@
 // web/src/pages/AdminUsers.tsx
-import { createResource, createSignal, For, Show } from 'solid-js';
-import { useNavigate } from '@solidjs/router';
+import { createSignal, createResource, For, Show } from 'solid-js';
 import { api, errorMessage } from '../lib/api';
 import type { AdminUserInfo } from '../lib/protocol';
 import { toast } from '../stores/toast';
 import { auth } from '../stores/auth';
 import { useI18n } from '../i18n';
 import LocaleSwitcher from '../components/LocaleSwitcher';
+import AdminNav from '../components/AdminNav';
 import Banner from '../components/Banner';
+
+const PAGE_SIZE = 50;
 
 export default function AdminUsers() {
   const { t } = useI18n();
-  const navigate = useNavigate();
 
-  const [users, { refetch }] = createResource<AdminUserInfo[]>(() =>
-    api.listAdminUsers(),
-  );
+  // Filter state (input)
+  const [filterQuery, setFilterQuery] = createSignal('');
+  const [filterStatus, setFilterStatus] = createSignal('');
+
+  // Applied filters
+  const [appliedQuery, setAppliedQuery] = createSignal('');
+  const [appliedStatus, setAppliedStatus] = createSignal('');
+
+  // Pagination
+  const [offset, setOffset] = createSignal(0);
+  const [hasMore, setHasMore] = createSignal(true);
+  const [allRows, setAllRows] = createSignal<AdminUserInfo[]>([]);
+
   const [busyId, setBusyId] = createSignal<string | null>(null);
+
+  const [page, { refetch }] = createResource(
+    () => ({ offset: offset(), q: appliedQuery(), status: appliedStatus() }),
+    async () => {
+      const resp = await api.listAdminUsers({
+        q: appliedQuery() || undefined,
+        status: appliedStatus() || undefined,
+        limit: PAGE_SIZE,
+        offset: offset(),
+      });
+      setHasMore(resp.users.length >= PAGE_SIZE);
+      if (offset() === 0) {
+        setAllRows(resp.users);
+      } else {
+        setAllRows((prev) => [...prev, ...resp.users]);
+      }
+      return resp;
+    },
+  );
+
+  function applyFilters() {
+    setAppliedQuery(filterQuery().trim());
+    setAppliedStatus(filterStatus());
+    setOffset(0);
+    setAllRows([]);
+  }
+
+  function clearFilters() {
+    setFilterQuery('');
+    setFilterStatus('');
+    setAppliedQuery('');
+    setAppliedStatus('');
+    setOffset(0);
+    setAllRows([]);
+  }
+
+  function loadMore() {
+    setOffset(allRows().length);
+  }
 
   const handleToggle = async (user: AdminUserInfo) => {
     if (busyId()) return;
@@ -33,6 +83,9 @@ export default function AdminUsers() {
           id: 'admin-users-toggle',
         });
       }
+      // Re-fetch current page to reflect the change
+      setOffset(0);
+      setAllRows([]);
       await refetch();
     } catch (e) {
       toast.error(t('admin_users.action_failed', { msg: errorMessage(e) }), {
@@ -49,10 +102,7 @@ export default function AdminUsers() {
     <div class="admin-users">
       <header class="topbar">
         <div class="topbar-left">
-          <a class="back-link" href="/">
-            {t('admin_users.back_to_dashboard')}
-          </a>
-          <h1>{t('admin_users.title')}</h1>
+          <AdminNav current="/admin/users" />
         </div>
         <div class="topbar-actions">
           <LocaleSwitcher variant="topbar" />
@@ -62,21 +112,61 @@ export default function AdminUsers() {
       <main class="content">
         <p class="subtitle">{t('admin_users.subtitle')}</p>
 
-        <Show when={users.error}>
+        {/* Filters */}
+        <div class="filters">
+          <div class="filter-group">
+            <label for="filter-query">{t('admin_users.filter_query_label')}</label>
+            <input
+              id="filter-query"
+              type="text"
+              placeholder={t('admin_users.filter_query_placeholder')}
+              value={filterQuery()}
+              onInput={(e) => setFilterQuery(e.currentTarget.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') applyFilters(); }}
+            />
+          </div>
+          <div class="filter-group">
+            <label for="filter-status">{t('admin_users.filter_status_label')}</label>
+            <select
+              id="filter-status"
+              value={filterStatus()}
+              onChange={(e) => setFilterStatus(e.currentTarget.value)}
+            >
+              <option value="">{t('admin_users.filter_status_all')}</option>
+              <option value="enabled">{t('admin_users.filter_status_enabled')}</option>
+              <option value="disabled">{t('admin_users.filter_status_disabled')}</option>
+              <option value="pending">{t('admin_users.filter_status_pending')}</option>
+            </select>
+          </div>
+          <div class="filter-actions">
+            <button type="button" class="primary" onClick={applyFilters}>
+              {t('admin_users.filter_apply')}
+            </button>
+            <button type="button" onClick={clearFilters}>
+              {t('admin_users.filter_clear')}
+            </button>
+          </div>
+        </div>
+
+        <Show when={page.error}>
           <Banner variant="error">
-            {t('admin_users.load_failed', { msg: errorMessage(users.error) })}
+            {t('admin_users.load_failed', { msg: errorMessage(page.error) })}
           </Banner>
         </Show>
 
-        <Show when={users.loading}>
+        <Show when={page.loading && allRows().length === 0}>
           <p class="muted">{t('admin_users.loading')}</p>
         </Show>
 
-        <Show when={!users.loading && users()?.length === 0}>
-          <p class="muted">{t('admin_users.empty')}</p>
+        <Show when={!page.loading && allRows().length === 0 && !page.error}>
+          <p class="muted">
+            {appliedQuery() || appliedStatus()
+              ? t('admin_users.no_results')
+              : t('admin_users.empty')}
+          </p>
         </Show>
 
-        <Show when={(users() ?? []).length > 0}>
+        <Show when={allRows().length > 0}>
           <div class="user-table-wrap" data-testid="admin-users-table">
             <table class="user-table">
               <thead>
@@ -89,7 +179,7 @@ export default function AdminUsers() {
                 </tr>
               </thead>
               <tbody>
-                <For each={users()}>
+                <For each={allRows()}>
                   {(user) => (
                     <tr data-user-id={user.id}>
                       <td class="user-name">
@@ -147,6 +237,21 @@ export default function AdminUsers() {
               </tbody>
             </table>
           </div>
+
+          <div class="pagination">
+            <Show
+              when={hasMore()}
+              fallback={<span class="muted">{t('admin_users.no_more')}</span>}
+            >
+              <button
+                type="button"
+                onClick={loadMore}
+                disabled={page.loading}
+              >
+                {page.loading ? t('admin_users.loading') : t('admin_users.load_more')}
+              </button>
+            </Show>
+          </div>
         </Show>
       </main>
 
@@ -167,17 +272,6 @@ export default function AdminUsers() {
           gap: 16px;
           min-width: 0;
         }
-        .topbar h1 {
-          font-size: 18px;
-          font-weight: 700;
-          white-space: nowrap;
-        }
-        .back-link {
-          color: var(--text-secondary);
-          text-decoration: none;
-          font-size: 13px;
-        }
-        .back-link:hover { color: var(--text-primary); }
         .topbar-actions { display: flex; gap: 8px; align-items: center; }
         .content {
           padding: 24px;
@@ -194,6 +288,46 @@ export default function AdminUsers() {
           color: var(--text-secondary);
           font-size: 14px;
         }
+        /* Filters */
+        .filters {
+          display: flex;
+          align-items: flex-end;
+          gap: 16px;
+          margin-bottom: 20px;
+          flex-wrap: wrap;
+        }
+        .filter-group {
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+        }
+        .filter-group label {
+          font-size: 12px;
+          font-weight: 600;
+          color: var(--text-secondary);
+        }
+        .filter-group select,
+        .filter-group input {
+          font-size: 13px;
+          padding: 6px 10px;
+          border: 1px solid var(--border);
+          border-radius: 6px;
+          background: var(--bg-primary);
+          color: var(--text-primary);
+          min-width: 180px;
+        }
+        .filter-actions {
+          display: flex;
+          gap: 8px;
+          align-items: center;
+        }
+        .filter-actions button {
+          font-size: 13px;
+          padding: 6px 14px;
+          border-radius: 6px;
+          cursor: pointer;
+        }
+        /* Table */
         .user-table-wrap {
           overflow-x: auto;
           border: 1px solid var(--border);
@@ -284,6 +418,22 @@ export default function AdminUsers() {
           background: rgba(210, 153, 34, 0.15);
         }
         .toggle-btn:disabled {
+          opacity: 0.6;
+          cursor: default;
+        }
+        /* Pagination */
+        .pagination {
+          display: flex;
+          justify-content: center;
+          padding: 16px 0;
+        }
+        .pagination button {
+          font-size: 13px;
+          padding: 6px 20px;
+          border-radius: 6px;
+          cursor: pointer;
+        }
+        .pagination button:disabled {
           opacity: 0.6;
           cursor: default;
         }

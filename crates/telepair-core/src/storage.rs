@@ -16,6 +16,27 @@ use crate::session::{
 
 pub use sqlite::SqliteStorage;
 
+/// Filter for the admin user listing endpoint.
+pub struct AccountFilter {
+    /// Fuzzy match on name or email.
+    pub query: Option<String>,
+    /// Filter by account status.
+    pub status: Option<AccountStatus>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// Account status filter for admin user management.
+#[derive(Debug, Clone, Copy)]
+pub enum AccountStatus {
+    /// `session_enabled = true AND verified = true`
+    Enabled,
+    /// `session_enabled = false AND verified = true`
+    Disabled,
+    /// `verified = false`
+    Pending,
+}
+
 #[allow(async_fn_in_trait)] // We only use SqliteStorage concretely, not dyn Storage
 pub trait Storage: Send + Sync {
     // Users
@@ -262,6 +283,10 @@ pub trait Storage: Send + Sync {
     /// scoped guests (`scoped_session_id IS NOT NULL`) since those are
     /// session-local and not user-actionable on the admin page.
     async fn list_accounts(&self) -> Result<Vec<User>>;
+
+    /// List non-guest accounts with optional filtering by name/email
+    /// and status. Returns (matching rows, total count before pagination).
+    async fn list_accounts_filtered(&self, filter: &AccountFilter) -> Result<(Vec<User>, i64)>;
 
     /// Look up a user row by id. Returns `Ok(None)` on miss so the
     /// admin enable/disable handler can render a 404 instead of a 500.
