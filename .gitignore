@@ -10,5 +10,7 @@ web/dist/
 web/test-results/
 web/playwright-report/
 tmp/
+test-reports/
 /package.json
 /package-lock.json
+.claude/

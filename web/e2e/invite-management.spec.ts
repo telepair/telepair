@@ -61,13 +61,14 @@ test.describe('Invite management (list + revoke)', () => {
     const rows = dialog.locator('[data-testid="invite-row"]');
     await expect(rows).toHaveCount(2, { timeout: 5_000 });
 
-    // Each row exposes an 8-char token prefix — the owner's stable
-    // per-row label.
+    // Each row exposes a 4-char token prefix — the owner's stable
+    // per-row label. Kept short so it reads as a correlator (not a
+    // bearer token) when it shows up in screenshots / logs.
     const firstPrefix = await dialog
       .locator('[data-testid="invite-prefix"]')
       .first()
       .textContent();
-    expect(firstPrefix?.trim()).toHaveLength(8);
+    expect(firstPrefix?.trim()).toHaveLength(4);
 
     // Two-step revoke on the first row. Pre-confirm → confirm.
     const firstRow = rows.first();

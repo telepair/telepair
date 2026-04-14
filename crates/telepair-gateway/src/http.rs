@@ -1,7 +1,10 @@
+use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
+
 use axum::{
     Json,
-    extract::{Path, Query, State, rejection::JsonRejection},
-    http::{HeaderMap, StatusCode, header},
+    extract::{ConnectInfo, FromRequestParts, Path, Query, State, rejection::JsonRejection},
+    http::{HeaderMap, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
@@ -38,6 +41,17 @@ impl ApiError {
         Self {
             status,
             message: None,
+        }
+    }
+
+    /// Build an `ApiError` with a custom 4xx message. 5xx callers
+    /// should stick to `bare` — the `IntoResponse` impl redacts their
+    /// body either way, so providing a string here would just be
+    /// leaked into logs.
+    pub(crate) fn with_message(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: Some(message.into()),
         }
     }
 }
@@ -77,6 +91,73 @@ impl IntoResponse for ApiError {
         };
         (self.status, Json(serde_json::json!({ "error": msg }))).into_response()
     }
+}
+
+/// Extractor that yields the client's `SocketAddr` when axum was
+/// booted with `into_make_service_with_connect_info::<SocketAddr>`
+/// and `None` otherwise. Axum's built-in `ConnectInfo<T>` extractor
+/// is not `Option`-wrappable (there is no `OptionalFromRequestParts`
+/// impl for it in 0.8), so we read the extension directly —
+/// mirroring what `ConnectInfo::from_request_parts` does internally
+/// but returning `None` instead of a 500 on absence. This lets
+/// tower `oneshot`-style tests keep calling the handler without
+/// installing a fake ConnectInfo.
+pub struct OptionalClientAddr(pub Option<SocketAddr>);
+
+impl<S: Send + Sync> FromRequestParts<S> for OptionalClientAddr {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(OptionalClientAddr(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ci| ci.0),
+        ))
+    }
+}
+
+/// Resolve the client IP the rate-limit gate should key on. When
+/// `trust_forwarded_headers` is off (the default) we always use the
+/// socket peer: a deployment that accepts direct traffic cannot trust
+/// `X-Forwarded-For` — any client can forge it and reset the bucket.
+///
+/// When the flag is on, we prefer `X-Real-IP`: the nginx deployment
+/// telepair documents (see `docs/deployment.md`) sets it from
+/// `$remote_addr`, i.e. the direct TCP peer at the proxy. That value
+/// is authoritative in a single-hop setup and cannot be spoofed by
+/// the client. We fall back to the *rightmost* `X-Forwarded-For`
+/// segment: the documented nginx snippet uses
+/// `$proxy_add_x_forwarded_for`, which **appends** the real peer to
+/// any `X-Forwarded-For` the client sent, so only the last entry is
+/// trustworthy — reading the leftmost would hand attackers a way to
+/// reset their bucket by forging a client-side XFF header.
+///
+/// If both headers are absent or unparseable we drop back to the
+/// socket peer rather than skip the gate — a misconfigured proxy
+/// that strips these headers must still cost the attacker one bucket
+/// per proxy pod, not zero. Multi-hop chains remain out of scope for
+/// v0.1.5 and would need an operator-configured trusted-proxy CIDR
+/// list to walk the XFF chain safely.
+fn resolve_client_ip(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> Option<IpAddr> {
+    if state.trust_forwarded_headers {
+        if let Some(real) = headers.get("x-real-ip").and_then(|v| v.to_str().ok())
+            && let Ok(ip) = real.trim().parse::<IpAddr>()
+        {
+            return Some(ip);
+        }
+        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
+            && let Some(last) = xff.rsplit(',').next()
+            && let Ok(ip) = last.trim().parse::<IpAddr>()
+        {
+            return Some(ip);
+        }
+    }
+    peer.map(|a| a.ip())
 }
 
 // --- Auth extraction ---
@@ -124,18 +205,23 @@ pub(crate) async fn audit_session_access_denied(
     state.audit.record(event).await;
 }
 
-/// Gate the session-create / WS-attach handlers on the user's
-/// `session_enabled` bit. Admins bypass so bootstrap cannot lock
-/// itself out. Rejections are audited via [`audit_session_access_denied`].
+/// Gate every session-mutating handler on the user's `session_enabled`
+/// bit. Admins bypass so bootstrap cannot lock itself out. Rejections
+/// are audited via [`audit_session_access_denied`]; pass `Some(id)`
+/// when the request is bound to a specific session so the audit row
+/// carries the `session_id` column (invite mint/revoke/redeem,
+/// participant-role updates). The bare "POST /api/sessions" path
+/// leaves it `None` because the session does not exist yet.
 async fn require_session_enabled(
     state: &AppState,
     user: &User,
     path: &str,
+    session_id: Option<&str>,
 ) -> Result<(), ApiError> {
     if user.session_enabled || user.is_admin {
         return Ok(());
     }
-    audit_session_access_denied(state, user, path, None).await;
+    audit_session_access_denied(state, user, path, session_id).await;
     Err(ApiError::bare(StatusCode::FORBIDDEN))
 }
 
@@ -155,14 +241,56 @@ pub struct RegisterRequest {
 }
 
 /// `POST /api/auth/register` — create unverified account and send OTP.
-/// Returns 503 if SMTP is not configured. Always returns 201 otherwise
-/// (enumeration safety: callers cannot distinguish "sent" from "already
-/// registered").
+/// Returns 503 if SMTP is not configured. 429 when the source IP is
+/// within the register rate-limit window (see [`crate::rate_limit`]
+/// for why this layer exists alongside the per-email throttle inside
+/// `AuthService`). Always returns 201 on success (enumeration safety:
+/// callers cannot distinguish "sent" from "already registered").
+///
+/// `ConnectInfo` is `Option`-wrapped so tower `oneshot` test harnesses
+/// — which never populate connect info — still reach the handler.
+/// Production (`axum::serve(..).into_make_service_with_connect_info`)
+/// always provides it.
 pub async fn register(
     State(state): State<AppState>,
+    OptionalClientAddr(client_addr): OptionalClientAddr,
+    headers: HeaderMap,
     body: Result<Json<RegisterRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
+
+    // Only enforce the IP throttle when we actually know the caller's
+    // address. If either piece is missing we skip the gate rather than
+    // reject the request — a production deployment that forgot to wire
+    // ConnectInfo would lock out every signup, and the per-email
+    // limiter inside `AuthService::register` still covers the most
+    // common "same user, mashing the button" shape.
+    //
+    // When `trust_forwarded_headers` is on, the key IP is pulled from
+    // `X-Forwarded-For` / `X-Real-IP` instead of the socket peer —
+    // otherwise the recommended "nginx in front of telepair" shape
+    // collapses every caller onto 127.0.0.1 and the whole fleet shares
+    // one bucket (see `resolve_client_ip`).
+    let client_ip = resolve_client_ip(&state, &headers, client_addr);
+    if let (Some(limiter), Some(ip)) = (state.register_rl.as_ref(), client_ip) {
+        use crate::rate_limit::RateLimitDecision;
+        if let RateLimitDecision::Throttled { retry_after } = limiter.check(ip) {
+            // Round up to the next 10-second bucket instead of leaking
+            // exact seconds. The precise remainder lets an attacker
+            // infer how recent their last probe was (a low-resolution
+            // timing oracle); 10s granularity is fine for the UX — a
+            // human retrying a form doesn't need second-accurate
+            // feedback — and clamped to at least 10 so the bucket is
+            // always meaningful.
+            let raw = retry_after.as_secs().max(1);
+            let secs = raw.div_ceil(10) * 10;
+            return Err(ApiError::with_message(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("Too many registrations from this address. Try again in {secs}s."),
+            ));
+        }
+    }
+
     state
         .auth_service
         .register(&body.email, &body.password, &body.display_name)
@@ -406,7 +534,7 @@ pub async fn create_session(
     // adversarial finding: before this gate, anyone with SMTP
     // enabled could go signup → verify OTP → `POST /api/sessions`
     // against `local-shell` and pop a shell on the gateway host.
-    require_session_enabled(&state, &user, "POST /api/sessions").await?;
+    require_session_enabled(&state, &user, "POST /api/sessions", None).await?;
 
     // Axum's default JSON rejection is 422; we want 400 so an unknown
     // `input_mode` value reads as "client sent garbage" instead of
@@ -582,6 +710,19 @@ pub async fn create_invite(
     // Auth first so unauthenticated callers get 401 instead of 400.
     let user = extract_user(&state, &headers).await?;
 
+    // A disabled owner must not keep minting invites against a session
+    // that outlived the disable. Before this gate, `session_enabled =
+    // FALSE` only blocked `POST /api/sessions` and WS attach, so a
+    // disabled owner could still mutate membership on any surviving
+    // session until it closed. Mirrors the gate in `create_session`.
+    require_session_enabled(
+        &state,
+        &user,
+        "POST /api/sessions/{id}/invites",
+        Some(session_id.as_str()),
+    )
+    .await?;
+
     // Axum's default JSON rejection is 422; every other handler in this
     // file remaps to 400 so clients get a consistent "you sent garbage"
     // signal regardless of which field was wrong.
@@ -660,6 +801,13 @@ pub async fn update_participant_role(
 ) -> Result<impl IntoResponse, ApiError> {
     let body = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?.0;
     let user = extract_user(&state, &headers).await?;
+    require_session_enabled(
+        &state,
+        &user,
+        "PUT /api/sessions/{id}/participants/{user_id}/role",
+        Some(session_id.as_str()),
+    )
+    .await?;
     state
         .sessions
         .require_active_owned(&user, &session_id)
@@ -768,6 +916,18 @@ pub async fn redeem_invite(
         Err(other) => return Err(other),
     };
 
+    // An authenticated but disabled account must not be able to redeem:
+    // before this gate the redeem path would happily consume a use and
+    // write a participant row, with the WS attach later rejecting the
+    // connection. One-shot invites were effectively griefable. The
+    // guest path (existing_user = None) is unaffected — a fresh guest
+    // is always minted with `session_enabled = TRUE`. `session_id` is
+    // unknown here because `find_invite` hasn't run yet; the audit row
+    // still carries `path` so operators can slice by surface.
+    if let Some(ref user) = existing_user {
+        require_session_enabled(&state, user, "POST /api/invite/redeem", None).await?;
+    }
+
     // Keep the JSON rejection semantics consistent across the handlers:
     // a malformed body is a 400, not a 422. This matters for the
     // frontend's error-handling code which branches on "bad request"
@@ -818,6 +978,16 @@ pub async fn revoke_session_invite(
     Path((session_id, token_sha256)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = extract_user(&state, &headers).await?;
+    // Revoke is a session-level mutation — gate it alongside mint so a
+    // disabled owner cannot still tear down invites that would let a
+    // replacement operator (e.g. another admin) clean up.
+    require_session_enabled(
+        &state,
+        &user,
+        "DELETE /api/sessions/{id}/invites/{token}",
+        Some(session_id.as_str()),
+    )
+    .await?;
     state
         .invites
         .revoke(&user, &session_id, &token_sha256)
@@ -1070,13 +1240,31 @@ pub async fn reload_targets(
     // for closing the validate→reload TOCTOU: a second admin racing
     // `targets.yaml` between preview and confirm now gets rejected
     // instead of silently applying an un-reviewed diff.
+    #[derive(Debug)]
+    enum LoadOutcome {
+        Loaded {
+            engine: telepair_agent::virtual_target::TargetEngine,
+            sha: String,
+        },
+        Missing,
+    }
+
     let path_for_blocking = path.clone();
-    let parse_result = tokio::task::spawn_blocking(move || -> Result<_, String> {
-        let bytes = std::fs::read(&path_for_blocking).map_err(|e| e.to_string())?;
+    let parse_result = tokio::task::spawn_blocking(move || -> Result<LoadOutcome, String> {
+        let bytes = match std::fs::read(&path_for_blocking) {
+            Ok(b) => b,
+            // Fresh installs ship without `targets.yaml` — treat
+            // ENOENT as "no user-defined targets" instead of surfacing
+            // the raw OS error. Other IO errors (permission denied,
+            // I/O failure) still flow to `parse_error` so they aren't
+            // silently swallowed.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(LoadOutcome::Missing),
+            Err(e) => return Err(e.to_string()),
+        };
         let sha = hex_sha256(&bytes);
         let engine = telepair_agent::virtual_target::TargetEngine::from_file(&path_for_blocking)
             .map_err(|e| e.to_string())?;
-        Ok((engine, sha))
+        Ok(LoadOutcome::Loaded { engine, sha })
     })
     .await
     .map_err(|e| {
@@ -1085,7 +1273,28 @@ pub async fn reload_targets(
     })?;
 
     let (new_engine, file_sha256) = match parse_result {
-        Ok(pair) => pair,
+        Ok(LoadOutcome::Loaded { engine, sha }) => (engine, sha),
+        Ok(LoadOutcome::Missing) => {
+            // No-op success: the caller hit reload on a file that
+            // doesn't exist yet (common on fresh installs). Keep the
+            // current engine in place — swapping to an empty one would
+            // silently drop targets an admin may have authored on an
+            // earlier file that moved away.
+            tracing::info!(
+                path = %path.display(),
+                actor = %user.name,
+                "targets reload: file not present, no-op"
+            );
+            return Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "reason": "no_targets_file",
+                    "message": "no user-defined targets (targets.yaml not present); \
+                                using built-in targets only",
+                    "path": path.display().to_string(),
+                })),
+            ));
+        }
         Err(err_msg) => {
             // Old engine stays loaded — `ArcSwap::store` is the only
             // site that replaces the pointer, and we haven't called
@@ -1541,7 +1750,14 @@ async fn set_user_enabled(
     // are never session-disabled in practice) but we reject it for
     // symmetry — nothing sensible calls this.
     if actor.id == target_uuid {
-        return Err(ApiError::bare(StatusCode::BAD_REQUEST));
+        // Emit the specific reason so clients can branch on it instead
+        // of treating every self-mutation 400 as "malformed request".
+        // Admin UIs use this to surface an explanatory toast; a bare
+        // 400 with no body lets users think they mis-typed the id.
+        return Err(ApiError::with_message(
+            StatusCode::BAD_REQUEST,
+            "cannot change your own account's session access",
+        ));
     }
 
     let result = state

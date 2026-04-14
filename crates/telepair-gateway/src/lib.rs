@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 pub mod http;
+pub mod rate_limit;
 pub mod session_hub;
 pub mod state;
 pub mod ws;

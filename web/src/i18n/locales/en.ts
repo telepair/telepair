@@ -24,6 +24,7 @@ export const en = {
     refresh: 'Refresh',
     refreshing: 'Refreshing…',
     logout: 'Logout',
+    leave_session: 'Leave session',
     back: '← Back',
     done: 'Done',
     dismiss: 'Dismiss notification',

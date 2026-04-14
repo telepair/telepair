@@ -82,19 +82,20 @@ pub struct RedeemResult {
 
 /// Read-side view of an invite for the owner-facing management
 /// dialog. Deliberately **does not** carry the raw token — the
-/// `token_prefix` is the first 8 chars of the sha256 digest so the
-/// UI can give each row a stable, non-sensitive label without
-/// leaking a value that could be used to redeem. Clients revoke a
-/// row by its full `token_sha256` (the PK).
+/// `token_prefix` is the first 4 chars of the sha256 digest so the
+/// UI can give each row a stable, low-signal label without leaking
+/// a value that could be used to redeem. Clients revoke a row by
+/// its full `token_sha256` (the PK).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InviteSummary {
     /// Full SHA-256 digest — used as the URL path parameter on
     /// `DELETE /api/sessions/:id/invites/:token_sha256`. Opaque to
     /// humans; the UI only shows the prefix.
     pub token_sha256: String,
-    /// First 8 chars of `token_sha256` — a short stable label the
-    /// UI renders next to each row ("ab12cd34"). Does not collide
-    /// in practice inside a single session's invite list.
+    /// First 4 chars of `token_sha256` — a short stable label the UI
+    /// renders next to each row ("ab12"). Length was halved from 8
+    /// after a QA review flagged the 8-char form as enough to help
+    /// correlate invite events across a compromised audit log.
     pub token_prefix: String,
     pub session_id: String,
     pub role: Role,

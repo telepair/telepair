@@ -306,6 +306,14 @@ async fn admin_cannot_enable_or_disable_self() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // Body must carry a specific reason so the admin UI can distinguish
+    // "self-protection" from "malformed request" and toast accordingly.
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["error"].as_str().unwrap(),
+        "cannot change your own account's session access"
+    );
 
     // Enable self (also blocked for symmetry)
     let resp = app

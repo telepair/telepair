@@ -300,7 +300,7 @@ export interface AuditEvent {
  * management dialog. Mirrors `InviteSummary` in
  * `crates/telepair-control/src/invite_service.rs` — the backend
  * deliberately does NOT leak the raw bearer token here. The UI uses
- * `token_prefix` (first 8 chars of the sha) as a stable per-row label
+ * `token_prefix` (first 4 chars of the sha) as a stable per-row label
  * and `token_sha256` as the DELETE path parameter when revoking.
  */
 export interface InviteSummary {

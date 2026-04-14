@@ -287,12 +287,17 @@ pub struct InviteToken {
 }
 
 impl InviteToken {
-    /// First 8 hex chars of `token_sha256`. Used as a short, stable,
-    /// non-sensitive label in audit detail blobs and the management
-    /// UI. Safe to expose — the full token is never reconstructable
-    /// from its prefix because the DB only ever stored the digest.
+    /// First 4 hex chars of `token_sha256`. Used as a short, stable,
+    /// low-entropy label in audit detail blobs and the management UI.
+    /// The full token is never reconstructable from this prefix; the
+    /// length was cut from 8 to 4 after a QA review flagged the 8-char
+    /// form as enough to partially correlate invite rows across a
+    /// compromised audit log. 4 chars (16 bits) keep the label useful
+    /// for humans reading audit rows for a single session while
+    /// reducing cross-event correlation signal for an attacker who
+    /// obtained audit logs without DB access.
     pub fn token_prefix(&self) -> &str {
-        let n = self.token_sha256.len().min(8);
+        let n = self.token_sha256.len().min(4);
         // `token_sha256` is hex-encoded SHA-256, so byte indices and
         // char indices coincide — no need to walk chars.
         &self.token_sha256[..n]

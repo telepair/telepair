@@ -526,7 +526,7 @@ async fn list_for_session_returns_all_invites_with_remaining_uses() {
         .expect("consumed row present");
     assert_eq!(consumed_row.max_uses, 3);
     assert_eq!(consumed_row.remaining_uses, 2);
-    assert_eq!(consumed_row.token_prefix.len(), 8);
+    assert_eq!(consumed_row.token_prefix.len(), 4);
     assert!(consumed_row.created_at.is_some());
 }
 

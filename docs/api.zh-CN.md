@@ -86,6 +86,7 @@ Authorization: Bearer <token>
 
 **错误**
 - `400 Bad Request` —— 请求体格式不合法
+- `429 Too Many Requests` —— 命中了按 IP 限速;响应体含可读的重试提示,等待时间会向上取整到最近的 10 秒桶,避免泄露精确计时
 - `503 Service Unavailable` —— 该实例未配置 SMTP;请联系管理员
 
 ### POST /api/auth/verify

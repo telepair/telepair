@@ -464,7 +464,7 @@ export default function SessionPage() {
     <div class="session-page">
       <header class="session-topbar">
         <button class="back-btn" onClick={goHomeOrLogout}>
-          {isGuestCredential() ? t('common.logout') : t('common.back')}
+          {isGuestCredential() ? t('common.leave_session') : t('common.back')}
         </button>
         <span class="session-label">
           {/* Use `renderTemplate` so the session id stays inside a real
@@ -509,7 +509,7 @@ export default function SessionPage() {
             role="status"
             action={{
               label: isGuestCredential()
-                ? t('common.logout')
+                ? t('common.leave_session')
                 : t('session.banner_back_to_dashboard'),
               onClick: goHomeOrLogout,
             }}

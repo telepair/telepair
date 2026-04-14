@@ -1266,8 +1266,8 @@ async fn list_session_invites_returns_all_invites() {
         assert!(row["token_sha256"].is_string());
         assert_eq!(
             row["token_prefix"].as_str().unwrap().len(),
-            8,
-            "token_prefix is 8 chars of the sha for a stable UI label"
+            4,
+            "token_prefix is 4 chars of the sha for a stable UI label"
         );
         assert_eq!(row["session_id"], session_id);
         assert!(row["max_uses"].is_number());
