@@ -15,7 +15,7 @@ use crate::session::{
     PendingVerifyResult, RedeemIdentity, RedeemOutcome, Session, SessionListFilter, SessionStatus,
     User, UserTarget,
 };
-use crate::storage::Storage;
+use crate::storage::{AccountFilter, AccountStatus, Storage};
 
 pub struct SqliteStorage {
     pool: Pool<Sqlite>,
@@ -1626,6 +1626,61 @@ impl Storage for SqliteStorage {
         rows.iter().map(row_to_user).collect()
     }
 
+    async fn list_accounts_filtered(&self, filter: &AccountFilter) -> Result<(Vec<User>, i64)> {
+        // Build the dynamic WHERE clause. Every branch appends to
+        // `conditions` and pushes bind values onto `binds` in order so
+        // the `?` placeholders line up with `.bind()` calls.
+        let mut conditions = vec!["scoped_session_id IS NULL".to_owned()];
+        let mut binds: Vec<String> = Vec::new();
+
+        if let Some(ref q) = filter.query {
+            let like = format!("%{q}%");
+            conditions.push(
+                "(name LIKE ? COLLATE NOCASE OR email LIKE ? COLLATE NOCASE)".to_owned(),
+            );
+            binds.push(like.clone());
+            binds.push(like);
+        }
+
+        if let Some(status) = filter.status {
+            match status {
+                AccountStatus::Enabled => {
+                    conditions.push("session_enabled = TRUE AND verified = TRUE".to_owned());
+                }
+                AccountStatus::Disabled => {
+                    conditions.push("session_enabled = FALSE AND verified = TRUE".to_owned());
+                }
+                AccountStatus::Pending => {
+                    conditions.push("verified = FALSE".to_owned());
+                }
+            }
+        }
+
+        let where_clause = conditions.join(" AND ");
+
+        let count_sql = format!("SELECT COUNT(*) AS cnt FROM users WHERE {where_clause}");
+        let mut count_query = sqlx::query(&count_sql);
+        for v in &binds {
+            count_query = count_query.bind(v);
+        }
+        let total: i64 = count_query.fetch_one(&self.pool).await?.get("cnt");
+
+        let data_sql = format!(
+            "SELECT {USER_COLS} FROM users WHERE {where_clause} \
+             ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        );
+        let mut data_query = sqlx::query(&data_sql);
+        for v in &binds {
+            data_query = data_query.bind(v);
+        }
+        data_query = data_query.bind(filter.limit).bind(filter.offset);
+
+        let rows = data_query.fetch_all(&self.pool).await?;
+        let users: Vec<User> = rows.iter().map(row_to_user).collect::<Result<_>>()?;
+
+        Ok((users, total))
+    }
+
     async fn find_user_by_id(&self, user_id: Uuid) -> Result<Option<User>> {
         let row = sqlx::query(&format!("SELECT {USER_COLS} FROM users WHERE id = ?"))
             .bind(user_id.to_string())
@@ -2407,6 +2462,70 @@ mod tests {
             listed.iter().all(|u| u.scoped_session_id.is_none()),
             "scoped guests must not appear in list_accounts"
         );
+    }
+
+    #[tokio::test]
+    async fn list_accounts_filtered_by_status_and_query() {
+        let s = SqliteStorage::new_memory().await.unwrap();
+
+        // create_user sets verified=TRUE and session_enabled=TRUE in the DB,
+        // so all three users start as "enabled" in AccountStatus terms.
+        let (_admin, _) = s.create_user("admin", true).await.unwrap();
+        let (alice, _) = s.create_user("alice", false).await.unwrap();
+        let (bob, _) = s.create_user("bob", false).await.unwrap();
+
+        // Disable alice → session_enabled=FALSE, verified still TRUE → "Disabled"
+        s.set_session_enabled(alice.id, false).await.unwrap();
+
+        // Make bob "pending" by flipping verified to FALSE directly in the DB.
+        // There is no trait method for this; create_user always sets verified=TRUE.
+        sqlx::query("UPDATE users SET verified = FALSE WHERE id = ?")
+            .bind(bob.id.to_string())
+            .execute(&s.pool)
+            .await
+            .unwrap();
+
+        // No filter → all 3 (admin=enabled, alice=disabled, bob=pending)
+        let filter = AccountFilter { query: None, status: None, limit: 50, offset: 0 };
+        let (rows, total) = s.list_accounts_filtered(&filter).await.unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(rows.len(), 3);
+
+        // Filter by query "ali" → alice only
+        let filter = AccountFilter { query: Some("ali".into()), status: None, limit: 50, offset: 0 };
+        let (rows, total) = s.list_accounts_filtered(&filter).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].name, "alice");
+
+        // Filter by status Enabled → admin only (session_enabled=TRUE AND verified=TRUE)
+        let filter = AccountFilter {
+            query: None, status: Some(AccountStatus::Enabled), limit: 50, offset: 0,
+        };
+        let (rows, total) = s.list_accounts_filtered(&filter).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].name, "admin");
+
+        // Filter by status Disabled → alice (session_enabled=FALSE AND verified=TRUE)
+        let filter = AccountFilter {
+            query: None, status: Some(AccountStatus::Disabled), limit: 50, offset: 0,
+        };
+        let (rows, total) = s.list_accounts_filtered(&filter).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].name, "alice");
+
+        // Filter by status Pending → bob (verified=FALSE)
+        let filter = AccountFilter {
+            query: None, status: Some(AccountStatus::Pending), limit: 50, offset: 0,
+        };
+        let (rows, total) = s.list_accounts_filtered(&filter).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].name, "bob");
+
+        // Pagination: limit 1, offset 1 — total unaffected
+        let filter = AccountFilter { query: None, status: None, limit: 1, offset: 1 };
+        let (rows, total) = s.list_accounts_filtered(&filter).await.unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(rows.len(), 1);
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@ use chrono::{Duration, Utc};
 use telepair_core::audit::{AuditEvent, AuditEventType, AuditSink};
 use telepair_core::error::{Error, Result};
 use telepair_core::session::{LoginFailureOutcome, PendingVerifyResult, User};
-use telepair_core::storage::{SqliteStorage, Storage};
+use telepair_core::storage::{AccountFilter, SqliteStorage, Storage};
 use uuid::Uuid;
 
 const OTP_TTL_MINUTES: i64 = 15;
@@ -473,6 +473,10 @@ impl AuthService {
     /// can drive it directly without a fake actor.
     pub async fn list_accounts(&self) -> Result<Vec<User>> {
         self.storage.list_accounts().await
+    }
+
+    pub async fn list_accounts_filtered(&self, filter: &AccountFilter) -> Result<(Vec<User>, i64)> {
+        self.storage.list_accounts_filtered(filter).await
     }
 
     /// Flip `session_enabled` on the target row and emit the
