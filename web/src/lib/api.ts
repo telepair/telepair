@@ -336,8 +336,15 @@ export const api = {
    * right toast. We keep this helper thin (no error shape transform)
    * so the caller retains full control over the branching.
    */
-  reloadTargets(): Promise<ReloadTargetsResult> {
-    return request('/admin/targets/reload', { method: 'POST' });
+  reloadTargets(expectedSha256?: string): Promise<ReloadTargetsResult> {
+    // Pass the sha from the preceding validate so the server can
+    // reject a reload whose file changed between preview and confirm.
+    // Omitted for no-preview callers (tests, legacy CLI).
+    const init: RequestInit = { method: 'POST' };
+    if (expectedSha256) {
+      init.body = JSON.stringify({ expected_sha256: expectedSha256 });
+    }
+    return request('/admin/targets/reload', init);
   },
 
   getSystemInfo(): Promise<SystemInfo> {

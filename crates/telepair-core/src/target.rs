@@ -9,7 +9,7 @@ pub enum TargetKind {
     Local,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
     pub name: String,
     pub display: String,

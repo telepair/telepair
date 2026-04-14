@@ -61,10 +61,13 @@ test.describe('Admin targets page', () => {
     await reloadBtn.click();
 
     // Toast is a global region with role="status". We match ANY of
-    // the three expected copy strings so either branch passes.
+    // the expected copy strings so either branch passes. The
+    // validate-first flow surfaces "Validation failed:" when the
+    // server has no targets path or the file is missing on disk;
+    // the success paths show "Reloaded" or "No changes detected".
     const toast = page.locator('[role="status"]');
     await expect(toast).toContainText(
-      /Reloaded \d+ targets|configure one and restart|malformed/,
+      /Reloaded \d+ targets|No changes detected|Validation failed|configure one and restart|malformed/,
       { timeout: 5_000 },
     );
   });

@@ -725,6 +725,17 @@ one — there is no lock window.
 Emits a `target.reloaded` audit event on success with `{path, targets}` in the
 detail blob.
 
+**Request body** (optional)
+```json
+{ "expected_sha256": "<hex sha-256 from the preceding validate response>" }
+```
+
+When present, the server re-hashes the on-disk bytes and refuses the reload
+with `409` if the hash has drifted. This closes the validate → confirm TOCTOU:
+an admin who previewed version A never applies version B, even if a second
+writer overwrote the file mid-flow. Omit the body to opt out (CLI / no-preview
+callers).
+
 **Response** `200 OK`
 ```json
 {
@@ -742,6 +753,7 @@ detail blob.
 - `400 Bad Request` with body `{ "reason": "no_targets_path", "message": "..." }` — the server was started without a `targets.yaml` path, so there is nothing to reload. The old engine stays loaded.
 - `400 Bad Request` with body `{ "reason": "parse_error", "message": "...", "path": "..." }` — the file on disk is now malformed. The old engine stays loaded and the `message` carries the parse error verbatim so the admin can fix the yaml.
 - `400 Bad Request` with body `{ "reason": "still_referenced", "message": "...", "targets": [{ "target": "...", "active_sessions": N }, ...] }` — the new `targets.yaml` would drop one or more targets that still have live sessions in the hub. The old engine stays loaded and the `targets` array lists exactly which targets are blocking the reload with their live session counts, so the operator can close those sessions (or restore the target in yaml) and retry. Admin UI renders this as a persistent banner instead of a one-shot toast.
+- `409 Conflict` with body `{ "reason": "file_changed", "message": "...", "expected_sha256": "...", "actual_sha256": "..." }` — the caller sent `expected_sha256` but the file's current bytes hash to a different value. The old engine stays loaded; the admin must re-run validate before retrying.
 - `401 Unauthorized` — missing or invalid token
 - `403 Forbidden` — caller is authenticated but not an admin
 

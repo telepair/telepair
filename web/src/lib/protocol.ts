@@ -370,6 +370,10 @@ export interface ValidateTargetsResult {
   diff?: TargetDiff;
   blocked?: BlockedTarget[];
   errors?: string[];
+  /** Hex SHA-256 of the validated targets.yaml; pass back to reload
+   *  as a TOCTOU guard so the server refuses to apply a file that
+   *  changed between preview and confirm. */
+  expected_sha256?: string;
 }
 
 export interface TargetDiff {
