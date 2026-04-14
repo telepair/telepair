@@ -50,7 +50,7 @@ async fn setup() -> (
         .await
         .unwrap();
 
-    let state = AppState::new(storage.clone(), TargetEngine::empty(), None, None).await;
+    let state = AppState::new(storage.clone(), TargetEngine::empty(), None, None, std::path::PathBuf::from("/tmp/telepair-test")).await;
     let router = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
     (
         router,

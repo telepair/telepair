@@ -282,6 +282,14 @@ export default function Dashboard() {
             >
               {t('dashboard.admin_audit_link')}
             </a>
+            <a
+              class="admin-link"
+              href="/admin/system"
+              aria-label={t('dashboard.admin_system_link_aria')}
+              data-testid="admin-system-link"
+            >
+              {t('dashboard.admin_system_link')}
+            </a>
           </Show>
           <Show when={!auth.currentUserIsGuest() && !auth.currentUserIsAdmin()}>
             <a class="admin-link" href="/change-password">

@@ -349,3 +349,43 @@ export interface AdminUserInfo {
   created_at: string;
   updated_at: string;
 }
+
+/** Response from GET /api/admin/system */
+export interface SystemInfo {
+  version: string;
+  data_dir: string;
+  db_path: string;
+  targets_path: string | null;
+  smtp_configured: boolean;
+  live_sessions: number;
+  registered_users: number;
+  uptime_seconds: number;
+}
+
+/** Response from POST /api/admin/targets/validate */
+export interface ValidateTargetsResult {
+  valid: boolean;
+  path?: string;
+  total?: number;
+  diff?: TargetDiff;
+  blocked?: BlockedTarget[];
+  errors?: string[];
+}
+
+export interface TargetDiff {
+  added: string[];
+  removed: string[];
+  changed: string[];
+  unchanged: string[];
+}
+
+export interface BlockedTarget {
+  target: string;
+  active_sessions: number;
+}
+
+/** Response from GET /api/admin/users (v0.1.4 — wrapped) */
+export interface AdminUsersResponse {
+  users: AdminUserInfo[];
+  total: number;
+}

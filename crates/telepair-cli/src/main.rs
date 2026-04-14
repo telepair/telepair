@@ -505,7 +505,7 @@ async fn main() -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("--web-dir path is not valid UTF-8"))
             })
             .transpose()?;
-        let state = AppState::new(storage, engine, targets_path, smtp).await;
+        let state = AppState::new(storage, engine, targets_path, smtp, data_dir.clone()).await;
         let cors_mode = if cli.allow_any_origin {
             telepair_gateway::CorsMode::AllowAny
         } else {

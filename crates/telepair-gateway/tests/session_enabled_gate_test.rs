@@ -45,7 +45,7 @@ use telepair_gateway::{CorsMode, build_router, build_router_with_options};
 /// path is tested elsewhere and would require a live SMTP stub).
 async fn setup() -> (axum::Router, AppState, Arc<SqliteStorage>) {
     let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
-    let state = AppState::new(storage.clone(), TargetEngine::empty(), None, None).await;
+    let state = AppState::new(storage.clone(), TargetEngine::empty(), None, None, std::path::PathBuf::from("/tmp/telepair-test")).await;
     let router = build_router_with_options(state.clone(), None, CorsMode::AllowAny).unwrap();
     (router, state, storage)
 }
@@ -166,7 +166,7 @@ async fn create_session_enabled_user_succeeds() {
 /// the test can still seed storage rows directly.
 async fn start_server() -> (String, AppState, Arc<SqliteStorage>) {
     let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
-    let state = AppState::new(storage.clone(), TargetEngine::empty(), None, None).await;
+    let state = AppState::new(storage.clone(), TargetEngine::empty(), None, None, std::path::PathBuf::from("/tmp/telepair-test")).await;
     let router = build_router(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
