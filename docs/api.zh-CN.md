@@ -698,6 +698,62 @@ shell 字符串、环境变量 key 的存在性,以及每个 target 的活跃会
 - `401 Unauthorized` —— token 缺失或无效
 - `403 Forbidden` —— 调用方已认证但不是管理员
 
+### POST /api/admin/targets/validate
+
+从磁盘解析 `targets.yaml`,并与内存中的 engine 做 diff,但**不应用**任何变更。
+仅管理员可访问,只读,随时可调用。admin 页面在每次 reload 之前都会跑一次,
+让管理员清楚看到这次变更会做什么;同时返回的 sha-256 可以回传给
+`/api/admin/targets/reload`,用来关闭"validate → confirm"之间的 TOCTOU 窗口。
+
+该请求没有请求体。
+
+**响应** `200 OK` —— 解析成功
+
+```json
+{
+  "valid": true,
+  "path": "/home/admin/.telepair/targets.yaml",
+  "total": 4,
+  "diff": {
+    "added":     ["ops-shell"],
+    "removed":   ["legacy-db"],
+    "changed":   ["prod-db"],
+    "unchanged": ["redis", "minio"]
+  },
+  "blocked": [
+    { "target": "legacy-db", "active_sessions": 2 }
+  ],
+  "expected_sha256": "9a8b7c...e1f2"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `valid` | boolean | 文件解析通过、diff 已计算时为 `true`。 |
+| `path` | string | 被读取的绝对路径。 |
+| `total` | integer | 新 engine 里的 target 总数。 |
+| `diff.added` / `removed` / `changed` / `unchanged` | string[] | 与当前 engine 比较后的 target 名称分类。`changed` 表示两边都有这个名字但配置不同。 |
+| `blocked` | array | `removed` 中仍有活跃会话引用的 target 子集。后续 reload 会因这些 target 被 `still_referenced` 拒绝,但 validate 本身不会因此失败。 |
+| `expected_sha256` | string | `targets.yaml` 原始字节的 hex SHA-256。把它回传到 reload 请求里,即可拒绝任何在中间偷改文件的并发写者。 |
+
+**响应** `200 OK` —— 解析失败
+
+yaml 解析失败属于**预期结果**(管理员粘贴了坏 yaml),不是错误。端点仍返回
+`200`,body 里 `valid: false`,前端可以直接把错误渲染出来,不用针对网络错误
+分叉处理。
+
+```json
+{
+  "valid": false,
+  "errors": ["invalid yaml at line 12: mapping values are not allowed here"]
+}
+```
+
+**错误**
+- `401 Unauthorized` —— token 缺失或无效
+- `403 Forbidden` —— 调用方已认证但不是管理员
+- `500 Internal Server Error` —— tokio 阻塞任务 join 失败(正常情况下不会出现)
+
 ### POST /api/admin/targets/reload
 
 从磁盘重新读取 `targets.yaml`,并把新的 `TargetEngine` 原子地安装到应用状态里。
@@ -741,23 +797,44 @@ CLI 等不做预览的调用方可以省略 body 以跳过该保护。
 列出所有非 guest 用户账号,最新优先。仅管理员可访问。Scoped guest 不会出现在列表里
 —— 它们是邀请兑换生成的,仅在会话范围内存在,会话关闭后即消失。
 
-该端点支撑 v0.1.2 引入的管理员 Users 页面,管理员可以在这里切换自注册邮箱账号的
-`session_enabled` 开关。
+该端点支撑管理员 Users 页面。v0.1.4 新增了服务端过滤、分页以及一层包装的响应
+结构。**相对 v0.1.3 的破坏性变更**:响应不再是裸数组 —— 调用方必须从外层对象里
+读 `users` 和 `total`。
+
+**查询参数**
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `q` | string(可选) | 对 name 或 email 做大小写不敏感的子串匹配。 |
+| `status` | `"enabled"` \| `"disabled"` \| `"pending"`(可选) | 按 admin-approval 桶过滤(见下文 `approval_state`)。无法识别的值会被静默忽略。 |
+| `limit` | integer(可选,默认 `50`,最大 `500`) | 单页返回的最大行数。 |
+| `offset` | integer(可选,默认 `0`) | 分页偏移。 |
 
 **响应** `200 OK`
 ```json
-[
-  {
-    "id": "550e8400-e29b-41d4-a716-446655440000",
-    "name": "alice",
-    "email": "alice@example.com",
-    "is_admin": false,
-    "session_enabled": false,
-    "created_at": "2026-04-13T08:00:00Z",
-    "updated_at": "2026-04-13T08:00:00Z"
-  }
-]
+{
+  "users": [
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "name": "alice",
+      "email": "alice@example.com",
+      "is_admin": false,
+      "session_enabled": false,
+      "approval_state": "pending",
+      "created_at": "2026-04-13T08:00:00Z",
+      "updated_at": "2026-04-13T08:00:00Z"
+    }
+  ],
+  "total": 1
+}
 ```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `users` | array | 当前页命中的行。 |
+| `total` | integer | 忽略 `limit`/`offset` 后的总命中行数。 |
+
+每行字段:
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -766,6 +843,7 @@ CLI 等不做预览的调用方可以省略 body 以跳过该保护。
 | `email` | string \| null | 邮箱地址。admin / CLI 账号(从未通过邮箱注册的)为 `null`。此处暴露邮箱因为调用方本身就是拥有全量 target-reload 和 session-close 权限的管理员。 |
 | `is_admin` | boolean | 管理员账号为 `true` |
 | `session_enabled` | boolean | 用户可以创建/加入会话时为 `true`。邮箱注册的新账号初始值为 `false`。 |
+| `approval_state` | `"approved"` \| `"pending"` | v0.1.4 新增。`"pending"` 表示账号完成了 OTP 验证但还在等管理员批准;`"approved"` 表示曾被批准(当前可能 `session_enabled=false` —— 那是被管理员临时停用)。这让"待审批"与"被停用"两种状态不再混在一起。 |
 | `created_at` | string (ISO 8601) | 账号创建时间,UTC |
 | `updated_at` | string (ISO 8601) | 最后修改时间,UTC |
 
@@ -852,6 +930,77 @@ WebSocket 连接时,会在 `session_enabled` 关卡处被拒绝。
   }
 ]
 ```
+
+**错误**
+- `401 Unauthorized` —— token 缺失或无效
+- `403 Forbidden` —— 调用方已认证但不是管理员
+
+### GET /api/admin/audit/export
+
+把审计日志导出为 JSON 或 CSV 附件下载。仅管理员可访问。接受与
+`GET /api/admin/audit` 相同的过滤参数,但**不分页** —— 端点一次返回全部命中
+结果,最多 10,000 行,超过则返回 `413`,避免误操作把整张表全量拉下来。
+
+**查询参数**
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `format` | `"json"` \| `"csv"` | **必填。**其他值返回 `400`。 |
+| `since` | string (ISO 8601) | `ts` 的包含下界。 |
+| `until` | string (ISO 8601) | `ts` 的不包含上界。 |
+| `actor_id` | string | 按 actor UUID 过滤。无效 UUID 被静默忽略。 |
+| `event_type` | string | 单个点分小写类型(如 `session.closed`)。无效值被静默忽略。 |
+| `session_id` | string | 过滤到与某个会话相关的事件。 |
+
+**响应** `200 OK`
+
+- `format=json` —— `Content-Type: application/json`,body 的数组形状与 `GET /api/admin/audit` 完全一致。
+- `format=csv` —— `Content-Type: text/csv; charset=utf-8`,按 RFC 4180 做引号/换行/逗号处理。列:`id,timestamp,event_type,actor_id,actor_name,session_id,detail`。`detail` 是 JSON 序列化后的字符串。
+
+两种格式都带 `Content-Disposition: attachment; filename="telepair-audit-<UTC-时间戳>.<ext>"`,让浏览器直接弹下载对话框。
+
+**安全 — CSV 公式注入防护。** 任何以 `=`、`+`、`-`、`@`、TAB、CR 开头的字符串
+单元格,会在加引号之前先前缀一个单引号。否则 Excel / Numbers / Google Sheets
+会把这种单元格当作公式求值,一旦用户可控字段(显示名、审计 detail)进入表格,
+就是一个数据外泄通道。单引号前缀是业界常见缓解手段 —— 在多数查看器里几乎不可
+见,却足以让公式求值失效。
+
+**错误**
+- `400 Bad Request` —— `format` 缺失或不是 `json` / `csv` 之一。
+- `401 Unauthorized` —— token 缺失或无效
+- `403 Forbidden` —— 调用方已认证但不是管理员
+- `413 Payload Too Large` —— 过滤后的结果超过 10,000 行上限。请缩小时间范围或过滤条件后重试。
+
+### GET /api/admin/system
+
+服务级诊断快照,供 admin 面板使用:版本、文件系统路径、SMTP 状态、活跃会话数、
+注册用户数、运行时长。仅管理员可访问。用于不登上机器就做一次 sanity check。
+
+**响应** `200 OK`
+
+```json
+{
+  "version": "0.1.4",
+  "data_dir": "/home/admin/.telepair",
+  "db_path": "/home/admin/.telepair/telepair.db",
+  "targets_path": "/home/admin/.telepair/targets.yaml",
+  "smtp_configured": true,
+  "live_sessions": 3,
+  "registered_users": 42,
+  "uptime_seconds": 86400
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `version` | string | 构建时的 `CARGO_PKG_VERSION`。 |
+| `data_dir` | string | telepair 数据目录的绝对路径。 |
+| `db_path` | string | `data_dir` 下 sqlite 文件的绝对路径。 |
+| `targets_path` | string \| null | 已配置的 `targets.yaml` 绝对路径;未配置时为 `null`。 |
+| `smtp_configured` | boolean | OTP 邮件发送所需的 SMTP 传输是否就绪。 |
+| `live_sessions` | integer | `SessionHub` 当前在附的会话数。 |
+| `registered_users` | integer | 非 guest 用户行数 —— 走 `SELECT COUNT(*)`,不会把行加载到内存。 |
+| `uptime_seconds` | integer | gateway 进程启动至今的秒数。 |
 
 **错误**
 - `401 Unauthorized` —— token 缺失或无效

@@ -148,7 +148,7 @@ Browser                     telepair (single process)
 
 ```sql
 users                 (id, name, token_sha256, is_admin, scoped_session_id,
-                       email, password_hash, session_enabled,
+                       email, password_hash, session_enabled, approval_state,
                        login_failed_count, login_locked_until,
                        created_at, updated_at)
 sessions              (id, owner_id, target_name, input_mode, status,
@@ -164,7 +164,7 @@ user_targets          (id, user_id, name, display, command, args, env, tags,
 
 所有 ID 都是存为 TEXT 的 UUID。时间戳是 ISO 8601 TEXT。`Storage` trait 是异步且与具体实现无关的 —— v1 的后端是 SQLite。
 
-**Schema 演进（0.1.x）。** 迁移状态保存在单一的 `migrations/001_initial.sql` 中，每次启动都会整份加载。`telepair-core/src/storage/sqlite.rs` 里的 `run_migrations()` 会先执行完整 SQL 文件，再通过 `pragma_table_info` 做列存在性检查，以幂等方式给旧库补上新列 —— 如 `sessions.closed_reason`、`sessions.user_target_id`、以及 `users` 表的邮箱认证字段（`email`、`password_hash`、`session_enabled`、`login_failed_count`、`login_locked_until`）。新表（`audit_events`、`pending_registrations`、`user_targets`）用 `CREATE TABLE IF NOT EXISTS` 达成同样的效果。这让 0.1.x 范围内的原地升级保持可用，而不必引入正式的迁移框架；真正出现 schema 冲突时，pre-1.0 的"删库重建"兜底仍然适用。正式迁移框架留给后续 minor 版本。
+**Schema 演进（0.1.x）。** 迁移状态保存在单一的 `migrations/001_initial.sql` 中，每次启动都会整份加载。`telepair-core/src/storage/sqlite.rs` 里的 `run_migrations()` 会先执行完整 SQL 文件，再通过 `pragma_table_info` 做列存在性检查，以幂等方式给旧库补上新列 —— 如 `sessions.closed_reason`、`sessions.user_target_id`、`users` 表的邮箱认证字段（`email`、`password_hash`、`session_enabled`、`login_failed_count`、`login_locked_until`），以及 v0.1.4 新增的 `users.approval_state`。`approval_state` 的回填(backfill)会在该列首次添加时**仅执行一次**,把 v0.1.4 之前的待审批账号(`verified=TRUE AND session_enabled=FALSE`)重新分类为 `approval_state='pending'`,这样新的拆分不会把它们悄悄提升为 `approved`。新表（`audit_events`、`pending_registrations`、`user_targets`）用 `CREATE TABLE IF NOT EXISTS` 达成同样的效果。这让 0.1.x 范围内的原地升级保持可用，而不必引入正式的迁移框架；真正出现 schema 冲突时，pre-1.0 的"删库重建"兜底仍然适用。正式迁移框架留给后续 minor 版本。
 
 ### 审计事件
 
@@ -187,7 +187,7 @@ user_targets          (id, user_id, name, display, command, args, env, tags,
 - **认证（Authentication）**：`Authorization` header 里的 bearer token。Token 只以 SHA-256 hex 摘要形式存储 —— 原始值仅在创建时返回给调用方一次，此后不再持久化。邮箱注册提供了第二条认证路径：用户以 email + password 注册，通过 SMTP 发送的 6 位 OTP 验证后获得 bearer token。密码使用 Argon2 哈希（每行独立 salt）；OTP 有效期 15 分钟，每个邮箱 60 秒限流。
 - **登录限流**：密码登录执行 5 次错误锁定 —— 连续 5 次错误密码后账户锁定 15 分钟。一次成功登录即清空计数器。所有失败模式（未知邮箱、错误密码、已锁定）返回完全相同的错误形态以防止枚举。
 - **待注册**：`pending_registrations` 表是一个无权限的暂存区 —— 在 OTP 验证通过前不会创建 `users` 行。对已验证邮箱的重复注册会静默成功（不泄露信息）并写入审计行。
-- **管理员审批门控**：邮箱注册的新用户默认 `session_enabled = FALSE`。管理员须通过 `PUT /api/admin/users/{id}/session-access` 将其置为 `TRUE` 后用户才能创建会话或接入 WebSocket。登录本身不受限，用户可在等待审批期间查看历史或修改密码。
+- **管理员审批门控**：邮箱注册的新用户以 `approval_state = 'pending'` 和 `session_enabled = FALSE` 的组合入库。管理员通过 `POST /api/admin/users/{id}/enable` 批准该账号,它会在单个事务里把 `session_enabled` 置为 `TRUE` 并把 `approval_state` 改为 `'approved'`。`POST /api/admin/users/{id}/disable` 是反向操作 —— 只把 `session_enabled` 改为 `FALSE`,`approval_state` 维持 `'approved'`,这样"管理员临时停用已启用用户"和"仍在首批审批中"两种状态在 admin UI 和审计日志里始终可区分。不论 pending 还是 disabled 状态,登录本身都被允许,用户可以在等待期间查看历史或修改密码。
 - **授权(Authorization)**:按会话做基于角色的授权。WS handler 在每次 input / resize 动作时都检查角色。
 - **邀请 token**:默认单次使用。以 SHA-256 摘要存储;原子化的 `used_count < max_uses` 自增防止并发兑换的竞态。
 - **CORS**:可通过 `--allowed-origins`(逗号分隔的绝对 URL)配置。不设置时,服务器默认**仅允许 loopback dev 源**(`http://localhost:5173`、`http://127.0.0.1:5173`)以匹配 Vite dev server。畸形的 origin 会让启动失败 —— 拼错不会悄悄让 allowlist 变宽。`--allow-any-origin` 显式启用 `Access-Control-Allow-Origin: *`,仅适合 dev 或下游已有强制 CORS 的反向代理。生产环境直连(无反代)时,请把 `--allowed-origins` 设为你信任的前端域名。

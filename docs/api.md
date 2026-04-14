@@ -715,6 +715,64 @@ Results are sorted by `name` so the admin UI does not shuffle between polls.
 - `401 Unauthorized` — missing or invalid token
 - `403 Forbidden` — caller is authenticated but not an admin
 
+### POST /api/admin/targets/validate
+
+Parse `targets.yaml` from disk and diff it against the in-memory engine
+without applying any changes. Admin-only, read-only, safe to call at any
+time. The admin UI runs this before every reload so the operator sees
+exactly what will change, and the returned sha-256 can be echoed back
+through `/api/admin/targets/reload` to close the validate → confirm
+TOCTOU window.
+
+The request takes no body.
+
+**Response** `200 OK` — parse succeeded
+
+```json
+{
+  "valid": true,
+  "path": "/home/admin/.telepair/targets.yaml",
+  "total": 4,
+  "diff": {
+    "added":     ["ops-shell"],
+    "removed":   ["legacy-db"],
+    "changed":   ["prod-db"],
+    "unchanged": ["redis", "minio"]
+  },
+  "blocked": [
+    { "target": "legacy-db", "active_sessions": 2 }
+  ],
+  "expected_sha256": "9a8b7c...e1f2"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `valid` | boolean | `true` when the file parsed and the diff was computed. |
+| `path` | string | Absolute path that was read. |
+| `total` | integer | Target count in the proposed engine. |
+| `diff.added` / `removed` / `changed` / `unchanged` | string[] | Target names classified against the currently loaded engine. `changed` means the name exists on both sides but the config differs. |
+| `blocked` | array | Subset of `removed` that still has live sessions referencing them. A subsequent reload would fail with `still_referenced` until those sessions are closed. Validate itself does NOT block on this. |
+| `expected_sha256` | string | Hex SHA-256 of the raw `targets.yaml` bytes. Echo this into the reload body to reject any concurrent writer. |
+
+**Response** `200 OK` — parse failed
+
+Parse failure is an expected outcome (admin pasted broken yaml), not an
+error. The endpoint still returns `200` with `valid: false` so the UI can
+render the message inline without branching on network-level errors.
+
+```json
+{
+  "valid": false,
+  "errors": ["invalid yaml at line 12: mapping values are not allowed here"]
+}
+```
+
+**Errors**
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — caller is authenticated but not an admin
+- `500 Internal Server Error` — tokio blocking-task join failure (not expected under normal operation)
+
 ### POST /api/admin/targets/reload
 
 Re-read `targets.yaml` from disk and atomically install the resulting
@@ -908,6 +966,83 @@ section above for the field reference.
   }
 ]
 ```
+
+**Errors**
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — caller is authenticated but not an admin
+
+### GET /api/admin/audit/export
+
+Export the audit log as a downloadable JSON or CSV attachment. Admin-only.
+Accepts the same filter parameters as `GET /api/admin/audit` but does not
+paginate — the endpoint returns the full matching set up to 10,000 rows
+and rejects larger exports with `413` to prevent accidental full-table
+dumps.
+
+**Query Parameters**
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `format` | `"json"` \| `"csv"` | **Required.** Anything else returns `400`. |
+| `since` | string (ISO 8601) | Inclusive lower bound on `ts`. |
+| `until` | string (ISO 8601) | Exclusive upper bound on `ts`. |
+| `actor_id` | string | Filter by actor UUID. Invalid UUIDs are silently ignored. |
+| `event_type` | string | Single dotted-lowercase type (e.g. `session.closed`). Invalid values are silently ignored. |
+| `session_id` | string | Filter to events touching a specific session. |
+
+**Response** `200 OK`
+
+- `format=json` — `Content-Type: application/json`. Body is the same array shape as `GET /api/admin/audit`.
+- `format=csv` — `Content-Type: text/csv; charset=utf-8`. RFC 4180 quoting (commas, quotes, newlines handled). Columns: `id,timestamp,event_type,actor_id,actor_name,session_id,detail`. `detail` is a JSON-stringified object.
+
+Both formats return `Content-Disposition: attachment; filename="telepair-audit-<UTC-timestamp>.<ext>"` so the browser offers a download dialog.
+
+**Security: CSV formula injection.** Any string cell beginning with `=`,
+`+`, `-`, `@`, TAB, or CR is prefixed with a single quote before quoting.
+Excel / Numbers / Google Sheets would otherwise evaluate such cells as
+formulas, which is an exfiltration vector when a user-controlled field
+(display name, audit detail) lands in a spreadsheet. The single-quote
+prefix is a well-known mitigation that stays invisible to most viewers
+while disarming formula evaluation.
+
+**Errors**
+- `400 Bad Request` — `format` missing or not one of `json` / `csv`.
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — caller is authenticated but not an admin
+- `413 Payload Too Large` — filtered result would exceed the 10,000-row cap. Narrow the time range or filter and retry.
+
+### GET /api/admin/system
+
+Snapshot of server-level diagnostics for the admin dashboard: version,
+filesystem paths, SMTP status, live session count, registered user count,
+and uptime. Admin-only. Useful for a one-shot sanity check without SSH'ing
+into the box.
+
+**Response** `200 OK`
+
+```json
+{
+  "version": "0.1.4",
+  "data_dir": "/home/admin/.telepair",
+  "db_path": "/home/admin/.telepair/telepair.db",
+  "targets_path": "/home/admin/.telepair/targets.yaml",
+  "smtp_configured": true,
+  "live_sessions": 3,
+  "registered_users": 42,
+  "uptime_seconds": 86400
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `version` | string | `CARGO_PKG_VERSION` at build time. |
+| `data_dir` | string | Absolute path of the telepair data directory. |
+| `db_path` | string | Absolute path of the sqlite file inside `data_dir`. |
+| `targets_path` | string \| null | Absolute path of the configured `targets.yaml`, or `null` if telepair was started without one. |
+| `smtp_configured` | boolean | Whether a working SMTP transport is available for OTP email delivery. |
+| `live_sessions` | integer | Count of sessions currently attached in `SessionHub`. |
+| `registered_users` | integer | Count of non-guest user rows — uses `SELECT COUNT(*)` without materialising rows. |
+| `uptime_seconds` | integer | Seconds since the gateway process started. |
 
 **Errors**
 - `401 Unauthorized` — missing or invalid token
