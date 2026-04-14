@@ -67,6 +67,35 @@ async fn seed_disabled(storage: &Arc<SqliteStorage>, name: &str) -> (uuid::Uuid,
     (user.id, token)
 }
 
+/// Assert that the gate emitted an `auth.session_access_denied` audit
+/// row for `path`. `expected_actor` and `expected_session` are checked
+/// when `Some`; `None` on `expected_session` means the gate fired
+/// before the session id was resolved (e.g. `POST /api/invite/redeem`).
+async fn assert_audit_denied(
+    storage: &Arc<SqliteStorage>,
+    path: &str,
+    expected_actor: Option<uuid::Uuid>,
+    expected_session: Option<&str>,
+) {
+    let sink = telepair_core::audit::AuditSink::new(storage.clone());
+    let events = sink.query(AuditFilter::default()).await.unwrap();
+    let row = events
+        .iter()
+        .find(|e| {
+            e.event_type == AuditEventType::AuthSessionAccessDenied && e.detail["path"] == path
+        })
+        .unwrap_or_else(|| panic!("expected auth.session_access_denied row for {path}"));
+    if let Some(actor) = expected_actor {
+        assert_eq!(
+            row.actor_id.map(|id| id.to_string()),
+            Some(actor.to_string())
+        );
+    }
+    if let Some(session) = expected_session {
+        assert_eq!(row.session_id.as_deref(), Some(session));
+    }
+}
+
 // ── HTTP gate: POST /api/sessions ────────────────────────────────────
 
 #[tokio::test]
@@ -105,17 +134,7 @@ async fn create_session_disabled_user_is_403_and_emits_audit() {
     // The rejection must be audited so operators can see disabled
     // accounts probing the endpoint. `path` distinguishes HTTP from
     // WS so dashboards can split the two surfaces.
-    let sink = telepair_core::audit::AuditSink::new(storage.clone());
-    let events = sink.query(AuditFilter::default()).await.unwrap();
-    let row = events
-        .iter()
-        .find(|e| e.event_type == AuditEventType::AuthSessionAccessDenied)
-        .expect("expected auth.session_access_denied row");
-    assert_eq!(row.detail["path"], "POST /api/sessions");
-    assert_eq!(
-        row.actor_id.map(|id| id.to_string()),
-        Some(user_id.to_string())
-    );
+    assert_audit_denied(&storage, "POST /api/sessions", Some(user_id), None).await;
 }
 
 #[tokio::test]
@@ -263,20 +282,13 @@ async fn ws_attach_disabled_user_gets_session_disabled_error() {
     // Audit row with the WS-side path marker. Paired with the HTTP
     // test above, an operator can count disabled-account probes per
     // surface from a single query.
-    let sink = telepair_core::audit::AuditSink::new(storage.clone());
-    let events = sink.query(AuditFilter::default()).await.unwrap();
-    let row = events
-        .iter()
-        .find(|e| {
-            e.event_type == AuditEventType::AuthSessionAccessDenied
-                && e.detail["path"] == "WS /ws/session/{id}"
-        })
-        .expect("expected auth.session_access_denied row for ws surface");
-    assert_eq!(
-        row.actor_id.map(|id| id.to_string()),
-        Some(disabled_id.to_string())
-    );
-    assert_eq!(row.session_id.as_deref(), Some(session.id.as_str()));
+    assert_audit_denied(
+        &storage,
+        "WS /ws/session/{id}",
+        Some(disabled_id),
+        Some(&session.id),
+    )
+    .await;
 
     // `state` is held so the server task's AppState doesn't drop
     // mid-test (the spawned axum::serve would otherwise tear down).
@@ -334,20 +346,13 @@ async fn create_invite_disabled_owner_is_403_and_audited() {
         "disabled owner leaked invite row: {rows:?}"
     );
 
-    let sink = telepair_core::audit::AuditSink::new(storage.clone());
-    let events = sink.query(AuditFilter::default()).await.unwrap();
-    let row = events
-        .iter()
-        .find(|e| {
-            e.event_type == AuditEventType::AuthSessionAccessDenied
-                && e.detail["path"] == "POST /api/sessions/{id}/invites"
-        })
-        .expect("expected auth.session_access_denied row for invite mint");
-    assert_eq!(
-        row.actor_id.map(|id| id.to_string()),
-        Some(owner_id.to_string())
-    );
-    assert_eq!(row.session_id.as_deref(), Some(session.id.as_str()));
+    assert_audit_denied(
+        &storage,
+        "POST /api/sessions/{id}/invites",
+        Some(owner_id),
+        Some(&session.id),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -438,15 +443,7 @@ async fn redeem_invite_disabled_user_is_403_and_no_participant_row() {
     // the gate fires before the invite preview resolves, so we don't
     // know the target session yet. That's a deliberate tradeoff: the
     // sooner we reject, the less state we touch.
-    let sink = telepair_core::audit::AuditSink::new(storage.clone());
-    let events = sink.query(AuditFilter::default()).await.unwrap();
-    events
-        .iter()
-        .find(|e| {
-            e.event_type == AuditEventType::AuthSessionAccessDenied
-                && e.detail["path"] == "POST /api/invite/redeem"
-        })
-        .expect("expected auth.session_access_denied row for invite redeem");
+    assert_audit_denied(&storage, "POST /api/invite/redeem", None, None).await;
 }
 
 #[tokio::test]
@@ -486,18 +483,11 @@ async fn update_participant_role_disabled_owner_is_403() {
     assert_eq!(role, Some(Role::Viewer));
 
     // Audit row with the role-update path.
-    let sink = telepair_core::audit::AuditSink::new(storage.clone());
-    let events = sink.query(AuditFilter::default()).await.unwrap();
-    let row = events
-        .iter()
-        .find(|e| {
-            e.event_type == AuditEventType::AuthSessionAccessDenied
-                && e.detail["path"] == "PUT /api/sessions/{id}/participants/{user_id}/role"
-        })
-        .expect("expected auth.session_access_denied row for role update");
-    assert_eq!(
-        row.actor_id.map(|id| id.to_string()),
-        Some(owner_id.to_string())
-    );
-    assert_eq!(row.session_id.as_deref(), Some(session.id.as_str()));
+    assert_audit_denied(
+        &storage,
+        "PUT /api/sessions/{id}/participants/{user_id}/role",
+        Some(owner_id),
+        Some(&session.id),
+    )
+    .await;
 }

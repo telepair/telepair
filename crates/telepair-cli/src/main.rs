@@ -299,6 +299,11 @@ async fn open_storage(data_dir: &std::path::Path) -> anyhow::Result<Arc<SqliteSt
     Ok(Arc::new(SqliteStorage::new(&db_url).await?))
 }
 
+fn make_auth_service(storage: &Arc<SqliteStorage>) -> AuthService {
+    let audit = Arc::new(AuditSink::new(storage.clone()));
+    AuthService::new(storage.clone(), None, audit)
+}
+
 /// Resolve a `--user` CLI argument (email or UUID) to a concrete
 /// [`User`] row. Unknown values are a hard error — otherwise a typo
 /// silently returns zero rows and the operator thinks nothing happened.
@@ -371,8 +376,7 @@ async fn run_users_create(args: CreateUserArgs, storage: Arc<SqliteStorage>) -> 
         (None, None) => (nanoid::nanoid!(16), true),
     };
 
-    let audit = Arc::new(AuditSink::new(storage.clone()));
-    let auth = AuthService::new(storage.clone(), None, audit);
+    let auth = make_auth_service(&storage);
     let session_enabled = !args.no_session;
     let (user, token) = auth
         .admin_create_user(
@@ -445,8 +449,7 @@ async fn run_users_set_enabled(
         );
         return Ok(());
     }
-    let audit = Arc::new(AuditSink::new(storage.clone()));
-    let auth = AuthService::new(storage.clone(), None, audit);
+    let auth = make_auth_service(&storage);
     // CLI has no authenticated admin identity; reuse the user's own row
     // as actor so the audit trail at least names the target. The bulk
     // "who ran the CLI" context lives in the shell history.
@@ -461,16 +464,9 @@ async fn run_users_set_enabled(
 }
 
 async fn run_audit_command(args: AuditArgs, data_dir: &std::path::Path) -> anyhow::Result<()> {
-    // Open the DB in the same shape the server does so the CLI sees
-    // exactly the rows the running process writes. Use `mode=rwc` so
-    // operators running `telepair admin audit` against a cold machine
-    // get a clear "nothing happened yet" instead of a connection error;
-    // `mode=rwc` fails if the parent directory is missing so we mkdir
-    // it ourselves, same as the server startup path.
-    std::fs::create_dir_all(data_dir)?;
-    let db_path = data_dir.join("telepair.db");
-    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
-    let storage = Arc::new(SqliteStorage::new(&db_url).await?);
+    // `mode=rwc` so `telepair admin audit` against a cold machine
+    // yields "nothing happened yet" instead of a connection error.
+    let storage = open_storage(data_dir).await?;
 
     // Resolve time bounds. `--last` wins and collapses into a (since, now)
     // pair; otherwise trust `--since`/`--until` verbatim; otherwise default

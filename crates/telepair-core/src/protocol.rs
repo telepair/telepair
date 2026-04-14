@@ -119,15 +119,8 @@ pub enum ServerMessage {
         participants: Vec<ParticipantInfo>,
         your_role: Role,
         your_user_id: Uuid,
-        /// Recent chat messages, oldest-first. Bounded in-memory backlog
-        /// so a late joiner can see what was said before they arrived
-        /// (handoff context, pasted error messages, etc.) instead of
-        /// dropping into a silent room. NOT persisted — when the session
-        /// closes the history dies with it; that matches the "ephemeral
-        /// collaboration" semantics and keeps chat out of the DB audit
-        /// surface. Capped on the server side (see
-        /// `session_hub::CHAT_HISTORY_CAP`) so the frame stays small
-        /// even after hours of banter.
+        /// Bounded replay for late joiners, oldest-first. Ephemeral —
+        /// dies with the session; see `session_hub::CHAT_HISTORY_CAP`.
         #[serde(default)]
         chat_history: Vec<ChatEntry>,
     },
@@ -195,6 +188,17 @@ pub struct ChatEntry {
     pub text: String,
     /// RFC 3339 timestamp captured at broadcast time (not at replay).
     pub ts: String,
+}
+
+impl From<ChatEntry> for ServerMessage {
+    fn from(e: ChatEntry) -> Self {
+        ServerMessage::PeerChat {
+            user_id: e.user_id,
+            name: e.name,
+            text: e.text,
+            ts: e.ts,
+        }
+    }
 }
 
 fn default_cols() -> u16 {

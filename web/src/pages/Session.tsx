@@ -147,16 +147,24 @@ export default function SessionPage() {
           }
         }
         break;
-      case 'PeerJoined':
-        setParticipants((prev) => [
-          ...prev.filter((p) => p.user_id !== msg.user_id),
-          { user_id: msg.user_id, name: msg.name, role: msg.role, color: msg.color },
-        ]);
+      case 'PeerJoined': {
+        const entry = {
+          user_id: msg.user_id,
+          name: msg.name,
+          role: msg.role,
+          color: msg.color,
+        };
+        setParticipants((prev) =>
+          prev.some((p) => p.user_id === entry.user_id)
+            ? prev.map((p) => (p.user_id === entry.user_id ? entry : p))
+            : [...prev, entry],
+        );
         appendSystemChat(
           `peer-joined:${msg.user_id}`,
           t('chat.system_joined', { name: msg.name }),
         );
         break;
+      }
       case 'PeerLeft':
         // Read the leaving peer's name from the current participant
         // list BEFORE we prune it, otherwise the system message falls

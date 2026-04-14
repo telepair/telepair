@@ -1232,39 +1232,9 @@ pub async fn reload_targets(
         ));
     };
 
-    // Parse in a blocking context so a pathologically large yaml
-    // doesn't stall the tokio worker. The closure also returns the
-    // hex SHA-256 of the raw bytes so we can compare against the
-    // `expected_sha256` the admin previewed before applying. Reading
-    // the file twice (here and in `from_file`) is an acceptable cost
-    // for closing the validate→reload TOCTOU: a second admin racing
-    // `targets.yaml` between preview and confirm now gets rejected
-    // instead of silently applying an un-reviewed diff.
-    #[derive(Debug)]
-    enum LoadOutcome {
-        Loaded {
-            engine: telepair_agent::virtual_target::TargetEngine,
-            sha: String,
-        },
-        Missing,
-    }
-
-    let path_for_blocking = path.clone();
-    let parse_result = tokio::task::spawn_blocking(move || -> Result<LoadOutcome, String> {
-        let bytes = match std::fs::read(&path_for_blocking) {
-            Ok(b) => b,
-            // Fresh installs ship without `targets.yaml` — treat
-            // ENOENT as "no user-defined targets" instead of surfacing
-            // the raw OS error. Other IO errors (permission denied,
-            // I/O failure) still flow to `parse_error` so they aren't
-            // silently swallowed.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(LoadOutcome::Missing),
-            Err(e) => return Err(e.to_string()),
-        };
-        let sha = hex_sha256(&bytes);
-        let engine = telepair_agent::virtual_target::TargetEngine::from_file(&path_for_blocking)
-            .map_err(|e| e.to_string())?;
-        Ok(LoadOutcome::Loaded { engine, sha })
+    let parse_result = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || load_and_hash_targets(&path)
     })
     .await
     .map_err(|e| {
@@ -1273,8 +1243,8 @@ pub async fn reload_targets(
     })?;
 
     let (new_engine, file_sha256) = match parse_result {
-        Ok(LoadOutcome::Loaded { engine, sha }) => (engine, sha),
-        Ok(LoadOutcome::Missing) => {
+        Ok(Some((engine, sha))) => (engine, sha),
+        Ok(None) => {
             // No-op success: the caller hit reload on a file that
             // doesn't exist yet (common on fresh installs). Keep the
             // current engine in place — swapping to an empty one would
@@ -1463,13 +1433,9 @@ pub async fn validate_targets(
         })));
     };
 
-    let path_clone = path.clone();
-    let parse_result = tokio::task::spawn_blocking(move || -> Result<_, String> {
-        let bytes = std::fs::read(&path_clone).map_err(|e| e.to_string())?;
-        let sha = hex_sha256(&bytes);
-        let engine = telepair_agent::virtual_target::TargetEngine::from_file(&path_clone)
-            .map_err(|e| e.to_string())?;
-        Ok((engine, sha))
+    let parse_result = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || load_and_hash_targets(&path)
     })
     .await
     .map_err(|e| {
@@ -1478,7 +1444,16 @@ pub async fn validate_targets(
     })?;
 
     let (new_engine, expected_sha256) = match parse_result {
-        Ok(pair) => pair,
+        Ok(Some(pair)) => pair,
+        Ok(None) => {
+            return Ok(Json(serde_json::json!({
+                "valid": false,
+                "errors": [format!(
+                    "targets.yaml not present at {}",
+                    path.display()
+                )],
+            })));
+        }
         Err(err) => {
             return Ok(Json(serde_json::json!({
                 "valid": false,
@@ -1525,6 +1500,27 @@ fn hex_sha256(bytes: &[u8]) -> String {
         let _ = write!(out, "{b:02x}");
     }
     out
+}
+
+/// Read `targets.yaml` and parse into a `TargetEngine`, returning the hex
+/// SHA-256 of the raw bytes alongside the engine. `Ok(None)` signals the
+/// file is absent (fresh install — callers translate to a friendly
+/// "no user-defined targets" response). Parsing from the same byte slice
+/// used for the hash closes a TOCTOU window where a writer could rotate
+/// the file between the hash and the parse.
+fn load_and_hash_targets(
+    path: &std::path::Path,
+) -> Result<Option<(telepair_agent::virtual_target::TargetEngine, String)>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let sha = hex_sha256(&bytes);
+    let yaml = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+    let engine = telepair_agent::virtual_target::TargetEngine::from_yaml(yaml)
+        .map_err(|e| e.to_string())?;
+    Ok(Some((engine, sha)))
 }
 
 // ── User-owned target CRUD ────────────────────────────────────────────────────

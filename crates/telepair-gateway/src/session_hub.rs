@@ -803,12 +803,7 @@ impl SessionHub {
             hist.pop_front();
         }
         hist.push_back(entry.clone());
-        let _ = live.collab_tx.send(ServerMessage::PeerChat {
-            user_id: entry.user_id,
-            name: entry.name,
-            text: entry.text,
-            ts: entry.ts,
-        });
+        let _ = live.collab_tx.send(entry.into());
     }
 
     /// Update a participant's role in a live session. Mutates the
