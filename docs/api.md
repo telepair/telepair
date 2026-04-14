@@ -762,23 +762,45 @@ callers).
 List every non-guest user account, newest first. Admin-only. Scoped guests are
 not included — they are invite-minted, session-local, and disappear on close.
 
-This endpoint backs the admin Users page introduced in v0.1.2, where an operator
-can flip the `session_enabled` bit on self-registered email accounts.
+This endpoint backs the admin Users page. In v0.1.4 it gained server-side
+filtering, pagination, and a wrapped response shape. **Breaking change vs.
+v0.1.3**: the response is no longer a bare array — callers must read
+`users` and `total` out of the enclosing object.
+
+**Query Parameters**
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `q` | string (optional) | Case-insensitive substring match on name or email. |
+| `status` | `"enabled"` \| `"disabled"` \| `"pending"` (optional) | Filter by admin-approval bucket (see `approval_state` below). Unknown values are ignored. |
+| `limit` | integer (optional, default `50`, capped at `500`) | Maximum rows returned. |
+| `offset` | integer (optional, default `0`) | Rows to skip for pagination. |
 
 **Response** `200 OK`
 ```json
-[
-  {
-    "id": "550e8400-e29b-41d4-a716-446655440000",
-    "name": "alice",
-    "email": "alice@example.com",
-    "is_admin": false,
-    "session_enabled": false,
-    "created_at": "2026-04-13T08:00:00Z",
-    "updated_at": "2026-04-13T08:00:00Z"
-  }
-]
+{
+  "users": [
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "name": "alice",
+      "email": "alice@example.com",
+      "is_admin": false,
+      "session_enabled": false,
+      "approval_state": "pending",
+      "created_at": "2026-04-13T08:00:00Z",
+      "updated_at": "2026-04-13T08:00:00Z"
+    }
+  ],
+  "total": 1
+}
 ```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `users` | array | Matching rows for this page. |
+| `total` | integer | Total matching rows across all pages (ignores `limit`/`offset`). |
+
+Per-row fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -787,8 +809,17 @@ can flip the `session_enabled` bit on self-registered email accounts.
 | `email` | string \| null | Email address. `null` for admin/CLI accounts that never registered with email. Exposed here because the caller is already an admin with full target-reload and session-close rights. |
 | `is_admin` | boolean | `true` for admin accounts |
 | `session_enabled` | boolean | `true` when the user is allowed to create / join sessions. New email registrations start with `false`. |
+| `approval_state` | `"pending"` \| `"approved"` | Admin-approval bucket. `"pending"` = completed OTP verification and waiting for an admin to enable the account. `"approved"` = has been enabled at some point; may still be currently disabled (`session_enabled: false`) if an admin flipped it off later. The `POST /enable` endpoint atomically sets this to `"approved"` and `session_enabled` to `true`; `POST /disable` leaves `approval_state` alone. |
 | `created_at` | string (ISO 8601) | Account creation time, UTC |
 | `updated_at` | string (ISO 8601) | Last modification time, UTC |
+
+The three `status` filter values map to:
+
+| Filter | SQL predicate |
+|--------|---------------|
+| `enabled` | `approval_state = 'approved' AND session_enabled = TRUE` |
+| `disabled` | `approval_state = 'approved' AND session_enabled = FALSE` |
+| `pending` | `approval_state = 'pending'` |
 
 **Errors**
 - `401 Unauthorized` — missing or invalid token
@@ -810,6 +841,7 @@ Returns the updated user object (same shape as rows in `GET /api/admin/users`).
   "email": "alice@example.com",
   "is_admin": false,
   "session_enabled": true,
+  "approval_state": "approved",
   "created_at": "2026-04-13T08:00:00Z",
   "updated_at": "2026-04-13T09:00:00Z"
 }

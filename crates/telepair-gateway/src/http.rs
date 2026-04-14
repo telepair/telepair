@@ -1395,6 +1395,12 @@ struct AdminUserInfo {
     email: Option<String>,
     is_admin: bool,
     session_enabled: bool,
+    /// Admin-approval bucket. `"pending"` means the account
+    /// completed OTP verification but is still waiting for an admin
+    /// to flip `session_enabled = TRUE`. `"approved"` means it has
+    /// been approved at some point (and may or may not currently be
+    /// `session_enabled`).
+    approval_state: &'static str,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -1407,6 +1413,7 @@ impl From<User> for AdminUserInfo {
             email: u.email,
             is_admin: u.is_admin,
             session_enabled: u.session_enabled,
+            approval_state: u.approval_state.as_str(),
             created_at: u.created_at,
             updated_at: u.updated_at,
         }

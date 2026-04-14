@@ -11,9 +11,9 @@ use crate::audit::{AuditEvent, AuditEventType, AuditFilter};
 use crate::error::{Error, Result};
 use crate::permission::Role;
 use crate::session::{
-    CloseReason, CreateUserTargetParams, InputMode, InviteToken, LoginFailureOutcome, Participant,
-    PendingVerifyResult, RedeemIdentity, RedeemOutcome, Session, SessionListFilter, SessionStatus,
-    User, UserTarget,
+    ApprovalState, CloseReason, CreateUserTargetParams, InputMode, InviteToken,
+    LoginFailureOutcome, Participant, PendingVerifyResult, RedeemIdentity, RedeemOutcome, Session,
+    SessionListFilter, SessionStatus, User, UserTarget,
 };
 use crate::storage::{AccountFilter, AccountStatus, Storage};
 
@@ -90,6 +90,27 @@ impl SqliteStorage {
         // accounts (see `materialize_pending_registration`).
         self.ensure_column("users", "session_enabled", "BOOLEAN NOT NULL DEFAULT TRUE")
             .await?;
+        // v0.1.4: admin-approval state. Previously we tried to infer
+        // "waiting for approval" from `verified = FALSE`, but the OTP
+        // flow actually sets `verified = TRUE, session_enabled = FALSE`,
+        // so the inference never matched real rows. Track the bucket
+        // explicitly so Pending/Disabled are distinct. The column
+        // defaults to `'approved'` so admin-created / pre-signup rows
+        // keep their access, but rows that match the pre-v0.1.4
+        // "waiting for approval" signature (OTP-verified email user
+        // with `session_enabled = FALSE`) are backfilled to `'pending'`
+        // during the same upgrade — otherwise a legacy pending queue
+        // disappears into the Disabled bucket after upgrade.
+        let approval_state_added = self
+            .ensure_column(
+                "users",
+                "approval_state",
+                "TEXT NOT NULL DEFAULT 'approved'",
+            )
+            .await?;
+        if approval_state_added {
+            self.backfill_pre_v0_1_4_pending_approvals().await?;
+        }
 
         // Partial unique index on `users.email` — only covers rows
         // where email is non-null. This MUST run after the ALTER
@@ -231,18 +252,44 @@ impl SqliteStorage {
     /// call site — never user input. The argument type is `&str`
     /// rather than a stricter type because the callers are inside
     /// this module and the string is always a literal.
-    async fn ensure_column(&self, table: &str, column: &str, sql_type: &str) -> Result<()> {
+    /// One-shot backfill that runs the moment `users.approval_state`
+    /// is first added. Pre-v0.1.4 "waiting for admin approval" rows
+    /// shared their on-disk shape with "admin-disabled after approval"
+    /// rows — the UI on main offered a binary enable/disable toggle
+    /// and never distinguished the two. Flipping every such row to
+    /// `'pending'` on upgrade keeps the legacy approval queue visible
+    /// in the new Pending bucket; the worst case for an
+    /// approved-then-disabled user is that an admin re-approves them
+    /// with the same click they would have used before.
+    async fn backfill_pre_v0_1_4_pending_approvals(&self) -> Result<()> {
+        sqlx::raw_sql(
+            "UPDATE users SET approval_state = 'pending' \
+             WHERE email IS NOT NULL \
+               AND scoped_session_id IS NULL \
+               AND is_admin = FALSE \
+               AND verified = TRUE \
+               AND session_enabled = FALSE",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Returns `true` when the column was just added, so callers can
+    /// run a one-shot backfill inside the same migration step without
+    /// re-running it on every boot.
+    async fn ensure_column(&self, table: &str, column: &str, sql_type: &str) -> Result<bool> {
         let probe = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?");
         let exists: Option<i64> = sqlx::query_scalar(&probe)
             .bind(column)
             .fetch_optional(&self.pool)
             .await?;
         if exists.is_some() {
-            return Ok(());
+            return Ok(false);
         }
         let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {sql_type}");
         sqlx::raw_sql(&alter).execute(&self.pool).await?;
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -269,10 +316,20 @@ fn now_rfc3339() -> String {
 
 /// Column list shared by every `SELECT … FROM users` that feeds
 /// `row_to_user`. Centralised so a new column only needs one change.
-const USER_COLS: &str =
-    "id, name, is_admin, scoped_session_id, email, session_enabled, created_at, updated_at";
+const USER_COLS: &str = "id, name, is_admin, scoped_session_id, email, session_enabled, \
+     approval_state, created_at, updated_at";
 
 fn row_to_user(r: &SqliteRow) -> Result<User> {
+    // `approval_state` defaults `'approved'` on legacy rows; a corrupt
+    // value (unknown string) falls back to `Approved` rather than
+    // failing the whole query — the worst case is an admin sees a
+    // stale row as Enabled/Disabled instead of Pending, and manual
+    // re-approval is the right recovery.
+    let approval_state = r
+        .try_get::<String, _>("approval_state")
+        .ok()
+        .and_then(|s| ApprovalState::parse(&s))
+        .unwrap_or(ApprovalState::Approved);
     Ok(User {
         id: parse_uuid(r.get("id"))?,
         name: r.get("name"),
@@ -283,6 +340,7 @@ fn row_to_user(r: &SqliteRow) -> Result<User> {
         // ALTER specifies `DEFAULT TRUE`); the `try_get` fallback to
         // `true` covers tests that select a narrower column set.
         session_enabled: r.try_get::<bool, _>("session_enabled").unwrap_or(true),
+        approval_state,
         created_at: parse_datetime(r.get("created_at"))?,
         updated_at: parse_datetime(r.get("updated_at"))?,
     })
@@ -516,8 +574,8 @@ impl SqliteStorage {
         sqlx::query(
             "INSERT INTO users \
                (id, name, token_sha256, is_admin, scoped_session_id, \
-                verified, session_enabled, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, TRUE, TRUE, ?, ?)",
+                verified, session_enabled, approval_state, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, TRUE, TRUE, 'approved', ?, ?)",
         )
         .bind(id.to_string())
         .bind(name)
@@ -536,6 +594,7 @@ impl SqliteStorage {
             scoped_session_id: scoped_session_id.map(|s| s.to_owned()),
             email: None,
             session_enabled: true,
+            approval_state: ApprovalState::Approved,
             created_at: now,
             updated_at: now,
         };
@@ -1498,8 +1557,8 @@ impl Storage for SqliteStorage {
                 "INSERT INTO users \
                    (id, name, token_sha256, is_admin, scoped_session_id, \
                     email, password_hash, verified, session_enabled, \
-                    created_at, updated_at) \
-                 VALUES (?, ?, ?, FALSE, NULL, ?, ?, TRUE, FALSE, ?, ?)",
+                    approval_state, created_at, updated_at) \
+                 VALUES (?, ?, ?, FALSE, NULL, ?, ?, TRUE, FALSE, 'pending', ?, ?)",
             )
             .bind(id.to_string())
             .bind(&display_name)
@@ -1535,6 +1594,7 @@ impl Storage for SqliteStorage {
                 scoped_session_id: None,
                 email: Some(email.to_string()),
                 session_enabled: false,
+                approval_state: ApprovalState::Pending,
                 created_at: now,
                 updated_at: now,
             };
@@ -1645,13 +1705,15 @@ impl Storage for SqliteStorage {
         if let Some(status) = filter.status {
             match status {
                 AccountStatus::Enabled => {
-                    conditions.push("session_enabled = TRUE AND verified = TRUE".to_owned());
+                    conditions
+                        .push("approval_state = 'approved' AND session_enabled = TRUE".to_owned());
                 }
                 AccountStatus::Disabled => {
-                    conditions.push("session_enabled = FALSE AND verified = TRUE".to_owned());
+                    conditions
+                        .push("approval_state = 'approved' AND session_enabled = FALSE".to_owned());
                 }
                 AccountStatus::Pending => {
-                    conditions.push("verified = FALSE".to_owned());
+                    conditions.push("approval_state = 'pending'".to_owned());
                 }
             }
         }
@@ -1691,16 +1753,37 @@ impl Storage for SqliteStorage {
 
     async fn set_session_enabled(&self, user_id: Uuid, enabled: bool) -> Result<User> {
         let now_str = now_rfc3339();
-        let row = sqlx::query(&format!(
-            "UPDATE users SET session_enabled = ?, updated_at = ? \
-             WHERE id = ? \
-             RETURNING {USER_COLS}"
-        ))
-        .bind(enabled)
-        .bind(&now_str)
-        .bind(user_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
+        // Enabling implicitly approves: the admin click that flips
+        // `session_enabled = TRUE` on a `pending` row is the approval
+        // signal itself, and the two bits should move in lockstep so
+        // the user never lands in the nonsensical state
+        // `approval_state = 'pending' AND session_enabled = TRUE`.
+        // Disabling leaves `approval_state` alone — an approved
+        // account that gets temporarily disabled should NOT regress
+        // to Pending, because a second enable click is a resumption
+        // rather than a fresh approval decision.
+        let row = if enabled {
+            sqlx::query(&format!(
+                "UPDATE users SET session_enabled = TRUE, \
+                 approval_state = 'approved', updated_at = ? \
+                 WHERE id = ? \
+                 RETURNING {USER_COLS}"
+            ))
+            .bind(&now_str)
+            .bind(user_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query(&format!(
+                "UPDATE users SET session_enabled = FALSE, updated_at = ? \
+                 WHERE id = ? \
+                 RETURNING {USER_COLS}"
+            ))
+            .bind(&now_str)
+            .bind(user_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+        };
         let row = row.ok_or_else(|| Error::InvalidInput(format!("user {user_id} not found")))?;
         row_to_user(&row)
     }
@@ -2443,6 +2526,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v0_1_4_upgrade_backfills_legacy_pending_approvals_to_pending() {
+        // Simulate the exact moment a pre-v0.1.4 DB boots on v0.1.4:
+        // the `users` table already contains a mix of rows, all with
+        // `approval_state='approved'` (the column's default), and the
+        // migration's one-shot backfill must reclassify the pending-
+        // approval queue before the admin UI sees it.
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let now = "2026-04-14T00:00:00Z";
+        // Case A — legacy waiting-for-approval email user.
+        let pending_id = Uuid::new_v4();
+        // Case B — active email user, already approved and enabled.
+        let active_id = Uuid::new_v4();
+        // Case C — admin row; email NULL, is_admin=TRUE.
+        let admin_id = Uuid::new_v4();
+        // Case D — invite-minted scoped guest.
+        let scoped_sid = Uuid::new_v4();
+        let guest_id = Uuid::new_v4();
+        sqlx::raw_sql(
+            "INSERT INTO sessions (id, owner_id, target_name, input_mode, status, created_at) \
+             VALUES ('11111111-1111-1111-1111-111111111111', \
+                     '00000000-0000-0000-0000-000000000000', \
+                     'shell', 'serialized', 'active', '2026-04-14T00:00:00Z')",
+        )
+        .execute(&s.pool)
+        .await
+        .ok();
+        let rows = [
+            (
+                pending_id,
+                "pending",
+                0,
+                Some("p@x.com"),
+                1,
+                0,
+                None::<String>,
+            ),
+            (active_id, "active", 0, Some("a@x.com"), 1, 1, None),
+            (admin_id, "root", 1, None, 1, 0, None),
+            (
+                guest_id,
+                "guest",
+                0,
+                None,
+                1,
+                1,
+                Some(scoped_sid.to_string()),
+            ),
+        ];
+        for (id, name, is_admin, email, verified, enabled, scoped) in rows {
+            sqlx::query(
+                "INSERT INTO users \
+                   (id, name, token_sha256, is_admin, scoped_session_id, email, \
+                    password_hash, verified, session_enabled, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id.to_string())
+            .bind(name)
+            .bind(format!("hash-{name}"))
+            .bind(is_admin)
+            .bind(scoped)
+            .bind(email)
+            .bind(Some("pw"))
+            .bind(verified)
+            .bind(enabled)
+            .bind(now)
+            .bind(now)
+            .execute(&s.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::raw_sql("UPDATE users SET approval_state = 'approved'")
+            .execute(&s.pool)
+            .await
+            .unwrap();
+
+        s.backfill_pre_v0_1_4_pending_approvals().await.unwrap();
+
+        let state_of = |id: Uuid| {
+            let pool = s.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT approval_state FROM users WHERE id = ?")
+                    .bind(id.to_string())
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(state_of(pending_id).await, "pending");
+        assert_eq!(state_of(active_id).await, "approved");
+        assert_eq!(state_of(admin_id).await, "approved");
+        assert_eq!(state_of(guest_id).await, "approved");
+    }
+
+    #[tokio::test]
     async fn list_accounts_excludes_scoped_guests() {
         // Admin-page listings must not surface invite-minted scoped
         // guests — they have no admin-actionable state and are tied
@@ -2468,20 +2645,24 @@ mod tests {
     async fn list_accounts_filtered_by_status_and_query() {
         let s = SqliteStorage::new_memory().await.unwrap();
 
-        // create_user sets verified=TRUE and session_enabled=TRUE in the DB,
-        // so all three users start as "enabled" in AccountStatus terms.
+        // create_user sets approval_state='approved' and session_enabled=TRUE,
+        // so admin and alice start as "enabled" in AccountStatus terms.
         let (_admin, _) = s.create_user("admin", true).await.unwrap();
         let (alice, _) = s.create_user("alice", false).await.unwrap();
-        let (bob, _) = s.create_user("bob", false).await.unwrap();
 
-        // Disable alice → session_enabled=FALSE, verified still TRUE → "Disabled"
+        // Disable alice → session_enabled=FALSE, approval_state stays
+        // 'approved' → "Disabled" bucket.
         s.set_session_enabled(alice.id, false).await.unwrap();
 
-        // Make bob "pending" by flipping verified to FALSE directly in the DB.
-        // There is no trait method for this; create_user always sets verified=TRUE.
-        sqlx::query("UPDATE users SET verified = FALSE WHERE id = ?")
-            .bind(bob.id.to_string())
-            .execute(&s.pool)
+        // Drive bob through the real OTP flow so he lands in
+        // approval_state='pending' with session_enabled=FALSE — the
+        // only path that produces a genuine Pending account.
+        let expires = Utc::now() + chrono::Duration::minutes(15);
+        s.upsert_pending_registration("bob@example.com", "bob", "h", "111111", expires)
+            .await
+            .unwrap();
+        let _ = s
+            .verify_pending_registration("bob@example.com", "111111")
             .await
             .unwrap();
 
@@ -2497,7 +2678,7 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(rows[0].name, "alice");
 
-        // Filter by status Enabled → admin only (session_enabled=TRUE AND verified=TRUE)
+        // Filter by status Enabled → admin only (approval_state='approved' AND session_enabled=TRUE)
         let filter = AccountFilter {
             query: None, status: Some(AccountStatus::Enabled), limit: 50, offset: 0,
         };
@@ -2505,7 +2686,7 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(rows[0].name, "admin");
 
-        // Filter by status Disabled → alice (session_enabled=FALSE AND verified=TRUE)
+        // Filter by status Disabled → alice (approval_state='approved' AND session_enabled=FALSE)
         let filter = AccountFilter {
             query: None, status: Some(AccountStatus::Disabled), limit: 50, offset: 0,
         };
@@ -2513,7 +2694,7 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(rows[0].name, "alice");
 
-        // Filter by status Pending → bob (verified=FALSE)
+        // Filter by status Pending → bob (approval_state='pending')
         let filter = AccountFilter {
             query: None, status: Some(AccountStatus::Pending), limit: 50, offset: 0,
         };

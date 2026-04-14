@@ -346,6 +346,11 @@ export interface AdminUserInfo {
   email: string | null;
   is_admin: boolean;
   session_enabled: boolean;
+  /** Admin-approval bucket. `"pending"` means OTP-verified and
+   * waiting for admin approval; `"approved"` means the admin has
+   * enabled this account at some point (it may still currently be
+   * `session_enabled = false` if later disabled). */
+  approval_state: "pending" | "approved";
   created_at: string;
   updated_at: string;
 }
