@@ -173,6 +173,43 @@ pub struct Participant {
     pub left_at: Option<DateTime<Utc>>,
 }
 
+/// Admin-approval state for an account. Tracked separately from
+/// `session_enabled` so the admin UI can tell "waiting for approval"
+/// apart from "approved but currently disabled". Introduced in v0.1.4
+/// to replace the old `verified = FALSE` proxy for "pending", which
+/// never matched real post-OTP rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalState {
+    /// Admin-created accounts, invite-minted guests, legacy rows, and
+    /// email signups that an admin has explicitly approved.
+    Approved,
+    /// Email signup that passed OTP verification and is waiting for an
+    /// admin to flip `session_enabled = TRUE`.
+    Pending,
+}
+
+impl ApprovalState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ApprovalState::Approved => "approved",
+            ApprovalState::Pending => "pending",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "approved" => Some(ApprovalState::Approved),
+            "pending" => Some(ApprovalState::Pending),
+            _ => None,
+        }
+    }
+}
+
+fn default_approval_state() -> ApprovalState {
+    ApprovalState::Approved
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: Uuid,
@@ -207,6 +244,11 @@ pub struct User {
     /// host (the v0.1.2 critical adversarial finding).
     #[serde(default = "default_session_enabled")]
     pub session_enabled: bool,
+    /// Admin-approval bucket. Required for the admin UI to display
+    /// "Pending approval" as a first-class status separate from
+    /// "Disabled". See [`ApprovalState`] for the transition rules.
+    #[serde(default = "default_approval_state")]
+    pub approval_state: ApprovalState,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

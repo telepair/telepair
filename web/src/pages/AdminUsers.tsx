@@ -202,11 +202,19 @@ export default function AdminUsers() {
                       <td>
                         <span
                           class="session-badge"
-                          data-enabled={user.session_enabled ? 'true' : 'false'}
+                          data-state={
+                            user.session_enabled
+                              ? 'enabled'
+                              : user.approval_state === 'pending'
+                                ? 'pending'
+                                : 'disabled'
+                          }
                         >
                           {user.session_enabled
                             ? t('admin_users.sessions_enabled')
-                            : t('admin_users.sessions_disabled')}
+                            : user.approval_state === 'pending'
+                              ? t('admin_users.sessions_pending')
+                              : t('admin_users.sessions_disabled')}
                         </span>
                       </td>
                       <td>
@@ -388,13 +396,17 @@ export default function AdminUsers() {
           padding: 2px 8px;
           border-radius: 999px;
         }
-        .session-badge[data-enabled='true'] {
+        .session-badge[data-state='enabled'] {
           background: rgba(63, 185, 80, 0.15);
           color: var(--success);
         }
-        .session-badge[data-enabled='false'] {
+        .session-badge[data-state='disabled'] {
           background: rgba(210, 153, 34, 0.15);
           color: var(--warning);
+        }
+        .session-badge[data-state='pending'] {
+          background: rgba(88, 166, 255, 0.15);
+          color: var(--accent, #58a6ff);
         }
         .toggle-btn {
           font-size: 12px;

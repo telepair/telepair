@@ -26,14 +26,18 @@ pub struct AccountFilter {
     pub offset: i64,
 }
 
-/// Account status filter for admin user management.
+/// Account status filter for admin user management. The three buckets
+/// map to a combination of `approval_state` + `session_enabled` so
+/// "waiting for admin approval" is distinct from "admin explicitly
+/// disabled this account":
 #[derive(Debug, Clone, Copy)]
 pub enum AccountStatus {
-    /// `session_enabled = true AND verified = true`
+    /// `approval_state = 'approved' AND session_enabled = TRUE`
     Enabled,
-    /// `session_enabled = false AND verified = true`
+    /// `approval_state = 'approved' AND session_enabled = FALSE`
     Disabled,
-    /// `verified = false`
+    /// `approval_state = 'pending'` — self-served signup that passed
+    /// OTP verification but has not been approved by an admin yet.
     Pending,
 }
 

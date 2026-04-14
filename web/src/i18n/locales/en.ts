@@ -395,6 +395,7 @@ export const en = {
     role_user: 'User',
     sessions_enabled: 'Enabled',
     sessions_disabled: 'Disabled',
+    sessions_pending: 'Pending approval',
     action_enable: 'Enable',
     action_disable: 'Disable',
     action_enabling: 'Enabling…',

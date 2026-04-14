@@ -372,6 +372,7 @@ export const zh: Dict = {
     role_user: '用户',
     sessions_enabled: '已启用',
     sessions_disabled: '已禁用',
+    sessions_pending: '待审核',
     action_enable: '启用',
     action_disable: '禁用',
     action_enabling: '启用中…',
