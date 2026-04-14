@@ -33,6 +33,7 @@ export default function Terminal(props: TerminalProps) {
   let fitAddon: FitAddon | undefined;
   let resizeObserver: ResizeObserver | undefined;
   let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+  let onVisibilityChange: (() => void) | undefined;
   // `readOnly` is set via the exposed handle and read inside xterm
   // callbacks; keeping it outside the xterm option bag means we avoid
   // touching internal xterm APIs that differ across minor versions.
@@ -131,6 +132,22 @@ export default function Terminal(props: TerminalProps) {
     });
     resizeObserver.observe(containerRef);
 
+    // Re-fit when the tab returns to the foreground. While the tab is
+    // backgrounded the browser throttles `requestAnimationFrame`, so
+    // xterm's renderer can miss layout ticks triggered by e.g. a
+    // sidebar toggle that happened during the background window. On
+    // re-show, the cell grid is painted against the last-known size
+    // and the terminal looks visibly tiny until the next real resize.
+    // A one-shot `fit()` on visibility-change snaps it back. Only fire
+    // when the tab is actually visible so the handler is a no-op on
+    // the hide leg of the toggle.
+    onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        fitAddon?.fit();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
     props.ref?.({
       write(data: string | Uint8Array) {
         term?.write(data);
@@ -163,6 +180,9 @@ export default function Terminal(props: TerminalProps) {
   onCleanup(() => {
     clearTimeout(resizeTimer);
     resizeObserver?.disconnect();
+    if (onVisibilityChange) {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    }
     term?.dispose();
   });
 
