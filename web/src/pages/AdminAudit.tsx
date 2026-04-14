@@ -6,7 +6,10 @@ import type { AuditEvent } from '../lib/protocol';
 import type { ListAdminAuditOptions } from '../lib/api';
 import { useI18n } from '../i18n';
 import { eventLabel as _eventLabel, formatTs } from '../lib/audit';
+import { auth } from '../stores/auth';
+import { toast } from '../stores/toast';
 import LocaleSwitcher from '../components/LocaleSwitcher';
+import AdminNav from '../components/AdminNav';
 import Banner from '../components/Banner';
 
 const PAGE_SIZE = 50;
@@ -92,16 +95,42 @@ export default function AdminAudit() {
 
   const eventLabel = (type: string) => _eventLabel(t, type);
 
+  const handleExport = async (format: 'json' | 'csv') => {
+    try {
+      const url = api.auditExportUrl(format, {
+        event_type: appliedType() || undefined,
+        session_id: appliedSession() || undefined,
+      });
+      const resp = await fetch(url, {
+        headers: { Authorization: `Bearer ${auth.token()}` },
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+      const blob = await resp.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = resp.headers.get('content-disposition')
+        ?.match(/filename="(.+)"/)?.[1]
+        ?? `telepair-audit.${format}`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (e) {
+      toast.error(t('admin_audit.export_failed', { msg: errorMessage(e) }));
+    }
+  };
+
   return (
     <div class="admin-audit">
       <header class="topbar">
         <div class="topbar-left">
-          <a class="back-link" href="/">
-            {t('admin_audit.back_to_dashboard')}
-          </a>
-          <h1>{t('admin_audit.title')}</h1>
+          <AdminNav current="/admin/audit" />
         </div>
         <div class="topbar-actions">
+          <button type="button" class="export-btn" onClick={() => handleExport('json')}>
+            {t('admin_audit.export_json')}
+          </button>
+          <button type="button" class="export-btn" onClick={() => handleExport('csv')}>
+            {t('admin_audit.export_csv')}
+          </button>
           <LocaleSwitcher variant="topbar" />
         </div>
       </header>
@@ -254,18 +283,13 @@ export default function AdminAudit() {
           gap: 16px;
           min-width: 0;
         }
-        .topbar h1 {
-          font-size: 18px;
-          font-weight: 700;
-          white-space: nowrap;
-        }
-        .back-link {
-          color: var(--text-secondary);
-          text-decoration: none;
-          font-size: 13px;
-        }
-        .back-link:hover { color: var(--text-primary); }
         .topbar-actions { display: flex; gap: 8px; align-items: center; }
+        .export-btn {
+          font-size: 12px;
+          padding: 4px 12px;
+          border-radius: 6px;
+          cursor: pointer;
+        }
         .content {
           padding: 24px;
           max-width: 1100px;
