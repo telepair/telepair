@@ -1,5 +1,5 @@
 // web/src/pages/Session.tsx
-import { createSignal, onCleanup, onMount, Show } from 'solid-js';
+import { createEffect, createSignal, onCleanup, onMount, Show } from 'solid-js';
 import { useParams, useNavigate } from '@solidjs/router';
 import { auth } from '../stores/auth';
 import { api, errorMessage as fmtError } from '../lib/api';
@@ -82,7 +82,11 @@ export default function SessionPage() {
   let closeDisarmTimer: ReturnType<typeof setTimeout> | undefined;
   let hasConnectedOnce = false;
 
-  let termHandle: TerminalHandle | undefined;
+  const [termHandle, setTermHandle] = createSignal<TerminalHandle | null>(null);
+  // Set true once SessionState (or any role message) lands, so the
+  // readOnly effect doesn't lock the terminal on the default
+  // pre-state 'viewer' value.
+  const [rolePinned, setRolePinned] = createSignal(false);
   let pendingOutput: Uint8Array[] = [];
   let socket: TelepairSocket | undefined;
   // One-shot latch so HMR/StrictMode re-entry into the Terminal ref
@@ -90,8 +94,9 @@ export default function SessionPage() {
   let socketOpened = false;
 
   const handleBinary = (data: Uint8Array) => {
-    if (termHandle) {
-      termHandle.write(data);
+    const th = termHandle();
+    if (th) {
+      th.write(data);
     } else {
       pendingOutput.push(data);
     }
@@ -119,6 +124,7 @@ export default function SessionPage() {
     switch (msg.type) {
       case 'SessionState':
         setRole(msg.your_role);
+        setRolePinned(true);
         setInputMode(msg.session.input_mode);
         setParticipants(msg.participants);
         break;
@@ -159,9 +165,25 @@ export default function SessionPage() {
           ),
         );
         // If it's our own role that changed, update the local signal
-        // so canInput / toolbar badges react immediately.
+        // so canInput / toolbar badges react immediately, and surface
+        // a proactive toast — without one, a demoted viewer sees a
+        // dead textarea with no explanation until they try to type.
         if (msg.user_id === auth.currentUserId()) {
+          const prev = role();
           setRole(msg.new_role);
+          if (prev !== msg.new_role) {
+            if (msg.new_role === 'viewer') {
+              toast.warning(t('session.toast_role_demoted_to_viewer'), {
+                id: ROLE_CHANGE_TOAST_ID,
+                duration: 5000,
+              });
+            } else if (msg.new_role === 'operator') {
+              toast.info(t('session.toast_role_promoted_to_operator'), {
+                id: ROLE_CHANGE_TOAST_ID,
+                duration: 4000,
+              });
+            }
+          }
         }
         break;
       case 'PeerCursor':
@@ -179,6 +201,10 @@ export default function SessionPage() {
   // time even if the server sends multiple `InputDenied` frames across
   // reconnects.
   const INPUT_DENIED_TOAST_ID = 'input-denied';
+  // Separate dedupe slot for role-transition toasts so a rapid
+  // demote→promote sequence (owner clicks the wrong option then
+  // corrects) doesn't leave the stale "you are now Viewer" hanging.
+  const ROLE_CHANGE_TOAST_ID = 'role-change';
   // `string & {}` keeps the autocomplete from the literal union while
   // still accepting any string the server might send in a future
   // protocol revision — the `default` branch is the forward-compat path.
@@ -286,8 +312,16 @@ export default function SessionPage() {
   };
 
   const handleRoleChange = async (userId: string, newRole: Role) => {
+    // Resolve the name from the current participant list BEFORE the
+    // async call; by the time the toast fires the user may have left
+    // and been pruned, which would render "Role for  set to Viewer".
+    const name = participants().find((p) => p.user_id === userId)?.name ?? '';
     try {
       await api.updateParticipantRole(params.id, userId, newRole);
+      toast.success(
+        t('session.role_change_success', { name, role: roleLabel(t, newRole) }),
+        { duration: 3000 },
+      );
     } catch (e) {
       toast.error(t('session.role_change_failed', { msg: fmtError(e) }));
     }
@@ -370,6 +404,26 @@ export default function SessionPage() {
   // this is safe if Dashboard or AdminGuard already kicked one off.
   onMount(() => {
     void auth.loadIdentity();
+  });
+
+  // Keep the terminal's read-only state in sync with the live role.
+  // Viewers (and anyone briefly in the `viewer` state during role
+  // transitions) get an inert xterm so stray keystrokes can't bypass
+  // the Session.tsx canInput pre-filter — e.g. via a clipboard paste
+  // which doesn't go through the keyboard event path at all.
+  //
+  // The effect gates on `role() !== 'viewer'` *after* the first
+  // SessionState lands. role() defaults to 'viewer' at mount (the
+  // safer preclusion noted above for inputMode), but applying that
+  // default would inadvertently lock the terminal for every owner /
+  // operator during the brief gap between WS open and SessionState
+  // arrival. `rolePinned` flips true on the first real role write so
+  // the pre-pin default is "unlocked" for non-viewers.
+  createEffect(() => {
+    const th = termHandle();
+    if (!th) return;
+    const shouldLock = rolePinned() && role() === 'viewer';
+    th.setReadOnly(shouldLock);
   });
 
   // `connect()` is deferred until the Terminal ref fires so the
@@ -474,7 +528,7 @@ export default function SessionPage() {
             onData={handleData}
             onResize={handleResize}
             ref={(h) => {
-              termHandle = h;
+              setTermHandle(h);
               for (const data of pendingOutput) h.write(data);
               pendingOutput = [];
               if (!socketOpened) {
