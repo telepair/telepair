@@ -93,6 +93,20 @@ export interface ParticipantInfo {
   color: string;
 }
 
+/**
+ * One entry in the bounded chat backlog the server delivers inside
+ * `SessionState.chat_history`. Field-for-field mirror of the `PeerChat`
+ * payload so the chat renderer can consume replayed and live entries
+ * through the same code path. Mirrors `ChatEntry` in
+ * `crates/telepair-core/src/protocol.rs`.
+ */
+export interface ChatEntry {
+  user_id: string;
+  name: string;
+  text: string;
+  ts: string;
+}
+
 export interface TargetInfo {
   name: string;
   display: string;
@@ -131,7 +145,21 @@ export type ClientMessage =
 // --- Server → Client ---
 
 export type ServerMessage =
-  | { type: 'SessionState'; session: Session; participants: ParticipantInfo[]; your_role: Role; your_user_id: string }
+  | {
+      type: 'SessionState';
+      session: Session;
+      participants: ParticipantInfo[];
+      your_role: Role;
+      your_user_id: string;
+      /**
+       * Bounded replay of chat messages posted before this client joined,
+       * oldest-first. Capped server-side (see `CHAT_HISTORY_CAP` in
+       * `session_hub.rs`). Delivered atomically with the subscribe-side
+       * snapshot so live `PeerChat` frames that arrive afterwards never
+       * duplicate entries found here.
+       */
+      chat_history: ChatEntry[];
+    }
   | { type: 'PeerJoined'; user_id: string; name: string; role: Role; color: string }
   | { type: 'PeerLeft'; user_id: string }
   | { type: 'PeerRoleChanged'; user_id: string; new_role: Role }

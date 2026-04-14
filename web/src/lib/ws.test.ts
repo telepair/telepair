@@ -140,6 +140,7 @@ describe('TelepairSocket', () => {
       participants: [],
       your_role: 'owner',
       your_user_id: 'u',
+      chat_history: [],
     };
     ws.onmessage?.({ data: JSON.stringify(state) });
 

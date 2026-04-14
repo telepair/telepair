@@ -12,7 +12,7 @@ use telepair_agent::pty::PtyManager;
 use telepair_control::session_service::SessionService;
 use telepair_core::error::Result;
 use telepair_core::permission::Role;
-use telepair_core::protocol::{ParticipantInfo, ServerMessage};
+use telepair_core::protocol::{ChatEntry, ParticipantInfo, ServerMessage};
 use telepair_core::session::CloseReason;
 
 /// Color palette for participant cursors / identifiers.
@@ -27,6 +27,15 @@ const COLORS: &[&str] = &[
 /// session memory. Raise this if users complain that the replay feels too
 /// short; lower it if long-lived sessions start ballooning RSS.
 const SCROLLBACK_CAP_BYTES: usize = 64 * 1024;
+
+/// How many recent chat messages a session retains so a late joiner can
+/// receive them alongside `SessionState`. Sized for a handful of handoff
+/// notes ("I'm running the migration", a pasted stack trace) rather than
+/// a full IRC log — long-running collab sessions stay bounded instead of
+/// letting chat balloon the `SessionState` frame. Lives in memory only;
+/// when the session closes the history is gone (matches the ephemeral
+/// collaboration semantics and keeps chat out of the DB audit surface).
+pub const CHAT_HISTORY_CAP: usize = 50;
 
 /// How long a [`SessionEntry::Pending`] reservation may sit in the hub
 /// without being upgraded to [`SessionEntry::Live`] before it is GCed.
@@ -119,6 +128,13 @@ pub struct SessionAttachment {
     pub output_rx: broadcast::Receiver<Bytes>,
     pub collab_rx: broadcast::Receiver<ServerMessage>,
     pub shutdown_rx: broadcast::Receiver<()>,
+    /// Bounded snapshot of chat messages already delivered before the
+    /// caller subscribed to `collab_rx`. Taken atomically with the
+    /// subscribe so a live `PeerChat` is either in this snapshot OR in
+    /// the receiver buffer — never both, never lost (see
+    /// [`SessionHub::attach_to`] for the mutex ordering that enforces
+    /// this). Empty for a brand-new session.
+    pub chat_history: Vec<ChatEntry>,
     /// Scrollback chunks to replay before the live broadcast starts.
     /// Empty for a freshly-spawned session.
     pub scrollback: Vec<Bytes>,
@@ -239,6 +255,15 @@ struct LiveSession {
     idle_since: Option<Instant>,
     /// Monotonic counter for color assignment
     color_counter: usize,
+    /// Bounded ring of recent `PeerChat` messages. Guarded by a std
+    /// `Mutex` because the critical section — push + broadcast in the
+    /// writer, subscribe + snapshot in the reader — is pure CPU and
+    /// never `.await`s. Writers (the `record_chat` method) hold the
+    /// lock across `collab_tx.send`; readers (`attach_to`) hold it
+    /// across `collab_tx.subscribe` + `snapshot`. That ordering is
+    /// what gives the "every PeerChat is in the snapshot OR the
+    /// receiver, never both" invariant.
+    chat_history: Arc<Mutex<VecDeque<ChatEntry>>>,
 }
 
 pub struct SessionHub {
@@ -466,6 +491,7 @@ impl SessionHub {
             // reaper will clean this up instead of leaking a shell.
             idle_since: Some(Instant::now()),
             color_counter: 0,
+            chat_history: Arc::new(Mutex::new(VecDeque::with_capacity(CHAT_HISTORY_CAP))),
         };
         // `insert` overwrites a stale `Pending` reservation in place
         // — that is the load-bearing semantic for closing the
@@ -483,6 +509,7 @@ impl SessionHub {
             output_rx,
             collab_rx,
             shutdown_rx,
+            chat_history: Vec::new(),
             scrollback: Vec::new(),
         })
     }
@@ -513,11 +540,26 @@ impl SessionHub {
             let scrollback = sb.snapshot();
             (output_rx, scrollback)
         };
+        // Same subscribe-under-lock pattern for chat: `record_chat`
+        // holds this mutex across push_back + `collab_tx.send`, so any
+        // PeerChat that slipped in before we took the lock is in the
+        // snapshot, and any that arrives after we release it lands in
+        // `collab_rx` — the subscriber sees each exactly once.
+        let (collab_rx, chat_history) = {
+            let hist = live
+                .chat_history
+                .lock()
+                .expect("chat_history mutex poisoned");
+            let collab_rx = live.collab_tx.subscribe();
+            let snapshot: Vec<ChatEntry> = hist.iter().cloned().collect();
+            (collab_rx, snapshot)
+        };
         SessionAttachment {
             cmd_tx: live.cmd_tx.clone(),
             output_rx,
-            collab_rx: live.collab_tx.subscribe(),
+            collab_rx,
             shutdown_rx: live.shutdown_tx.subscribe(),
+            chat_history,
             scrollback,
         }
     }
@@ -737,6 +779,36 @@ impl SessionHub {
         if let Some(SessionEntry::Live(live)) = sessions.get(session_id) {
             let _ = live.collab_tx.send(msg);
         }
+    }
+
+    /// Record a chat entry into the session's bounded history AND
+    /// broadcast it as `PeerChat`. The ring buffer push and the
+    /// broadcast happen under the same std mutex so `attach_to`'s
+    /// atomic subscribe + snapshot can guarantee each message is
+    /// delivered exactly once to late joiners (see the ordering
+    /// comment on `LiveSession::chat_history`). The caller supplies a
+    /// pre-built `ChatEntry` — keeping the `ts` on the caller side
+    /// matches the existing `Utc::now().to_rfc3339()` call site and
+    /// makes tests that need a deterministic clock straightforward.
+    pub async fn record_chat(&self, session_id: &str, entry: ChatEntry) {
+        let sessions = self.sessions.read().await;
+        let Some(SessionEntry::Live(live)) = sessions.get(session_id) else {
+            return;
+        };
+        let mut hist = live
+            .chat_history
+            .lock()
+            .expect("chat_history mutex poisoned");
+        if hist.len() >= CHAT_HISTORY_CAP {
+            hist.pop_front();
+        }
+        hist.push_back(entry.clone());
+        let _ = live.collab_tx.send(ServerMessage::PeerChat {
+            user_id: entry.user_id,
+            name: entry.name,
+            text: entry.text,
+            ts: entry.ts,
+        });
     }
 
     /// Update a participant's role in a live session. Mutates the
