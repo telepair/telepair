@@ -1,12 +1,11 @@
 // web/src/pages/AdminAudit.tsx
 import { createSignal, createResource, For, Show } from 'solid-js';
-import { api, errorMessage, readErrorMessage } from '../lib/api';
+import { api, errorMessage } from '../lib/api';
 import { AuditEventType } from '../lib/protocol';
 import type { AuditEvent } from '../lib/protocol';
 import type { ListAdminAuditOptions } from '../lib/api';
 import { useI18n } from '../i18n';
 import { eventLabel as _eventLabel, formatTs } from '../lib/audit';
-import { auth } from '../stores/auth';
 import { toast } from '../stores/toast';
 import LocaleSwitcher from '../components/LocaleSwitcher';
 import AdminNav from '../components/AdminNav';
@@ -97,20 +96,18 @@ export default function AdminAudit() {
 
   const handleExport = async (format: 'json' | 'csv') => {
     try {
-      const url = api.auditExportUrl(format, {
+      // Route through `api.downloadBlob` rather than raw `fetch()` so a
+      // 401 on an expired token trips the global logout interceptor —
+      // previously this call site bypassed it and left the dashboard in
+      // a stale-logged-in state.
+      const path = api.auditExportPath(format, {
         event_type: appliedType() || undefined,
         session_id: appliedSession() || undefined,
       });
-      const resp = await fetch(url, {
-        headers: { Authorization: `Bearer ${auth.token()}` },
-      });
-      if (!resp.ok) throw new Error(await readErrorMessage(resp));
-      const blob = await resp.blob();
+      const { blob, filename } = await api.downloadBlob(path);
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = resp.headers.get('content-disposition')
-        ?.match(/filename="(.+)"/)?.[1]
-        ?? `telepair-audit.${format}`;
+      a.download = filename ?? `telepair-audit.${format}`;
       a.click();
       // `a.click()` has already kicked off the download; the browser
       // holds its own reference to the blob, so we can release ours on

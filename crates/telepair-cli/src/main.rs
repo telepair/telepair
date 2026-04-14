@@ -86,6 +86,20 @@ struct Cli {
     /// SMTP sender address, e.g. "Telepair <noreply@example.com>"
     #[arg(long, env = "TELEPAIR_SMTP_FROM")]
     smtp_from: Option<String>,
+
+    /// Trust the `X-Forwarded-For` / `X-Real-IP` headers when keying
+    /// the per-IP register rate limiter. Set this ONLY when telepair
+    /// is behind a reverse proxy that rewrites those headers on every
+    /// inbound request (the documented nginx deployment). With it
+    /// enabled in a direct-to-internet setup, any client can forge
+    /// the header and bypass the throttle. Off by default, which is
+    /// the safe fail-closed.
+    #[arg(
+        long,
+        env = "TELEPAIR_TRUST_FORWARDED_HEADERS",
+        default_value_t = false
+    )]
+    trust_forwarded_headers: bool,
 }
 
 #[derive(Subcommand)]
@@ -738,7 +752,8 @@ async fn main() -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("--web-dir path is not valid UTF-8"))
             })
             .transpose()?;
-        let state = AppState::new(storage, engine, targets_path, smtp, data_dir.clone()).await;
+        let mut state = AppState::new(storage, engine, targets_path, smtp, data_dir.clone()).await;
+        state.trust_forwarded_headers = cli.trust_forwarded_headers;
         let cors_mode = if cli.allow_any_origin {
             telepair_gateway::CorsMode::AllowAny
         } else {

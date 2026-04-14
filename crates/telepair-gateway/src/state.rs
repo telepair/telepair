@@ -11,6 +11,7 @@ use telepair_core::audit::AuditSink;
 use telepair_core::auth::TokenAuthProvider;
 use telepair_core::storage::{SqliteStorage, Storage};
 
+use crate::rate_limit::{DEFAULT_REGISTER_MIN_INTERVAL, RegisterRateLimiter};
 use crate::session_hub::{ReaperConfig, SessionHub};
 
 /// Shared state handed to every Axum handler. Holds the services
@@ -59,6 +60,27 @@ pub struct AppState {
     pub data_dir: PathBuf,
     /// Whether SMTP was configured at startup.
     pub smtp_configured: bool,
+    /// Per-IP rate limiter for `POST /api/auth/register`. `None` in
+    /// test fixtures (so unit tests that fire many requests back to
+    /// back aren't throttled) and in any wiring that cannot see the
+    /// caller's `SocketAddr` (tower oneshot, reverse proxies that
+    /// don't forward ConnectInfo). Production sets this via
+    /// [`AppState::new`].
+    pub register_rl: Option<Arc<RegisterRateLimiter>>,
+    /// When `true`, the rate-limit gate on `POST /api/auth/register`
+    /// reads the caller's real IP from `X-Real-IP` (preferred; set by
+    /// nginx from `$remote_addr`, non-forgeable in the documented
+    /// single-hop deployment) or the rightmost `X-Forwarded-For`
+    /// entry (where `$proxy_add_x_forwarded_for` appends the real
+    /// peer after whatever the client may have prepended). Must ONLY
+    /// be enabled when telepair sits behind a reverse proxy that
+    /// rewrites these headers on every inbound request — any
+    /// deployment that accepts traffic directly from untrusted
+    /// clients with this flag on lets attackers forge their source
+    /// IP and bypass the throttle entirely. Off by default so a
+    /// misconfigured operator fails closed to "per-socket IP", which
+    /// is the safe default.
+    pub trust_forwarded_headers: bool,
 }
 
 impl AppState {
@@ -91,6 +113,22 @@ impl AppState {
         // `drop` (not `let _`) to silence clippy::let_underscore_future:
         // ignoring the handle detaches the task, which is what we want.
         std::mem::drop(hub.spawn_reaper(ReaperConfig::default()));
+        let register_rl = Arc::new(RegisterRateLimiter::new(DEFAULT_REGISTER_MIN_INTERVAL));
+        // Detached sweep — drops stale entries so the map can't grow
+        // unbounded under signup churn. Cadence matches the throttle
+        // window; `ReaperConfig`-style tunables aren't warranted for
+        // a single-purpose limiter this small.
+        let sweep = Arc::clone(&register_rl);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(DEFAULT_REGISTER_MIN_INTERVAL);
+            // First tick fires immediately; skip it so startup doesn't
+            // purge an empty map just to touch the lock.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                sweep.purge_expired();
+            }
+        });
         Self {
             auth,
             sessions,
@@ -105,6 +143,8 @@ impl AppState {
             startup: std::time::Instant::now(),
             data_dir,
             smtp_configured,
+            register_rl: Some(register_rl),
+            trust_forwarded_headers: false,
         }
     }
 
@@ -140,6 +180,10 @@ impl AppState {
             startup: std::time::Instant::now(),
             data_dir: PathBuf::from("/tmp/telepair-test"),
             smtp_configured: false,
+            // Tests that want to exercise the limiter opt-in by
+            // swapping this to `Some(...)` on the returned AppState.
+            register_rl: None,
+            trust_forwarded_headers: false,
         }
     }
 

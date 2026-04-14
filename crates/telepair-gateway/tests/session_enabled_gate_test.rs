@@ -282,3 +282,222 @@ async fn ws_attach_disabled_user_gets_session_disabled_error() {
     // mid-test (the spawned axum::serve would otherwise tear down).
     drop(state);
 }
+
+// ── HTTP gates: invite mint / revoke / redeem + participant-role ─────
+
+/// Seed a session owned by a disabled user. The flow is: create the
+/// user with `session_enabled = TRUE` (so `create_session_with_owner`
+/// has a clean precondition), then disable them. This matches what
+/// happens in production when an admin flips an active owner.
+async fn seed_session_with_disabled_owner(
+    storage: &Arc<SqliteStorage>,
+    name: &str,
+) -> (uuid::Uuid, String, telepair_core::session::Session) {
+    let (user, token) = storage.create_user(name, false).await.unwrap();
+    let session = storage
+        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized, None)
+        .await
+        .unwrap();
+    storage.set_session_enabled(user.id, false).await.unwrap();
+    (user.id, token, session)
+}
+
+#[tokio::test]
+async fn create_invite_disabled_owner_is_403_and_audited() {
+    // A disabled owner must not keep minting invites against a session
+    // that predates the disable. Before the gate, `POST /invites` only
+    // checked ownership + session-active, so a disabled owner could
+    // grow the participant roster until the session closed. The gate
+    // fires before `InviteService::create`, so no invite row should
+    // appear.
+    let (app, _, storage) = setup().await;
+    let (owner_id, owner_token, session) =
+        seed_session_with_disabled_owner(&storage, "owner").await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/sessions/{}/invites", session.id))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"viewer","max_uses":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // No invite row leaked — the gate beat the mint.
+    let rows = storage.list_invites_for_session(&session.id).await.unwrap();
+    assert!(
+        rows.is_empty(),
+        "disabled owner leaked invite row: {rows:?}"
+    );
+
+    let sink = telepair_core::audit::AuditSink::new(storage.clone());
+    let events = sink.query(AuditFilter::default()).await.unwrap();
+    let row = events
+        .iter()
+        .find(|e| {
+            e.event_type == AuditEventType::AuthSessionAccessDenied
+                && e.detail["path"] == "POST /api/sessions/{id}/invites"
+        })
+        .expect("expected auth.session_access_denied row for invite mint");
+    assert_eq!(
+        row.actor_id.map(|id| id.to_string()),
+        Some(owner_id.to_string())
+    );
+    assert_eq!(row.session_id.as_deref(), Some(session.id.as_str()));
+}
+
+#[tokio::test]
+async fn revoke_invite_disabled_owner_is_403() {
+    // Revoke is a session-level mutation — gated alongside mint. A
+    // disabled owner should not be able to tear down invites that
+    // might be needed for a replacement operator to finish cleanup.
+    let (app, _, storage) = setup().await;
+    // Seed the invite while the owner is still enabled so the mint
+    // succeeds at the storage layer, then disable and try to revoke.
+    let (user, owner_token) = storage.create_user("owner", false).await.unwrap();
+    let session = storage
+        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized, None)
+        .await
+        .unwrap();
+    let (invite, _raw) = storage
+        .create_invite(&session.id, Role::Viewer, 1, None)
+        .await
+        .unwrap();
+    storage.set_session_enabled(user.id, false).await.unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::delete(format!(
+                "/api/sessions/{}/invites/{}",
+                session.id, invite.token_sha256
+            ))
+            .header("Authorization", format!("Bearer {owner_token}"))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Invite row still present — revoke was blocked at the gate.
+    let rows = storage.list_invites_for_session(&session.id).await.unwrap();
+    assert_eq!(rows.len(), 1);
+}
+
+#[tokio::test]
+async fn redeem_invite_disabled_user_is_403_and_no_participant_row() {
+    // A disabled user with a valid token must not redeem an invite.
+    // Pre-fix, the redeem path consumed a use AND wrote a participant
+    // row before the WS attach layer got a chance to reject — a
+    // one-shot invite was effectively griefable. The gate fires before
+    // the storage transaction, so `used_count` must stay 0 and no
+    // participant row should appear.
+    let (app, _, storage) = setup().await;
+    let (admin, _admin_token) = storage.create_user("root", true).await.unwrap();
+    let session = storage
+        .create_session_with_owner(admin.id, "local-shell", InputMode::Serialized, None)
+        .await
+        .unwrap();
+    let (_, raw_token) = storage
+        .create_invite(&session.id, Role::Viewer, 1, None)
+        .await
+        .unwrap();
+    let (disabled_id, disabled_token) = seed_disabled(&storage, "pending").await;
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/invite/redeem")
+                .header("Authorization", format!("Bearer {disabled_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "token": raw_token }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Invite still pristine.
+    let rows = storage.list_invites_for_session(&session.id).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].used_count, 0, "disabled redeem burned a use");
+
+    // No participant row for the disabled user.
+    let role = storage
+        .find_active_participant_role(&session.id, disabled_id)
+        .await
+        .unwrap();
+    assert!(role.is_none(), "disabled redeem leaked participant row");
+
+    // Audit row carries the redeem path. `session_id` is None here —
+    // the gate fires before the invite preview resolves, so we don't
+    // know the target session yet. That's a deliberate tradeoff: the
+    // sooner we reject, the less state we touch.
+    let sink = telepair_core::audit::AuditSink::new(storage.clone());
+    let events = sink.query(AuditFilter::default()).await.unwrap();
+    events
+        .iter()
+        .find(|e| {
+            e.event_type == AuditEventType::AuthSessionAccessDenied
+                && e.detail["path"] == "POST /api/invite/redeem"
+        })
+        .expect("expected auth.session_access_denied row for invite redeem");
+}
+
+#[tokio::test]
+async fn update_participant_role_disabled_owner_is_403() {
+    // Role changes are a session-level mutation — same gate as mint.
+    let (app, _, storage) = setup().await;
+    let (owner_id, owner_token, session) =
+        seed_session_with_disabled_owner(&storage, "owner").await;
+    let (target, _) = storage.create_user("peer", false).await.unwrap();
+    storage
+        .upsert_participant(&session.id, target.id, Role::Viewer)
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/api/sessions/{}/participants/{}/role",
+                    session.id, target.id
+                ))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"role":"operator"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Role unchanged in storage.
+    let role = storage
+        .find_active_participant_role(&session.id, target.id)
+        .await
+        .unwrap();
+    assert_eq!(role, Some(Role::Viewer));
+
+    // Audit row with the role-update path.
+    let sink = telepair_core::audit::AuditSink::new(storage.clone());
+    let events = sink.query(AuditFilter::default()).await.unwrap();
+    let row = events
+        .iter()
+        .find(|e| {
+            e.event_type == AuditEventType::AuthSessionAccessDenied
+                && e.detail["path"] == "PUT /api/sessions/{id}/participants/{user_id}/role"
+        })
+        .expect("expected auth.session_access_denied row for role update");
+    assert_eq!(
+        row.actor_id.map(|id| id.to_string()),
+        Some(owner_id.to_string())
+    );
+    assert_eq!(row.session_id.as_deref(), Some(session.id.as_str()));
+}

@@ -15,6 +15,7 @@ export const zh: Dict = {
     refresh: '刷新',
     refreshing: '刷新中…',
     logout: '退出登录',
+    leave_session: '离开会话',
     back: '← 返回',
     done: '完成',
     dismiss: '关闭通知',

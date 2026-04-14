@@ -128,7 +128,16 @@ export async function readErrorMessage(resp: Response): Promise<string> {
   return raw;
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+/**
+ * Shared pre-flight: attach the bearer, fire the request, and surface
+ * failures consistently. Every authenticated path — JSON request,
+ * binary download — routes through here so the 401 → global logout
+ * interceptor cannot drift per call site. A previous regression had
+ * `AdminAudit`'s export call `fetch()` directly, which left the UI
+ * "logged in" after a token expiry until the next api.* call tripped
+ * the interceptor.
+ */
+async function authedFetch(path: string, options: RequestInit = {}): Promise<Response> {
   // Read the in-memory signal — the single source of truth for the
   // current tab's credential. The signal is primed at module init from
   // sessionStorage/localStorage (via readInitialToken) and updated
@@ -153,12 +162,21 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     // 401 on a protected endpoint = the cached token is bad. Kick
     // the user out before surfacing the error so the UI can't linger
     // in a broken state. PUBLIC_PATHS opts out of this — redeeming
-    // an invite anonymously is not an auth failure.
-    if (resp.status === 401 && !PUBLIC_PATHS.has(path)) {
+    // an invite anonymously is not an auth failure. Path matching is
+    // prefix-insensitive to the query string so `/admin/audit/export?…`
+    // still matches the bare `/admin/audit/export` entries callers
+    // would expect in the allowlist.
+    if (resp.status === 401 && !PUBLIC_PATHS.has(path.split('?')[0])) {
       handleAuthExpired();
     }
     throw new ApiError(resp.status, await readErrorMessage(resp));
   }
+
+  return resp;
+}
+
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const resp = await authedFetch(path, options);
 
   // 204 No Content (DELETE endpoints) has no body — calling
   // `resp.json()` on it would throw SyntaxError. Return undefined
@@ -168,6 +186,19 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
 
   return resp.json();
+}
+
+/**
+ * Extract the filename from a `Content-Disposition` header. Returns
+ * `null` on missing or unparsable headers so callers can fall back to
+ * a computed default (e.g. `telepair-audit.csv`). Only the quoted
+ * `filename="…"` form is recognised — the unquoted or RFC 5987
+ * `filename*=UTF-8''…` forms aren't emitted by our gateway.
+ */
+function parseContentDispositionFilename(header: string | null): string | null {
+  if (!header) return null;
+  const match = header.match(/filename="([^"]+)"/);
+  return match?.[1] ?? null;
 }
 
 /**
@@ -304,7 +335,7 @@ export const api = {
    * Owner-only. List every invite ever minted for `sessionId`, active
    * and expired/exhausted alike — the management dialog wants the full
    * history and renders state chips per row. The response deliberately
-   * omits raw bearer tokens; callers label rows by `token_prefix` (8
+   * omits raw bearer tokens; callers label rows by `token_prefix` (4
    * hex chars) and revoke by `token_sha256`.
    */
   listInvites(sessionId: string): Promise<InviteSummary[]> {
@@ -400,7 +431,15 @@ export const api = {
     return request(qs ? `/admin/audit?${qs}` : '/admin/audit');
   },
 
-  auditExportUrl(format: 'json' | 'csv', opts: ListAdminAuditOptions = {}): string {
+  /**
+   * Build the path (relative to `BASE`) for the admin audit export
+   * endpoint. Callers pass the result straight to `api.downloadBlob`
+   * so the download shares the global 401 → logout interceptor. A
+   * previous iteration returned a fully qualified URL that callers
+   * fed to bare `fetch()`, which left the UI logged-in after a token
+   * expiry on a CSV export.
+   */
+  auditExportPath(format: 'json' | 'csv', opts: ListAdminAuditOptions = {}): string {
     const params = new URLSearchParams();
     params.set('format', format);
     if (opts.event_type) params.set('event_type', opts.event_type);
@@ -408,7 +447,27 @@ export const api = {
     if (opts.since) params.set('since', opts.since);
     if (opts.until) params.set('until', opts.until);
     if (opts.actor_id) params.set('actor_id', opts.actor_id);
-    return `${BASE}/admin/audit/export?${params.toString()}`;
+    return `/admin/audit/export?${params.toString()}`;
+  },
+
+  /**
+   * Authenticated binary download. Mirrors `request()` on the auth +
+   * 401-interceptor side but returns the raw blob plus the filename
+   * parsed out of `Content-Disposition`. Used by admin exports (audit
+   * CSV / JSON) so download failures behave like every other protected
+   * call: a 401 on an expired token rotates the user out globally
+   * instead of leaving the dashboard in a stale-logged-in state.
+   */
+  async downloadBlob(
+    path: string,
+    options: RequestInit = {},
+  ): Promise<{ blob: Blob; filename: string | null }> {
+    const resp = await authedFetch(path, options);
+    const filename = parseContentDispositionFilename(
+      resp.headers.get('content-disposition'),
+    );
+    const blob = await resp.blob();
+    return { blob, filename };
   },
 
   // ── Admin: users ────────────────────────────────────────────────────────────

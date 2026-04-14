@@ -300,3 +300,59 @@ describe('401 auth-expired interceptor', () => {
     expect(onExpired).not.toHaveBeenCalled();
   });
 });
+
+describe('admin audit export', () => {
+  it('auditExportPath encodes filters into the query string', async () => {
+    const path = api.auditExportPath('csv', {
+      event_type: 'SessionCreated',
+      session_id: 'sess-1',
+      since: '2026-01-01T00:00:00Z',
+    });
+    expect(path).toContain('/admin/audit/export?');
+    expect(path).toContain('format=csv');
+    expect(path).toContain('event_type=SessionCreated');
+    expect(path).toContain('session_id=sess-1');
+    expect(path).toContain('since=2026-01-01T00%3A00%3A00Z');
+  });
+
+  it('downloadBlob attaches the bearer token and returns blob + filename', async () => {
+    auth.setToken('admin-token');
+    const body = new Blob(['id,ts\n1,x\n'], { type: 'text/csv' });
+    mockFetch.mockResolvedValueOnce(
+      new Response(body, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/csv',
+          'Content-Disposition': 'attachment; filename="telepair-audit-2026.csv"',
+        },
+      }),
+    );
+
+    const path = api.auditExportPath('csv');
+    const { blob, filename } = await api.downloadBlob(path);
+
+    const [url, init] = mockFetch.mock.calls[0];
+    expect(url).toBe(`/api${path}`);
+    expect(init.headers['Authorization']).toBe('Bearer admin-token');
+    expect(filename).toBe('telepair-audit-2026.csv');
+    expect(blob).toBeInstanceOf(Blob);
+  });
+
+  it('downloadBlob trips the global 401 interceptor (regression)', async () => {
+    // Previously AdminAudit.tsx bypassed the shared interceptor with a
+    // raw `fetch()`; a token expiry on export left the dashboard in a
+    // stale-logged-in state until the next api.* call tripped the
+    // interceptor. downloadBlob now routes through the same authedFetch
+    // helper as JSON requests, so a 401 from an authenticated download
+    // path must invoke handleAuthExpired exactly once.
+    auth.setToken('expired-token');
+    const onExpired = vi.fn();
+    __setAuthExpiredHandler(onExpired);
+    mockFetch.mockResolvedValueOnce(errorResponse('Unauthorized', 401));
+
+    await expect(
+      api.downloadBlob(api.auditExportPath('json')),
+    ).rejects.toThrow(ApiError);
+    expect(onExpired).toHaveBeenCalledTimes(1);
+  });
+});

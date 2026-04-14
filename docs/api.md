@@ -88,6 +88,7 @@ limited, etc.) is captured in the audit log.
 
 **Errors**
 - `400 Bad Request` — malformed request body
+- `429 Too Many Requests` — per-IP throttle tripped; body includes a human-readable retry hint and the wait is bucketed to the nearest 10 seconds to avoid leaking exact timing
 - `503 Service Unavailable` — SMTP is not configured on this instance; contact the administrator
 
 ### POST /api/auth/verify
