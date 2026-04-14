@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Path, Query, State, rejection::JsonRejection},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
@@ -1453,6 +1453,143 @@ pub async fn list_admin_audit(
 
     let rows = state.audit.query(filter).await?;
     Ok(Json(rows))
+}
+
+// --- Admin audit export ---
+
+#[derive(Deserialize)]
+pub struct AuditExportQuery {
+    pub format: Option<String>,
+    #[serde(default)]
+    pub event_type: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub since: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub actor_id: Option<String>,
+}
+
+const EXPORT_MAX_ROWS: i64 = 10_000;
+
+/// `GET /api/admin/audit/export` — admin-only. Exports audit logs as
+/// JSON or CSV. Accepts the same filter parameters as the list endpoint.
+/// Capped at 10,000 rows to prevent accidental full-table dumps.
+pub async fn export_audit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<AuditExportQuery>,
+) -> Result<Response, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    require_admin(&user)?;
+
+    let format = query.format.as_deref().unwrap_or("");
+    if format != "json" && format != "csv" {
+        return Err(ApiError(StatusCode::BAD_REQUEST));
+    }
+
+    let actor_id = query
+        .actor_id
+        .as_deref()
+        .and_then(|s| Uuid::parse_str(s).ok());
+
+    let event_types: Vec<telepair_core::audit::AuditEventType> = query
+        .event_type
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .into_iter()
+        .collect();
+
+    let filter = telepair_core::audit::AuditFilter {
+        since: query.since,
+        until: query.until,
+        actor_id,
+        session_id: query.session_id.filter(|s| !s.is_empty()),
+        event_types,
+        limit: Some(EXPORT_MAX_ROWS + 1), // fetch one extra to detect overflow
+        offset: 0,
+    };
+
+    let rows = state.audit.query(filter).await?;
+
+    if rows.len() as i64 > EXPORT_MAX_ROWS {
+        return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+
+    let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+
+    if format == "csv" {
+        // ~200 bytes/row is a rough upper bound for the fixed columns
+        // (UUIDs + RFC3339 ts + enum + short names). `detail` can be
+        // larger; `String` grows as needed, but this avoids the early
+        // reallocations for the common case.
+        let mut csv = String::with_capacity(64 + rows.len() * 200);
+        csv.push_str("id,timestamp,event_type,actor_id,actor_name,session_id,detail\n");
+
+        use std::fmt::Write as _;
+        // RFC 4180 quoting handles commas / quotes / newlines, but does
+        // NOT stop spreadsheet apps from evaluating cells that start with
+        // `=`, `+`, `-`, `@`, TAB, or CR as formulas. Those prefixes are
+        // an exfiltration vector when a user-controlled field (display
+        // name, audit detail) lands in Excel / Numbers / Sheets. Prefix
+        // a single quote to the raw cell BEFORE quoting so any leading
+        // trigger character is neutralized by the spreadsheet.
+        fn csv_cell(s: &str) -> String {
+            let needs_guard = s
+                .chars()
+                .next()
+                .is_some_and(|c| matches!(c, '=' | '+' | '-' | '@' | '\t' | '\r'));
+            let escaped = s.replace('"', "\"\"");
+            if needs_guard {
+                format!("\"'{escaped}\"")
+            } else {
+                format!("\"{escaped}\"")
+            }
+        }
+
+        for row in &rows {
+            let id = row.id.map(|i| i.to_string()).unwrap_or_default();
+            let ts = row.ts.to_rfc3339();
+            let event_type = row.event_type.as_str();
+            let actor_id = row.actor_id.map(|u| u.to_string()).unwrap_or_default();
+            let actor_name = csv_cell(row.actor_name.as_deref().unwrap_or(""));
+            let session_id = csv_cell(row.session_id.as_deref().unwrap_or(""));
+            let detail = if row.detail.is_null() {
+                String::new()
+            } else {
+                csv_cell(&serde_json::to_string(&row.detail).unwrap_or_default())
+            };
+            // write! on String is infallible, but writeln/write returns fmt::Result
+            let _ = writeln!(
+                csv,
+                "{id},{ts},{event_type},{actor_id},{actor_name},{session_id},{detail}"
+            );
+        }
+
+        Ok(axum::http::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
+            .header(
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"telepair-audit-{now}.csv\""),
+            )
+            .body(axum::body::Body::from(csv))
+            .unwrap())
+    } else {
+        let json_bytes =
+            serde_json::to_vec(&rows).map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR))?;
+        Ok(axum::http::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"telepair-audit-{now}.json\""),
+            )
+            .body(axum::body::Body::from(json_bytes))
+            .unwrap())
+    }
 }
 
 // --- Admin system info ---

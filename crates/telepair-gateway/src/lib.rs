@@ -152,6 +152,7 @@ pub fn build_router_with_options(
         .route("/api/admin/targets", get(http::list_admin_targets))
         .route("/api/admin/targets/reload", post(http::reload_targets))
         .route("/api/admin/audit", get(http::list_admin_audit))
+        .route("/api/admin/audit/export", get(http::export_audit))
         .route("/api/admin/system", get(http::system_info))
         .route("/api/admin/users", get(http::list_admin_users))
         .route(
