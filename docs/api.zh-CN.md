@@ -166,7 +166,7 @@ bearer token 并返回。
 - `400 Bad Request` —— 既没传 `token` 也没传 `email`+`password`,或请求体格式不合法
 - `401 Unauthorized` —— token 无效、邮箱未知、密码错误,或账号在多次失败后被锁定。所有场景返回同一个通用错误(防枚举)。密码登录有节流:连续 5 次错误密码后账号将被锁定一段冷却时间,锁定情况仅在审计日志中可见。
 
-**备注:** `session_enabled` 检查**不在**登录时发生。被禁用的账号仍然可以登录(查看历史、修改密码等)—— 会话创建和 WebSocket 连接才是执行 `session_enabled` 检查的关卡。
+**备注:** `session_enabled` 检查**不在**登录时发生。被禁用的账号仍然可以登录(查看历史、修改密码等)。每个会话变更入口都自带该关卡:`POST /api/sessions`、邀请的铸造/撤销/兑换(`POST|DELETE /api/sessions/{id}/invites[/{token}]`、已登录用户的 `POST /api/invite/redeem`)、参与者角色更新(`PUT /api/sessions/{id}/participants/{user_id}/role`),以及 WebSocket 连接(`GET /ws/session/{id}`)。
 
 ### POST /api/auth/change-password
 
@@ -364,7 +364,8 @@ SQLite 事务中完成,所以两次写入之间不会出现旧 token 在密码�
 | `max_uses` | integer | 否 | 最大兑换次数(默认 1) |
 
 | `expires_in_minutes` | integer | 否 | 相对 TTL,单位分钟。与 `expires_at` 互斥;服务端会先把它转成绝对 UTC 时间再落库。**会被夹到** `MAX_INVITE_TTL_MINUTES`(滑杆拉过头视为无害的 UX 误操作)。 |
-| `expires_at` | string (ISO 8601) | 否 | 绝对过期时间。如果同时传了 `expires_in_minutes` 和 `expires_at`,以 `expires_at` 为准。**超过** `MAX_INVITE_TTL_MINUTES` 时会被 `400 invalid_input` **拒绝**—— 服务端绝不会悄悄改写调用方显式指定的 wall-clock 时间。 |
+| `expires_in_secs` | integer | 否 | 相对 TTL,单位秒。与 `expires_in_minutes` 同时传时,**秒优先**。给 CLI / 自动化调用方用的,允许亚分钟级精度;服务端先把它解析成绝对 `expires_at` 再走校验,所以过去 / 超上限的值仍会返回 `400 invalid_input`。 |
+| `expires_at` | string (ISO 8601) | 否 | 绝对过期时间。如果同时传了 `expires_in_minutes`(或 `expires_in_secs`)和 `expires_at`,以 `expires_at` 为准。**超过** `MAX_INVITE_TTL_MINUTES` 时会被 `400 invalid_input` **拒绝**—— 服务端绝不会悄悄改写调用方显式指定的 wall-clock 时间。 |
 
 **响应** `201 Created`
 ```json
@@ -425,9 +426,10 @@ SQLite 事务中完成,所以两次写入之间不会出现旧 token 在密码�
 
 ### DELETE /api/sessions/{session_id}/invites/{token_sha256}
 
-硬删除一条邀请记录。仅 owner 可操作。路径里的 session id 必须与邀请指向的会话一致
-—— 不一致会返回 `404`,防止调用方枚举其他会话的邀请。对同一个 token 重复 revoke
-会得到 `404`("已经没了"),前端把这当作刷新列表的信号。
+硬删除一条邀请记录。仅 owner 可操作。**幂等**:重复 revoke、未知 sha、跨会话探测
+(sha 存在但属于其他会话)都会返回 `204 No Content`,这样端点就不会泄露其他会话的
+邀请是否存在,前端也不需要在两个管理员同时点击"撤销"时特别处理错误提示。副作用
+仍然会按会话隔离 —— 只有当邀请确实属于路径里的 session 时才会被删除。
 
 已撤销的邀请无法再被兑换(记录本身已经删掉,所以 `POST /api/invite/redeem` 会按
 未知 token 返回 `400`)。
@@ -437,7 +439,7 @@ SQLite 事务中完成,所以两次写入之间不会出现旧 token 在密码�
 **错误**
 - `401 Unauthorized` —— token 缺失或无效
 - `403 Forbidden` —— 调用方不是会话 owner
-- `404 Not Found` —— 会话不存在、邀请不存在,或邀请属于其他会话
+- `404 Not Found` —— 会话不存在
 
 ### POST /api/invite/redeem
 

@@ -505,9 +505,15 @@ fn check_invite_validity(invite: &InviteToken) -> Result<()> {
         return Err(Error::InvalidInput("invite token has expired".into()));
     }
     if invite.used_count >= invite.max_uses {
-        return Err(Error::InvalidInput(
-            "invite token has been fully used".into(),
-        ));
+        // Collapsed onto the same "invalid invite token" message
+        // that `find_invite` returns for an unknown sha. Distinguishing
+        // "exhausted" from "never existed" at redeem time gave
+        // attackers a yes/no oracle on whether a guessed token once
+        // lived — e.g. "did the admin mint an invite for session X
+        // yesterday?" becomes answerable by hammering random shas.
+        // Expired tokens stay distinct because that branch is a
+        // legitimate UX signal the UI surfaces to the user.
+        return Err(Error::InvalidInput("invalid invite token".into()));
     }
     Ok(())
 }
@@ -1074,19 +1080,18 @@ impl Storage for SqliteStorage {
     }
 
     async fn revoke_invite(&self, token_sha256: &str) -> Result<()> {
-        // Hard delete: a revoked invite has no use to the caller and
-        // nothing downstream references it by its PK (participants
-        // are keyed by session+user, not by invite). Returning
-        // `Error::InvalidInput` on miss mirrors `find_invite`'s
-        // "unknown token" behavior so the HTTP layer maps both to
-        // 400 without a separate branch.
-        let result = sqlx::query("DELETE FROM invite_tokens WHERE token_sha256 = ?")
+        // Hard delete, idempotent: a revoked invite has no use to the
+        // caller and nothing downstream references it by its PK
+        // (participants are keyed by session+user, not by invite).
+        // Missing rows resolve to `Ok(())` so the HTTP DELETE can be
+        // retried or raced between concurrent admins without spurious
+        // 400s. The caller-facing "did it really exist?" distinction is
+        // deliberately erased at this layer — cross-session probe
+        // blocking lives one level up in `InviteService::revoke`.
+        sqlx::query("DELETE FROM invite_tokens WHERE token_sha256 = ?")
             .bind(token_sha256)
             .execute(&self.pool)
             .await?;
-        if result.rows_affected() == 0 {
-            return Err(Error::InvalidInput("invite token not found".into()));
-        }
         Ok(())
     }
 
@@ -1248,12 +1253,11 @@ impl Storage for SqliteStorage {
 
             // Session is alive, caller is not already a member —
             // so the failure must be expiry or exhaustion.
-            // `check_invite_validity` returns the precise message
-            // for each.
+            // `check_invite_validity` distinguishes the two: expired
+            // stays distinct (useful UX signal), exhausted collapses
+            // onto "invalid invite token".
             check_invite_validity(&invite)?;
-            return Err(Error::InvalidInput(
-                "invite token has been fully used".into(),
-            ));
+            return Err(Error::InvalidInput("invalid invite token".into()));
         }
 
         // Re-read the updated invite row to return authoritative

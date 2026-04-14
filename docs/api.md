@@ -171,7 +171,7 @@ password login, a fresh bearer token is minted and returned.
 - `400 Bad Request` — neither `token` nor `email`+`password` provided, or body is malformed
 - `401 Unauthorized` — token is invalid, email is unknown, password is wrong, or account is locked after too many failed attempts. All cases return the same generic error (enumeration safety). Login failures are throttled: after 5 consecutive bad passwords the account is locked for a cooldown window. The lockout is only visible in the audit trail.
 
-**Note:** the `session_enabled` check does **not** happen at login. A disabled account can still log in (to read history, change password, etc.) — session creation and WebSocket attach are the gates that enforce the `session_enabled` bit.
+**Note:** the `session_enabled` check does **not** happen at login. A disabled account can still log in (to read history, change password, etc.). Every session-mutating surface enforces the bit on its own: `POST /api/sessions`, invite mint/revoke/redeem (`POST|DELETE /api/sessions/{id}/invites[/{token}]`, `POST /api/invite/redeem` for authenticated callers), participant-role updates (`PUT /api/sessions/{id}/participants/{user_id}/role`), and WebSocket attach (`GET /ws/session/{id}`).
 
 ### POST /api/auth/change-password
 
@@ -372,7 +372,8 @@ Create an invite link for a session. Only the session owner can create invites.
 | `max_uses` | integer | no | Maximum redemptions (default: 1) |
 
 | `expires_in_minutes` | integer | no | TTL in minutes. Mutually exclusive with `expires_at`; the server resolves it to an absolute UTC timestamp before persisting. **Clamped** to `MAX_INVITE_TTL_MINUTES` (a slider overshoot is treated as a benign UX mistake). |
-| `expires_at` | string (ISO 8601) | no | Absolute expiry. Wins if both `expires_in_minutes` and `expires_at` are set. **Rejected** with `400 invalid_input` if it exceeds `MAX_INVITE_TTL_MINUTES` — the server never silently rewrites an explicit wall-clock pick. |
+| `expires_in_secs` | integer | no | TTL in seconds. Takes precedence over `expires_in_minutes` when both are supplied. Useful for CLI / automated callers that need sub-minute precision; the server resolves it to an absolute `expires_at` before validation, so past / out-of-range values still return `400 invalid_input`. |
+| `expires_at` | string (ISO 8601) | no | Absolute expiry. Wins if both `expires_in_minutes` (or `expires_in_secs`) and `expires_at` are set. **Rejected** with `400 invalid_input` if it exceeds `MAX_INVITE_TTL_MINUTES` — the server never silently rewrites an explicit wall-clock pick. |
 
 **Response** `201 Created`
 ```json
@@ -435,20 +436,23 @@ mint a new invite instead.
 
 ### DELETE /api/sessions/{session_id}/invites/{token_sha256}
 
-Hard-delete an invite row. Owner-only. The path-parameter session id must match
-what the invite points at — a mismatch surfaces as `404` so a caller cannot probe
-for invites belonging to other sessions. Double-revoke returns `404` ("already
-gone"), which the UI treats as a signal to refresh the list.
+Hard-delete an invite row. Owner-only. **Idempotent**: a double-revoke, an
+unknown sha, and a cross-session probe (a sha that exists but belongs to a
+different session) all return `204 No Content`. This prevents the endpoint from
+leaking cross-session invite existence and lets the UI drop a "revoke" click
+without a special error toast when two admins race the operation. Side effects
+remain session-scoped — the underlying invite is only deleted when it actually
+belongs to the path-parameter session.
 
 Revoked invites cannot be redeemed (the row is gone, so `POST /api/invite/redeem`
-returns `400` on a bad token).
+returns `400` on the raw token).
 
 **Response** `204 No Content`
 
 **Errors**
 - `401 Unauthorized` — missing or invalid token
 - `403 Forbidden` — not the session owner
-- `404 Not Found` — session does not exist, invite does not exist, or invite belongs to a different session
+- `404 Not Found` — session does not exist
 
 ### POST /api/invite/redeem
 
