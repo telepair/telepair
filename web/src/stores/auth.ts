@@ -99,6 +99,7 @@ export type AuthErrorKey =
   | 'auth.error_invalid_credentials'
   | 'auth.error_not_verified'
   | 'auth.error_rate_limited'
+  | 'auth.error_register_rate_limited'
   | 'auth.error_smtp_unavailable'
   | 'auth.error_password_too_short'
   | null;
@@ -254,10 +255,17 @@ async function refreshIdentity(): Promise<void> {
 
 async function validateToken(t: string): Promise<boolean> {
   setValidating(true);
+  // Trim before persist: copy-pasted tokens routinely pick up a
+  // trailing newline or stray whitespace, and until v0.1.5 we stored
+  // the raw value in localStorage, producing a confusing "invalid
+  // token" on every subsequent request. The admin token file itself
+  // is written without trailing whitespace, so trimming here cannot
+  // produce a false accept.
+  const trimmed = t.trim();
   // Login is the "persistent" entry point — the admin wants their
   // primary token to survive a tab close. Guest redemption uses the
   // bare `setToken(value)` call instead.
-  setToken(t, { persist: true });
+  setToken(trimmed, { persist: true });
   try {
     await api.listTargets();
     // Prime the cached identity right after the credential check —
@@ -299,7 +307,7 @@ async function emailRegister(
       if (e.status === 400) setErrorKey('auth.error_password_too_short');
       else if (e.status === 503) setErrorKey('auth.error_smtp_unavailable');
       else if (e.status === 409) setErrorKey('auth.error_email_taken');
-      else if (e.status === 429) setErrorKey('auth.error_rate_limited');
+      else if (e.status === 429) setErrorKey('auth.error_register_rate_limited');
       else setErrorKey('auth.error_connection_failed');
     } else {
       setErrorKey('auth.error_connection_failed');

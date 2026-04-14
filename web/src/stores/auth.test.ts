@@ -135,6 +135,19 @@ describe('auth.validateToken', () => {
     expect(tabStore[STORAGE_KEY]).toBeUndefined();
     expect(persistStore[STORAGE_KEY]).toBeUndefined();
   });
+
+  it('trims surrounding whitespace before persisting the token (F1-q1)', async () => {
+    // Copy-pasted tokens routinely pick up a trailing newline from
+    // the terminal or source document. Before v0.1.5 the raw value
+    // landed in localStorage, producing a confusing "invalid token"
+    // on every subsequent request. validateToken must normalise.
+    mockFetch.mockResolvedValueOnce(jsonResponse([]));
+    const result = await auth.validateToken('  padded-token\n');
+    expect(result).toBe(true);
+    expect(auth.token()).toBe('padded-token');
+    expect(tabStore[STORAGE_KEY]).toBe('padded-token');
+    expect(persistStore[STORAGE_KEY]).toBe('padded-token');
+  });
 });
 
 describe('auth.logout', () => {

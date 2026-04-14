@@ -162,6 +162,30 @@ export type ServerMessage =
     }
   | { type: 'PeerJoined'; user_id: string; name: string; role: Role; color: string }
   | { type: 'PeerLeft'; user_id: string }
+  /**
+   * Force-removal of a participant. `reason` distinguishes the two
+   * triggers so the UI does not conflate them:
+   *   - `account_disabled`: admin flipped `session_enabled = FALSE`
+   *     (or equivalent permanent revoke). Other participants render
+   *     "X was removed by an admin"; the evicted user lands on the
+   *     pending-approval UI on reconnect.
+   *   - `token_rotated`: the user's own password change atomically
+   *     rotated their bearer. The account is fine — only the bearer
+   *     the WS was attached with is dead. Other participants render
+   *     a neutral "X re-authenticated" string (NOT an admin action),
+   *     and the evicted user is routed to re-login. Keeping these
+   *     separate on the wire means a routine password rotation is
+   *     never misreported to collaborators as moderation.
+   * The evicted user's own socket receives this frame and is then
+   * closed with `CloseCode.TERMINAL`; the close-frame reason string
+   * mirrors the enum ("account disabled" / "token rotated") for
+   * tooling that only inspects the close frame.
+   */
+  | {
+      type: 'PeerEvicted';
+      user_id: string;
+      reason: 'account_disabled' | 'token_rotated';
+    }
   | { type: 'PeerRoleChanged'; user_id: string; new_role: Role }
   | { type: 'PeerCursor'; user_id: string; x: number; y: number }
   | { type: 'PeerChat'; user_id: string; name: string; text: string; ts: string }

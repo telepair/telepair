@@ -564,6 +564,60 @@ impl SessionHub {
         }
     }
 
+    /// Eject every WS connection owned by `user_id` from every live
+    /// session. Drives the "admin disabled a user with active tabs"
+    /// path: the HTTP gate already prevents *new* session-level
+    /// mutations, but without this call, tabs that were attached
+    /// before the disable keep forwarding keystrokes and chat until
+    /// the user manually disconnects. Once the `PeerEvicted` frame
+    /// lands, the evicted user's main loop (in `ws.rs`) breaks out
+    /// of its `select!` and the socket closes; the frame is also
+    /// visible to co-participants so their UIs drop the now-gone
+    /// entry from their participant lists. Returns the number of
+    /// sessions where at least one connection was dropped — useful
+    /// for audit logging and for the admin handler to decide whether
+    /// to mention "N sessions revoked" in its response.
+    ///
+    /// The participant record is removed under the same write lock
+    /// that broadcasts the frame, so a racing `add_participant` (a
+    /// reconnect attempt from the same user) cannot recreate the row
+    /// between the remove and the broadcast. The follow-up HTTP gate
+    /// on `POST /api/sessions` / WS attach blocks the reconnect
+    /// entirely — this method only needs to handle *already-attached*
+    /// connections.
+    pub async fn evict_user(
+        &self,
+        user_id: Uuid,
+        reason: telepair_core::protocol::EvictReason,
+    ) -> usize {
+        let mut sessions = self.sessions.write().await;
+        let mut affected = 0usize;
+        for entry in sessions.values_mut() {
+            let SessionEntry::Live(live) = entry else {
+                continue;
+            };
+            if live.connections.remove(&user_id).is_none() {
+                // No connections from this user in this session — skip
+                // the broadcast so co-participants don't see a spurious
+                // PeerEvicted for someone who was never here.
+                continue;
+            }
+            live.participants.remove(&user_id);
+            let _ = live
+                .collab_tx
+                .send(ServerMessage::PeerEvicted { user_id, reason });
+            // If this user's connections were the last thing keeping
+            // the session non-idle, restart the idle clock so the
+            // reaper can collect it after the grace period. Mirrors
+            // the equivalent branch in `remove_participant`.
+            if live.connections.is_empty() {
+                live.idle_since = Some(Instant::now());
+            }
+            affected += 1;
+        }
+        affected
+    }
+
     /// Force-stop a live session by signalling all connected WS handlers,
     /// then removing it from the map. A `Pending` entry has no WS
     /// handlers to signal, but is still removed so a stop call drops

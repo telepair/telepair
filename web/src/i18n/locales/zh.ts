@@ -296,6 +296,8 @@ export const zh: Dict = {
     send: '发送',
     system_joined: '{{ name }} 加入了会话',
     system_left: '{{ name }} 离开了会话',
+    system_evicted: '{{ name }} 已被管理员移出会话',
+    system_reauth_required: '{{ name }} 已退出登录 — 需要重新验证',
   },
   participants: {
     heading: '参与者({{ count }})',
@@ -434,6 +436,7 @@ export const zh: Dict = {
     error_invalid_credentials: '邮箱或密码错误',
     error_not_verified: '邮箱尚未验证，请查收邮件',
     error_rate_limited: '请稍后再申请新的验证码',
+    error_register_rate_limited: '此网络的注册请求过于频繁，请稍后再试',
     error_smtp_unavailable: '邮件服务不可用，请联系管理员',
     error_password_too_short: '密码至少需要 8 个字符。',
   },

@@ -241,6 +241,149 @@ where
     }
 }
 
+/// Start a live server AND return a second router clone that tests
+/// can use with `tower::ServiceExt::oneshot` for HTTP calls while the
+/// WS is attached. Both share the same `AppState` (and thus the same
+/// `SessionHub`), so an HTTP admin action on the router actually
+/// affects the live WS connection. Returns the WS base URL, the
+/// oneshot router, the live state handle, and the storage handle.
+async fn start_server_with_router() -> (String, axum::Router, AppState, Arc<SqliteStorage>) {
+    let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+    let state = AppState::new(
+        storage.clone(),
+        TargetEngine::empty(),
+        None,
+        None,
+        std::path::PathBuf::from("/tmp/telepair-test"),
+    )
+    .await;
+    let router = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let serve_router = router.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, serve_router).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, router, state, storage)
+}
+
+#[tokio::test]
+async fn admin_disable_evicts_live_ws_connections() {
+    // The HTTP gate on POST /api/sessions already prevents a newly
+    // disabled user from creating new sessions, but a tab that was
+    // attached *before* the disable keeps the terminal hooks alive
+    // until the user closes the browser. `set_user_enabled` in the
+    // disable path calls `hub.evict_user`, which broadcasts
+    // `PeerEvicted` on the session's collab channel; the user's WS
+    // handler breaks out of its main loop on that frame and the
+    // socket closes. This test pins that chain end-to-end: if a
+    // regression drops the hub call or the WS-side detection, the
+    // socket would remain open and the assertions below would
+    // timeout waiting for the close.
+    let (addr, router, state, storage) = start_server_with_router().await;
+
+    // Seed admin (for the disable HTTP call) and a second enabled
+    // user (the eviction target). The target must start enabled —
+    // we're exercising the "disable an actively-attached user" case.
+    let (admin, admin_token) = storage.create_user("root", true).await.unwrap();
+    let (target_user, target_token) = storage.create_user("worker", false).await.unwrap();
+    let session = storage
+        .create_session_with_owner(admin.id, "local-shell", InputMode::Serialized, None)
+        .await
+        .unwrap();
+    storage
+        .upsert_participant(&session.id, target_user.id, Role::Viewer)
+        .await
+        .unwrap();
+
+    // Target attaches via WS and reads past the initial SessionState
+    // frame so we know the handshake completed before the disable
+    // fires — otherwise a fast disable could race the attach and
+    // we'd be asserting the close path of a connection that never
+    // finished joining, which is a different bug.
+    let url = format!("ws://{addr}/ws/session/{}", session.id);
+    let (mut ws, _) = connect_async(url).await.expect("ws connect failed");
+    ws.send(session_join_msg(&session.id, &target_token))
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(3), recv_json(&mut ws))
+        .await
+        .expect("timed out waiting for SessionState")
+        .expect("ws closed before SessionState");
+    assert!(
+        matches!(first, ServerMessage::SessionState { .. }),
+        "expected SessionState first, got {first:?}"
+    );
+
+    // Admin flips the bit. The oneshot router shares `state` with
+    // the live WS server, so `hub.evict_user` inside this handler
+    // reaches the same LiveSession the WS is attached to.
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/admin/users/{}/disable", target_user.id))
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The WS must now receive `PeerEvicted` targeting its own user
+    // id — co-participants see the same frame and drop the entry
+    // from their participant lists. We keep pulling frames in case
+    // the broadcast channel delivered an unrelated collab message
+    // (e.g. a late `PeerJoined` echo) first; anything other than
+    // PeerEvicted or a socket close is tolerated here.
+    let mut saw_evicted = false;
+    for _ in 0..10 {
+        let next =
+            tokio::time::timeout(std::time::Duration::from_secs(3), recv_json(&mut ws)).await;
+        match next {
+            Ok(Some(ServerMessage::PeerEvicted { user_id, reason })) => {
+                assert_eq!(user_id, target_user.id, "PeerEvicted targeted wrong user");
+                assert_eq!(
+                    reason,
+                    telepair_core::protocol::EvictReason::AccountDisabled,
+                    "admin disable must evict with AccountDisabled reason",
+                );
+                saw_evicted = true;
+                break;
+            }
+            Ok(Some(_)) => continue, // unrelated collab frame, keep reading
+            Ok(None) => break,       // socket closed
+            Err(_) => panic!("timed out waiting for PeerEvicted"),
+        }
+    }
+    assert!(saw_evicted, "WS closed without ever delivering PeerEvicted");
+
+    // And the socket must actually close — eviction is the kill
+    // switch, not just a notice. `next().await` returns `None` when
+    // the tungstenite stream sees the close frame; anything else in
+    // a bounded window means the WS loop never broke out.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(_))) | None => return true,
+                Some(Ok(_)) => continue,
+                Some(Err(_)) => return true,
+            }
+        }
+    })
+    .await
+    .expect("ws did not close within 3s after disable");
+    assert!(closed, "ws next() returned something other than Close");
+
+    // Hub state mirrors the eviction: the participant row is gone.
+    // A regression that broadcasts the frame without updating the
+    // in-memory map would fail here — the user would still appear
+    // in the participant list for any late joiner.
+    drop(state);
+    drop(storage);
+}
+
 #[tokio::test]
 async fn ws_attach_disabled_user_gets_session_disabled_error() {
     let (addr, state, storage) = start_server().await;
@@ -444,6 +587,47 @@ async fn redeem_invite_disabled_user_is_403_and_no_participant_row() {
     // know the target session yet. That's a deliberate tradeoff: the
     // sooner we reject, the less state we touch.
     assert_audit_denied(&storage, "POST /api/invite/redeem", None, None).await;
+}
+
+#[tokio::test]
+async fn close_session_disabled_owner_is_403() {
+    // A disabled owner must not be able to DELETE their own session.
+    // Before the gate, close_session only checked auth + ownership,
+    // so a disabled owner could still force-close an active session
+    // and disconnect every other participant. Matching the gates on
+    // mint / revoke / role-change keeps "disabled" consistently
+    // meaning "no session-level mutations, even on rows I own".
+    let (app, _, storage) = setup().await;
+    let (owner_id, owner_token, session) =
+        seed_session_with_disabled_owner(&storage, "owner").await;
+
+    let resp = app
+        .oneshot(
+            Request::delete(format!("/api/sessions/{}", session.id))
+                .header("Authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Session row still active — the gate beat the close. A regression
+    // that let the DELETE through would flip `status` to Closed here.
+    let row = storage
+        .get_session(&session.id)
+        .await
+        .unwrap()
+        .expect("session row must still exist");
+    assert_eq!(row.status, telepair_core::session::SessionStatus::Active);
+
+    assert_audit_denied(
+        &storage,
+        "DELETE /api/sessions/{id}",
+        Some(owner_id),
+        Some(&session.id),
+    )
+    .await;
 }
 
 #[tokio::test]

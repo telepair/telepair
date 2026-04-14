@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -491,6 +493,22 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     let (personal_tx, mut personal_rx) = mpsc::channel::<ServerMessage>(4);
 
     let session_id_for_output = session_id.clone();
+    // Captured here (rather than re-read inside the task) so the
+    // forwarder can detect self-eviction without having to touch
+    // `user` after ownership moves into the async block. Uuid is
+    // Copy, so this is just a field read.
+    let forwarder_user_id = user.id;
+    // Shared "was the socket force-evicted?" flag. The forwarder sets
+    // it the instant it sees a `PeerEvicted` frame aimed at this user;
+    // the main loop reads it just before deciding whether to call
+    // `hub.remove_participant` on exit. Without this, an evicted WS
+    // task would still decrement the hub's refcount for its user_id
+    // after `SessionHub::evict_user` already cleared the entry, and if
+    // the user re-attached quickly (admin re-enabled the account), the
+    // stale decrement would drop the fresh participant from the live
+    // map and broadcast a spurious `PeerLeft`.
+    let was_evicted = Arc::new(AtomicBool::new(false));
+    let was_evicted_forwarder = was_evicted.clone();
     let mut output_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -514,11 +532,71 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                 result = collab_rx.recv() => {
                     match result {
                         Ok(collab_msg) => {
+                            // Detect self-eviction BEFORE the send so we can
+                            // follow the frame with an explicit Close in one
+                            // serialized sequence. Doing this in the forwarder
+                            // (instead of in the main loop + a stop signal)
+                            // sidesteps the race where tokio::select! picks
+                            // `stop_rx` over the next `collab_rx.recv()` and
+                            // drops the notice frame on the floor — the only
+                            // task that owns `ws_tx` is the one that both
+                            // forwards and closes, so ordering is atomic.
+                            let self_evict_reason = if let ServerMessage::PeerEvicted {
+                                user_id,
+                                reason,
+                            } = collab_msg
+                                && user_id == forwarder_user_id
+                            {
+                                Some(reason)
+                            } else {
+                                None
+                            };
                             let Ok(json) = serde_json::to_string(&collab_msg) else {
                                 tracing::error!("failed to serialize collab message");
                                 continue;
                             };
                             if ws_tx.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                            if let Some(reason) = self_evict_reason {
+                                // Signal the main loop to skip its own
+                                // `remove_participant` bookkeeping on exit:
+                                // `SessionHub::evict_user` has already torn
+                                // down the participant and the connection
+                                // refcount, and a second decrement here
+                                // would race a reconnect from the same user
+                                // (admin re-enable) and spuriously drop the
+                                // fresh participant. Release ordering so the
+                                // main loop's Acquire load observes this
+                                // write after the eviction-triggered Close
+                                // traverses the WS stream.
+                                was_evicted_forwarder.store(true, Ordering::Release);
+                                // Terminal close — the client should route
+                                // the user per `reason`. The close-frame
+                                // reason string mirrors the PeerEvicted
+                                // enum so a client that only inspects the
+                                // Close frame (bypassing the JSON path,
+                                // e.g. raw tooling) can still tell the
+                                // cases apart. `CLOSE_CODE_TERMINAL` is
+                                // the same signal the HTTP-side
+                                // SESSION_DISABLED rejection uses; the
+                                // frontend's JSON handler already routes
+                                // on the enum and doesn't rely on the
+                                // close-reason text.
+                                let close_reason = match reason {
+                                    telepair_core::protocol::EvictReason::AccountDisabled => {
+                                        "account disabled"
+                                    }
+                                    telepair_core::protocol::EvictReason::TokenRotated => {
+                                        "token rotated"
+                                    }
+                                };
+                                let _ = ws_tx
+                                    .send(Message::Close(Some(CloseFrame {
+                                        code: telepair_core::protocol::CLOSE_CODE_TERMINAL,
+                                        reason: close_reason.into(),
+                                    })))
+                                    .await;
                                 break;
                             }
                         }
@@ -675,6 +753,16 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                             "role changed at runtime"
                         );
                     }
+                    // Self-eviction is handled by the forwarder: it
+                    // is the only task that owns `ws_tx`, so the
+                    // "send PeerEvicted then Close atomically"
+                    // sequence has to live there to avoid racing the
+                    // stop signal. The main loop winds down naturally
+                    // once the client acknowledges the close frame
+                    // and `ws_rx.next()` returns None. We still pin
+                    // this branch to document the decision so a
+                    // future reader doesn't re-introduce a main-loop
+                    // break and reinstate the race.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         // Messages were dropped — re-fetch the authoritative
                         // role from the hub so a missed demotion cannot leave
@@ -731,7 +819,15 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     // hub was still holding their session open. `close_session` /
     // `close_stale_sessions` now own the participant-cleanup write,
     // which keeps the DB consistent with the session lifecycle.
-    hub.remove_participant(&session_id, user_id).await;
+    //
+    // Skip the decrement entirely if the socket was force-evicted:
+    // `SessionHub::evict_user` already removed the participant, and
+    // calling `remove_participant` here would race a user's reconnect
+    // (admin re-enabled the account before this task exited) and drop
+    // the fresh participant from the live map.
+    if !was_evicted.load(Ordering::Acquire) {
+        hub.remove_participant(&session_id, user_id).await;
+    }
     tracing::info!(user = %user_name, session = %session_id, "WebSocket disconnected");
 }
 
