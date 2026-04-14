@@ -194,6 +194,11 @@ export const en = {
     close_confirm: 'Click again to close',
     close_failed: 'Failed to close session: {{ msg }}',
     role_change_failed: 'Failed to change role: {{ msg }}',
+    role_change_success: 'Role for {{ name }} set to {{ role }}.',
+    toast_role_demoted_to_viewer:
+      'Your role is now Viewer — terminal input is disabled.',
+    toast_role_promoted_to_operator:
+      'Your role is now Operator — you can type in the terminal.',
     sidebar_show: 'Show Sidebar',
     sidebar_hide: 'Hide Sidebar',
     banner_ended: 'This session has ended.',
@@ -309,7 +314,7 @@ export const en = {
   },
   participants: {
     heading: 'Participants ({{ count }})',
-    toggle_role_aria: 'Toggle role for {{ name }}',
+    change_role_aria: 'Change role for {{ name }}',
   },
   // Short labels for protocol enums (Role, InputMode). Kept separate
   // from `invite.role_*` and `create_session.mode_*` because those

@@ -184,6 +184,9 @@ export const zh: Dict = {
     close_confirm: '再次点击确认关闭',
     close_failed: '关闭会话失败:{{ msg }}',
     role_change_failed: '更改角色失败:{{ msg }}',
+    role_change_success: '已将 {{ name }} 的角色设为 {{ role }}。',
+    toast_role_demoted_to_viewer: '你已被降为观察者 — 终端输入已禁用。',
+    toast_role_promoted_to_operator: '你已被提升为操作者 — 可以在终端输入。',
     sidebar_show: '显示侧栏',
     sidebar_hide: '隐藏侧栏',
     banner_ended: '此会话已结束。',
@@ -295,7 +298,7 @@ export const zh: Dict = {
   },
   participants: {
     heading: '参与者({{ count }})',
-    toggle_role_aria: '切换 {{ name }} 的角色',
+    change_role_aria: '更改 {{ name }} 的角色',
   },
   roles: {
     owner: '所有者',

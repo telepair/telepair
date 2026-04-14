@@ -48,6 +48,85 @@ test.describe('Collaboration', () => {
     await ctxB.close();
   });
 
+  test('owner demotes operator via dropdown and demoted user sees feedback', async ({ browser }) => {
+    // Regression for F4-c2 + F4-q3: before v0.1.5 the participant
+    // role was a single-click toggle with zero confirmation and no
+    // success toast on the owner side. Worse, the demoted user's
+    // terminal stayed fully interactive — the server silently dropped
+    // their keystrokes but nothing in the UI told them why. The fix
+    // swaps the toggle for an explicit <select> and fires a warning
+    // toast + readonly-class on the terminal when the role crosses
+    // to viewer. Both halves are pinned here.
+
+    // --- Owner: collaborative session -------------------------------
+    const ctxA = await browser.newContext();
+    const pageA = await ctxA.newPage();
+    await login(pageA);
+    await pageA.locator('button.target-card').first().click();
+    const launchDialog = pageA.getByRole('dialog', { name: 'Start a session' });
+    await launchDialog.waitFor({ state: 'visible', timeout: 5_000 });
+    await launchDialog.getByRole('button', { name: 'Launch' }).click();
+    await pageA.waitForURL(/\/session\/.+/);
+    await waitForTerminal(pageA);
+
+    // Mint an operator invite so the second window joins with input.
+    await pageA.locator('button.action-btn', { hasText: 'Invite' }).click();
+    const inviteDialog = pageA.locator('.dialog');
+    await expect(inviteDialog).toBeVisible();
+    await inviteDialog.locator('button.primary').click();
+    const urlInput = inviteDialog.locator('.invite-url-row input');
+    await expect(urlInput).toBeVisible({ timeout: 5_000 });
+    const inviteUrl = await urlInput.inputValue();
+    // Close the invite dialog so later locators ('.xterm' etc.) aren't
+    // occluded by its backdrop.
+    await pageA.keyboard.press('Escape');
+
+    // --- Guest: redeem as operator -----------------------------------
+    const ctxB = await browser.newContext();
+    const pageB = await ctxB.newPage();
+    await pageB.goto('/login');
+    await pageB.evaluate(() => {
+      localStorage.clear();
+      sessionStorage.clear();
+    });
+    await pageB.goto(new URL(inviteUrl).pathname);
+    await pageB.waitForURL(/\/session\/.+/);
+    await waitForTerminal(pageB);
+    await expect(pageB.locator('.role-badge')).toHaveText('Operator');
+
+    // --- Owner flips guest to Viewer via the new dropdown ------------
+    // The previous button-based toggle would have fired on click;
+    // explicitly select 'viewer' so the test also catches a
+    // regression to the single-option button.
+    const guestSelect = pageA.locator('.participant-row', {
+      hasNot: pageA.locator('.participant-role[data-role="owner"]'),
+    }).locator('select.role-select');
+    await expect(guestSelect).toBeVisible();
+    await guestSelect.selectOption('viewer');
+
+    // Owner sees a success toast (F4-c2).
+    await expect(pageA.locator('li.toast .toast-text').first()).toContainText(
+      /set to Viewer/i,
+      { timeout: 3_000 },
+    );
+
+    // Guest sees the demotion toast (F4-q3 — proactive feedback) and
+    // the role badge updates in lockstep.
+    await expect(pageB.locator('.role-badge')).toHaveText('Viewer', { timeout: 3_000 });
+    await expect(pageB.locator('li.toast .toast-text')).toContainText(
+      /Viewer/i,
+      { timeout: 3_000 },
+    );
+
+    // And the terminal is visibly locked — the container picks up the
+    // `terminal-readonly` class so CSS can grey it out and hide the
+    // cursor.
+    await expect(pageB.locator('.terminal-container .terminal-readonly')).toHaveCount(1);
+
+    await ctxA.close();
+    await ctxB.close();
+  });
+
   test('operator in solo session sees denial toast and is blocked', async ({ browser }) => {
     // Regression for a real-machine finding: the client-side `canInput`
     // pre-filter used to silently drop operator keystrokes in solo

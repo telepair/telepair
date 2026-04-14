@@ -9,10 +9,16 @@ export interface TerminalHandle {
   write(data: string | Uint8Array): void;
   focus(): void;
   dispose(): void;
+  /** Toggle read-only mode. When true: keyboard events are consumed
+   *  before xterm processes them, `onData` is suppressed, and the
+   *  cursor stops blinking so the textarea visibly reflects the lock.
+   *  Used for viewer-role demotion so the user doesn't face a dead
+   *  prompt with no feedback. */
+  setReadOnly(flag: boolean): void;
   /** Fit-computed size; read by the parent to size the initial
    *  `SessionJoin` frame so the server PTY spawns at the right dims. */
-  cols: number;
-  rows: number;
+  readonly cols: number;
+  readonly rows: number;
 }
 
 interface TerminalProps {
@@ -27,6 +33,10 @@ export default function Terminal(props: TerminalProps) {
   let fitAddon: FitAddon | undefined;
   let resizeObserver: ResizeObserver | undefined;
   let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+  // `readOnly` is set via the exposed handle and read inside xterm
+  // callbacks; keeping it outside the xterm option bag means we avoid
+  // touching internal xterm APIs that differ across minor versions.
+  let readOnly = false;
 
   onMount(() => {
     if (!containerRef) return;
@@ -95,8 +105,16 @@ export default function Terminal(props: TerminalProps) {
         });
     }
 
-    // Forward user input
-    term.onData((data) => props.onData(data));
+    // Forward user input — but honour the read-only latch so demoted
+    // viewers can't leak keystrokes to the server even if the parent
+    // forgets to gate at the `handleData` layer. Belt-and-braces with
+    // `attachCustomKeyEventHandler` below: the key handler stops xterm
+    // from echoing / interpreting the event, and this guard stops any
+    // alternate data path (e.g. clipboard paste) from emitting too.
+    term.onData((data) => {
+      if (readOnly) return;
+      props.onData(data);
+    });
 
     // Register onResize BEFORE fit() so the initial 80×24 → real-size
     // event actually reaches the parent. fit() fires onResize
@@ -113,8 +131,6 @@ export default function Terminal(props: TerminalProps) {
     });
     resizeObserver.observe(containerRef);
 
-    // `cols`/`rows` read AFTER fit() so the handle exposes the real
-    // pixel-derived dims, not the xterm default 80×24.
     props.ref?.({
       write(data: string | Uint8Array) {
         term?.write(data);
@@ -125,8 +141,20 @@ export default function Terminal(props: TerminalProps) {
       dispose() {
         term?.dispose();
       },
-      cols: term.cols,
-      rows: term.rows,
+      setReadOnly(flag: boolean) {
+        readOnly = flag;
+        if (!term) return;
+        // xterm 6.x has no first-class read-only mode; the custom key
+        // handler returns false to abort processing of every
+        // KeyboardEvent so the user's keystrokes never reach xterm's
+        // writer or fire `onData`. Returning true (the install-time
+        // default) lets the event through.
+        term.attachCustomKeyEventHandler(() => !flag);
+        term.options.cursorBlink = !flag;
+        containerRef?.classList.toggle('terminal-readonly', flag);
+      },
+      get cols() { return term?.cols ?? 80; },
+      get rows() { return term?.rows ?? 24; },
     });
 
     term.focus();
@@ -139,9 +167,18 @@ export default function Terminal(props: TerminalProps) {
   });
 
   return (
-    <div
-      ref={containerRef}
-      style={{ width: '100%', height: '100%', overflow: 'hidden' }}
-    />
+    <>
+      <div
+        ref={containerRef}
+        style={{ width: '100%', height: '100%', overflow: 'hidden' }}
+      />
+      <style>{`
+        .terminal-readonly {
+          opacity: 0.75;
+          cursor: not-allowed;
+        }
+        .terminal-readonly .xterm-cursor-layer { display: none; }
+      `}</style>
+    </>
   );
 }
