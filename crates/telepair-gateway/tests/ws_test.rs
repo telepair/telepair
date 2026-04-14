@@ -237,6 +237,7 @@ async fn ws_successful_join_receives_session_state() {
             participants,
             your_role,
             your_user_id,
+            chat_history: _,
         }) => {
             assert_eq!(sess.id, session.id);
             assert_eq!(your_role, Role::Owner);

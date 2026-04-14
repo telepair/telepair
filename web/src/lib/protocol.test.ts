@@ -49,6 +49,7 @@ describe('ServerMessage type narrowing', () => {
       participants: [],
       your_role: 'owner',
       your_user_id: '550e8400-e29b-41d4-a716-446655440000',
+      chat_history: [],
     };
     if (msg.type === 'SessionState') {
       expect(msg.your_role).toBe('owner');

@@ -88,6 +88,13 @@ export default function SessionPage() {
   // pre-state 'viewer' value.
   const [rolePinned, setRolePinned] = createSignal(false);
   let pendingOutput: Uint8Array[] = [];
+  // Latches after the first `SessionState` seeds the chat panel from
+  // the server backlog. Subsequent reconnect-triggered SessionState
+  // frames must NOT overwrite the local chat — by that point live
+  // `PeerChat` broadcasts have populated entries the server backlog
+  // may have already dropped past its cap, and locally synthesized
+  // system notices (join/leave) don't exist server-side.
+  let chatSeeded = false;
   let socket: TelepairSocket | undefined;
   // One-shot latch so HMR/StrictMode re-entry into the Terminal ref
   // callback doesn't reopen the WebSocket.
@@ -127,6 +134,18 @@ export default function SessionPage() {
         setRolePinned(true);
         setInputMode(msg.session.input_mode);
         setParticipants(msg.participants);
+        // Seed the chat panel from the server's bounded backlog on the
+        // FIRST SessionState only. A reconnect delivers SessionState
+        // again, but by then local state is richer than the server
+        // snapshot (system notices, plus live entries that aged out of
+        // the server cap) — overwriting would look like data loss to
+        // the user.
+        if (!chatSeeded) {
+          chatSeeded = true;
+          if (msg.chat_history.length > 0) {
+            setChatMessages(msg.chat_history.slice(-MAX_CHAT_HISTORY));
+          }
+        }
         break;
       case 'PeerJoined':
         setParticipants((prev) => [

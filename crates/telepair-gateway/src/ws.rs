@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use telepair_core::permission::Role;
 use telepair_core::protocol::{
-    ClientMessage, ServerMessage, close_code_for, error_codes, input_denied,
+    ChatEntry, ClientMessage, ServerMessage, close_code_for, error_codes, input_denied,
 };
 use telepair_core::session::{CloseReason, InputMode};
 
@@ -402,6 +402,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         mut output_rx,
         mut collab_rx,
         mut shutdown_rx,
+        chat_history,
         scrollback,
     } = match hub
         .start_or_join(
@@ -447,6 +448,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
         participants,
         your_role: my_role,
         your_user_id: user.id,
+        chat_history,
     };
     match serde_json::to_string(&state_msg) {
         Ok(json) => {
@@ -591,13 +593,20 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                                             "dropped oversized chat message"
                                         );
                                     } else {
-                                        let chat_msg = ServerMessage::PeerChat {
+                                        // `record_chat` pushes into the
+                                        // bounded history AND broadcasts
+                                        // under the same mutex so late
+                                        // joiners receive this message
+                                        // either via `SessionState.chat_history`
+                                        // or via their live `collab_rx`,
+                                        // never both, never neither.
+                                        let entry = ChatEntry {
                                             user_id,
                                             name: user_name.clone(),
                                             text,
                                             ts: Utc::now().to_rfc3339(),
                                         };
-                                        hub.broadcast_collab(&session_id, chat_msg).await;
+                                        hub.record_chat(&session_id, entry).await;
                                     }
                                 }
                                 ClientMessage::CursorMove { x, y } => {

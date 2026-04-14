@@ -496,6 +496,64 @@ async fn e2e_late_joiner_receives_scrollback() {
     let _ = ws_op.close(None).await;
 }
 
+#[tokio::test]
+async fn e2e_late_joiner_receives_chat_backlog() {
+    let (addr, state) = start_server().await;
+
+    let (session_id, owner_token, owner_id) = create_owned_session(&state, "alice").await;
+
+    // Alice joins, waits briefly for the WS handler's forwarder task
+    // to fully wire up, then posts a chat message. We then wait for
+    // her own PeerChat echo before letting Bob in — that echo is the
+    // signal that the server has processed the chat and pushed it
+    // into the backlog ring.
+    let mut ws_owner = join_session(&addr, &session_id, &owner_token).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    ws_owner
+        .send(chat_msg("hello from alice before bob joined"))
+        .await
+        .unwrap();
+    let _ = expect_json(&mut ws_owner, 5, |m| {
+        matches!(m, ServerMessage::PeerChat { .. })
+    })
+    .await;
+
+    // Bob joins after the chat was sent. The first SessionState frame
+    // he receives must carry the backlog so the chat panel renders the
+    // missed message instead of a blank room.
+    //
+    // Connect manually (rather than via `join_session`) so we can
+    // inspect that first SessionState ourselves — `join_session`
+    // consumes it internally.
+    let (op_token, _) = add_participant(&state, &session_id, "bob", Role::Operator).await;
+    let (mut ws_op, _) = connect_async(ws_url(&addr, &session_id)).await.unwrap();
+    ws_op
+        .send(session_join_msg(&session_id, &op_token))
+        .await
+        .unwrap();
+    let state_msg = expect_json(&mut ws_op, 5, |m| {
+        matches!(m, ServerMessage::SessionState { .. })
+    })
+    .await;
+    if let ServerMessage::SessionState { chat_history, .. } = state_msg {
+        assert_eq!(
+            chat_history.len(),
+            1,
+            "late joiner should see the one chat entry posted before they joined"
+        );
+        let entry = &chat_history[0];
+        assert_eq!(entry.user_id, owner_id);
+        assert_eq!(entry.name, "alice");
+        assert_eq!(entry.text, "hello from alice before bob joined");
+        assert!(!entry.ts.is_empty());
+    } else {
+        panic!("expected SessionState");
+    }
+
+    let _ = ws_owner.close(None).await;
+    let _ = ws_op.close(None).await;
+}
+
 // ─── Scenario 5: Session close disconnects all ──────────
 
 #[tokio::test]
