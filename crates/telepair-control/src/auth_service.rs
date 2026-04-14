@@ -136,6 +136,12 @@ impl AuthService {
         // rate-limit window, silently accept — same as already_registered
         // — so an attacker cannot distinguish "pending signup" from
         // "unknown email" via a 429 vs 2xx difference.
+        //
+        // This gate is per-email only. The complementary per-source-IP
+        // gate lives one layer up in the HTTP handler
+        // (`telepair_gateway::rate_limit::RegisterRateLimiter`) and
+        // catches the "one attacker, many emails" shape that would
+        // otherwise walk straight past this check.
         if let Some(last) = last_pending?
             && Utc::now() - last < Duration::seconds(OTP_RATE_LIMIT_SECS)
         {
@@ -246,11 +252,21 @@ impl AuthService {
     ///    all time" tally.
     ///
     /// Note that the `session_enabled` check does NOT happen here:
-    /// login still mints a token for an admin-disabled account so
-    /// the user can read history / change their password / etc., but
-    /// the HTTP `POST /api/sessions` and WS attach paths reject the
-    /// token whenever `session_enabled = FALSE`. Conflating the two
-    /// gates here would block a legitimate password reset flow.
+    /// login still mints a token for an admin-disabled account so the
+    /// user can read history / change their password / etc. Every
+    /// session-mutating surface enforces the bit on its own:
+    ///
+    /// - `POST /api/sessions`
+    /// - `POST /api/sessions/{id}/invites` (mint) and
+    ///   `DELETE /api/sessions/{id}/invites/{token}` (revoke)
+    /// - `POST /api/invite/redeem` (for authenticated callers; the
+    ///   anonymous guest path is unaffected since fresh guests are
+    ///   minted with `session_enabled = TRUE`)
+    /// - `PUT /api/sessions/{id}/participants/{user_id}/role`
+    /// - `GET /ws/session/{id}` (WS attach)
+    ///
+    /// Conflating the gate with login would block a legitimate
+    /// password reset flow.
     pub async fn login(&self, email: &str, password: &str) -> Result<String> {
         let email = email.to_lowercase();
         let email = email.as_str();
@@ -477,6 +493,56 @@ impl AuthService {
 
     pub async fn list_accounts_filtered(&self, filter: &AccountFilter) -> Result<(Vec<User>, i64)> {
         self.storage.list_accounts_filtered(filter).await
+    }
+
+    /// Provision a new password-login user directly from the admin
+    /// CLI. Validates the password, hashes it on a blocking thread,
+    /// and writes the `users` row with `approval_state = 'approved'`
+    /// so the new account can create sessions immediately without
+    /// admin review. Emits `auth.admin_user_created`. Returns the
+    /// created `User` and the freshly minted raw bearer token — the
+    /// CLI prints both once, same as the admin bootstrap path.
+    ///
+    /// This deliberately does NOT share `register` / `verify_otp`'s
+    /// enumeration-safe collapsing: the CLI operator wants real error
+    /// messages ("email already exists"), not silent 2xx. Conflict
+    /// errors propagate from the storage layer verbatim.
+    pub async fn admin_create_user(
+        &self,
+        email: &str,
+        name: &str,
+        password: &str,
+        is_admin: bool,
+        session_enabled: bool,
+    ) -> Result<(User, String)> {
+        validate_password(password)?;
+
+        let password_owned = password.to_owned();
+        let hash = tokio::task::spawn_blocking(move || hash_password(&password_owned))
+            .await
+            .map_err(|_| Error::Internal("hash task panicked".into()))??;
+
+        let email_norm = email.to_lowercase();
+        let (user, token) = self
+            .storage
+            .admin_create_password_user(&email_norm, name, &hash, is_admin, session_enabled)
+            .await?;
+
+        self.audit
+            .record(
+                AuditEvent::new(AuditEventType::AuthAdminUserCreated).with_detail(
+                    serde_json::json!({
+                        "target_user_id": user.id.to_string(),
+                        "target_user_name": user.name,
+                        "email": email_norm,
+                        "is_admin": is_admin,
+                        "session_enabled": session_enabled,
+                    }),
+                ),
+            )
+            .await;
+
+        Ok((user, token))
     }
 
     /// Flip `session_enabled` on the target row and emit the
@@ -890,5 +956,72 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn admin_create_user_lowercases_email_and_audits() {
+        let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+        let audit = make_audit(storage.clone());
+        let svc = AuthService::new(storage.clone(), None, audit);
+
+        let (user, token) = svc
+            .admin_create_user("Carol@Example.COM", "carol", "hunter2a", false, true)
+            .await
+            .expect("admin_create_user must succeed");
+
+        assert_eq!(user.email.as_deref(), Some("carol@example.com"));
+        assert!(!token.is_empty());
+        assert!(user.session_enabled);
+        // Login round-trip with the chosen password must work.
+        let login_token = svc
+            .login("carol@example.com", "hunter2a")
+            .await
+            .expect("login with new credentials");
+        assert!(!login_token.is_empty());
+        // And an audit row landed.
+        let rows = AuditSink::new(storage)
+            .query(AuditFilter::default())
+            .await
+            .unwrap();
+        assert!(
+            rows.iter()
+                .any(|e| e.event_type == AuditEventType::AuthAdminUserCreated),
+            "audit log should contain AuthAdminUserCreated: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_create_user_rejects_short_password() {
+        let svc = make_service_no_smtp().await;
+        let err = svc
+            .admin_create_user("x@y.com", "x", "short", false, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn admin_create_user_duplicate_email_conflicts() {
+        let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+        let audit = make_audit(storage.clone());
+        let svc = AuthService::new(storage, None, audit);
+        svc.admin_create_user("a@b.com", "alice", "hunter2a", false, true)
+            .await
+            .unwrap();
+        let err = svc
+            .admin_create_user("a@b.com", "alice2", "hunter2a", false, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Conflict(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn admin_create_user_respects_no_session() {
+        let svc = make_service_no_smtp().await;
+        let (user, _) = svc
+            .admin_create_user("p@q.com", "p", "hunter2a", false, false)
+            .await
+            .unwrap();
+        assert!(!user.session_enabled);
     }
 }

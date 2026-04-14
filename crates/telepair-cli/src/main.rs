@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -7,11 +9,11 @@ use tracing_subscriber::EnvFilter;
 use chrono::{DateTime, Duration, Utc};
 
 use telepair_agent::virtual_target::TargetEngine;
-use telepair_control::auth_service::SmtpConfig;
+use telepair_control::auth_service::{AuthService, SmtpConfig};
 use telepair_control::session_service::SessionService;
 use telepair_core::audit::{AuditEvent, AuditEventType, AuditFilter, AuditSink};
 use telepair_core::auth::TokenAuthProvider;
-use telepair_core::session::CloseReason;
+use telepair_core::session::{CloseReason, User};
 use telepair_core::storage::{SqliteStorage, Storage};
 use telepair_gateway::state::AppState;
 
@@ -101,6 +103,69 @@ enum AdminCommand {
     ShowToken,
     /// Query the append-only audit log
     Audit(AuditArgs),
+    /// Manage password-login user accounts (create / list / enable / disable).
+    /// Useful on single-node installs without SMTP, where self-served
+    /// registration is unavailable.
+    Users {
+        #[command(subcommand)]
+        cmd: UsersCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum UsersCommand {
+    /// Provision a new user directly, bypassing the OTP flow. The account
+    /// is created as `approved` so the user can log in immediately. Prints
+    /// the freshly minted bearer token to stderr; if no password is
+    /// supplied a random one is generated and printed too.
+    Create(CreateUserArgs),
+    /// List non-guest accounts (newest first).
+    List,
+    /// Flip `session_enabled = TRUE` on the target account. Accepts the
+    /// user's email (case-insensitive) or raw UUID.
+    Enable {
+        /// User email or UUID.
+        user: String,
+    },
+    /// Flip `session_enabled = FALSE` on the target account. Accepts the
+    /// user's email (case-insensitive) or raw UUID.
+    Disable {
+        /// User email or UUID.
+        user: String,
+    },
+}
+
+#[derive(clap::Args, Debug)]
+struct CreateUserArgs {
+    /// Email address (login identifier). Lowercased before insert.
+    #[arg(long)]
+    email: String,
+
+    /// Display name. Defaults to the email's local part.
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Read the password from this file (one line, trailing whitespace
+    /// stripped). Mutually exclusive with `--password`; if neither is set
+    /// a random 16-character password is generated and printed once.
+    #[arg(long, conflicts_with = "password")]
+    password_file: Option<PathBuf>,
+
+    /// Password supplied inline. Prefer `--password-file` to keep the
+    /// value out of shell history; this flag exists for scripted runs
+    /// where the caller has already secured the input channel.
+    #[arg(long)]
+    password: Option<String>,
+
+    /// Mark the account as an admin. Defaults to false — admins should be
+    /// a deliberate, rare choice.
+    #[arg(long, default_value_t = false)]
+    admin: bool,
+
+    /// Create the account with `session_enabled = FALSE`. Useful for
+    /// pre-provisioning an account an operator will enable later.
+    #[arg(long, default_value_t = false)]
+    no_session: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -187,10 +252,10 @@ fn data_dir() -> PathBuf {
         .join(".telepair")
 }
 
-async fn run_admin_command(cmd: AdminCommand) -> anyhow::Result<()> {
+async fn run_admin_command(cmd: AdminCommand, data_dir: &std::path::Path) -> anyhow::Result<()> {
     match cmd {
         AdminCommand::ShowToken => {
-            let token_file = data_dir().join("admin_token");
+            let token_file = data_dir.join("admin_token");
             if !token_file.exists() {
                 anyhow::bail!(
                     "admin token file not found at {}\n\
@@ -208,20 +273,188 @@ async fn run_admin_command(cmd: AdminCommand) -> anyhow::Result<()> {
             println!("{token}");
             Ok(())
         }
-        AdminCommand::Audit(args) => run_audit_command(args).await,
+        AdminCommand::Audit(args) => run_audit_command(args, data_dir).await,
+        AdminCommand::Users { cmd } => run_users_command(cmd, data_dir).await,
     }
 }
 
-async fn run_audit_command(args: AuditArgs) -> anyhow::Result<()> {
+async fn open_storage(data_dir: &std::path::Path) -> anyhow::Result<Arc<SqliteStorage>> {
+    std::fs::create_dir_all(data_dir)?;
+    let db_path = data_dir.join("telepair.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+    Ok(Arc::new(SqliteStorage::new(&db_url).await?))
+}
+
+/// Resolve a `--user` CLI argument (email or UUID) to a concrete
+/// [`User`] row. Unknown values are a hard error — otherwise a typo
+/// silently returns zero rows and the operator thinks nothing happened.
+async fn resolve_user(storage: &SqliteStorage, raw: &str) -> anyhow::Result<User> {
+    if let Ok(uuid) = uuid::Uuid::parse_str(raw) {
+        return storage
+            .find_user_by_id(uuid)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no user with id {uuid}"));
+    }
+    let email = raw.to_lowercase();
+    storage
+        .get_user_by_email(&email)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no user with email '{raw}' (or raw UUID)"))
+}
+
+async fn run_users_command(cmd: UsersCommand, data_dir: &std::path::Path) -> anyhow::Result<()> {
+    let storage = open_storage(data_dir).await?;
+    match cmd {
+        UsersCommand::Create(args) => run_users_create(args, storage).await,
+        UsersCommand::List => run_users_list(storage).await,
+        UsersCommand::Enable { user } => run_users_set_enabled(user, true, storage).await,
+        UsersCommand::Disable { user } => run_users_set_enabled(user, false, storage).await,
+    }
+}
+
+async fn run_users_create(args: CreateUserArgs, storage: Arc<SqliteStorage>) -> anyhow::Result<()> {
+    let email = args.email.trim().to_lowercase();
+    if email.is_empty() || !email.contains('@') {
+        anyhow::bail!("--email must be a non-empty address containing '@'");
+    }
+
+    let display_name = match args.name {
+        Some(n) => {
+            let n = n.trim().to_owned();
+            if n.is_empty() {
+                anyhow::bail!("--name, if provided, must be non-empty");
+            }
+            n
+        }
+        None => email
+            .split('@')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_owned())
+            .ok_or_else(|| anyhow::anyhow!("cannot derive display name from email '{email}'"))?,
+    };
+
+    // Password resolution: --password-file → file, --password → inline,
+    // otherwise generate a 16-char nanoid. The generated case mirrors the
+    // admin-token bootstrap: print once to stderr so the operator can
+    // hand it off, and never persist it.
+    let (password, generated) = match (args.password_file, args.password) {
+        (Some(path), _) => {
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("read --password-file {}: {e}", path.display()))?;
+            let trimmed = raw.trim_end_matches(['\n', '\r']).to_owned();
+            if trimmed.is_empty() {
+                anyhow::bail!("--password-file {} is empty", path.display());
+            }
+            (trimmed, false)
+        }
+        (None, Some(p)) => {
+            if p.is_empty() {
+                anyhow::bail!("--password must be non-empty");
+            }
+            (p, false)
+        }
+        (None, None) => (nanoid::nanoid!(16), true),
+    };
+
+    let audit = Arc::new(AuditSink::new(storage.clone()));
+    let auth = AuthService::new(storage.clone(), None, audit);
+    let session_enabled = !args.no_session;
+    let (user, token) = auth
+        .admin_create_user(
+            &email,
+            &display_name,
+            &password,
+            args.admin,
+            session_enabled,
+        )
+        .await?;
+
+    println!("Created user:");
+    println!("  id            : {}", user.id);
+    println!("  name          : {}", user.name);
+    println!("  email         : {}", user.email.as_deref().unwrap_or("-"));
+    println!("  admin         : {}", user.is_admin);
+    println!("  session_enabled: {}", user.session_enabled);
+
+    eprintln!();
+    eprintln!("Bearer token (save — it will not be shown again):");
+    eprintln!("  {token}");
+    if generated {
+        eprintln!();
+        eprintln!("Generated password (save — it will not be shown again):");
+        eprintln!("  {password}");
+    }
+    Ok(())
+}
+
+async fn run_users_list(storage: Arc<SqliteStorage>) -> anyhow::Result<()> {
+    let users = storage.list_accounts().await?;
+    if users.is_empty() {
+        println!("no accounts (not counting invite-minted scoped guests)");
+        return Ok(());
+    }
+    const NAME_W: usize = 20;
+    const EMAIL_W: usize = 28;
+    println!(
+        "{:<NAME_W$}  {:<EMAIL_W$}  {:<5}  {:<8}  state",
+        "name", "email", "admin", "session",
+    );
+    for u in users {
+        println!(
+            "{:<NAME_W$}  {:<EMAIL_W$}  {:<5}  {:<8}  {}",
+            truncate(&u.name, NAME_W),
+            truncate(u.email.as_deref().unwrap_or("-"), EMAIL_W),
+            if u.is_admin { "yes" } else { "no" },
+            if u.session_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            u.approval_state.as_str(),
+        );
+    }
+    Ok(())
+}
+
+async fn run_users_set_enabled(
+    raw: String,
+    enabled: bool,
+    storage: Arc<SqliteStorage>,
+) -> anyhow::Result<()> {
+    let user = resolve_user(&storage, &raw).await?;
+    if user.session_enabled == enabled {
+        println!(
+            "user {} already {} — no change",
+            user.name,
+            if enabled { "enabled" } else { "disabled" }
+        );
+        return Ok(());
+    }
+    let audit = Arc::new(AuditSink::new(storage.clone()));
+    let auth = AuthService::new(storage.clone(), None, audit);
+    // CLI has no authenticated admin identity; reuse the user's own row
+    // as actor so the audit trail at least names the target. The bulk
+    // "who ran the CLI" context lives in the shell history.
+    let updated = auth
+        .set_session_access(user.id, &user.name, user.id, enabled)
+        .await?;
+    println!(
+        "user {} -> session_enabled = {}",
+        updated.name, updated.session_enabled
+    );
+    Ok(())
+}
+
+async fn run_audit_command(args: AuditArgs, data_dir: &std::path::Path) -> anyhow::Result<()> {
     // Open the DB in the same shape the server does so the CLI sees
     // exactly the rows the running process writes. Use `mode=rwc` so
     // operators running `telepair admin audit` against a cold machine
     // get a clear "nothing happened yet" instead of a connection error;
     // `mode=rwc` fails if the parent directory is missing so we mkdir
     // it ourselves, same as the server startup path.
-    let dir = data_dir();
-    std::fs::create_dir_all(&dir)?;
-    let db_path = dir.join("telepair.db");
+    std::fs::create_dir_all(data_dir)?;
+    let db_path = data_dir.join("telepair.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
     let storage = Arc::new(SqliteStorage::new(&db_url).await?);
 
@@ -362,7 +595,7 @@ async fn main() -> anyhow::Result<()> {
     // startup path stays untouched.
     if let Some(command) = cli.command {
         return match command {
-            Command::Admin { cmd } => run_admin_command(cmd).await,
+            Command::Admin { cmd } => run_admin_command(cmd, &data_dir()).await,
         };
     }
 
@@ -519,12 +752,23 @@ async fn main() -> anyhow::Result<()> {
         if let Some(dir) = &cli.web_dir {
             tracing::info!("serving web frontend from {}", dir.display());
         }
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async {
-                tokio::signal::ctrl_c().await.ok();
-                tracing::info!("shutting down gracefully...");
-            })
-            .await?;
+        // `into_make_service_with_connect_info::<SocketAddr>` is what
+        // makes the `ConnectInfo` extractor in `http::register`
+        // actually populate — without it the per-IP rate limiter
+        // silently degrades to "no limit" because every call sees
+        // `ConnectInfo = None`. Keep this wired even if the register
+        // surface is later moved behind a reverse proxy: the proxy
+        // is then the addr, which is still a useful shape of IP to
+        // throttle (better than global no-op).
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c().await.ok();
+            tracing::info!("shutting down gracefully...");
+        })
+        .await?;
     } else {
         tracing::info!("no gateway role — running headless");
         // In a future cluster mode, agent/control-only instances would
@@ -549,8 +793,6 @@ mod tests {
 
     #[test]
     fn parse_last_window_rejects_garbage() {
-        // Empty, missing unit, unknown unit, compound form, zero/negative
-        // — all of these must error rather than silently reinterpret.
         assert!(parse_last_window("").is_err());
         assert!(parse_last_window("42").is_err());
         assert!(parse_last_window("42y").is_err());
@@ -563,5 +805,266 @@ mod tests {
     #[test]
     fn parse_last_window_trims_whitespace() {
         assert_eq!(parse_last_window("  2h  ").unwrap(), Duration::hours(2));
+    }
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string_adds_ellipsis() {
+        let result = truncate("abcdefghij", 5);
+        assert_eq!(result.chars().count(), 5);
+        assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_exact_length_unchanged() {
+        assert_eq!(truncate("abc", 3), "abc");
+    }
+
+    fn audit_args() -> AuditArgs {
+        AuditArgs {
+            last: Some("1h".into()),
+            since: None,
+            until: None,
+            session: None,
+            actor: None,
+            event_types: vec![],
+            limit: 5,
+            format: AuditFormat::Table,
+        }
+    }
+
+    #[tokio::test]
+    async fn show_token_missing_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = run_admin_command(AdminCommand::ShowToken, dir.path()).await;
+        let err = result.expect_err("missing admin_token must error");
+        assert!(
+            err.to_string().contains("admin token file not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn show_token_empty_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("admin_token"), "   \n").unwrap();
+        let err = run_admin_command(AdminCommand::ShowToken, dir.path())
+            .await
+            .expect_err("empty admin_token must error");
+        assert!(err.to_string().contains("empty"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn audit_command_with_bad_actor_name_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = AuditArgs {
+            actor: Some("nonexistent-user-xyz-12345".into()),
+            ..audit_args()
+        };
+        let err = run_audit_command(args, dir.path())
+            .await
+            .expect_err("unknown actor must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nonexistent-user-xyz-12345"),
+            "error must mention the bad actor name, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_command_with_bad_event_type_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = AuditArgs {
+            event_types: vec!["invalid.event.type".into()],
+            ..audit_args()
+        };
+        let err = run_audit_command(args, dir.path())
+            .await
+            .expect_err("unknown event type must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid.event.type"),
+            "error must mention the bad event type, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_command_json_format_on_empty_db_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = AuditArgs {
+            format: AuditFormat::Json,
+            ..audit_args()
+        };
+        run_audit_command(args, dir.path())
+            .await
+            .expect("empty isolated DB must succeed");
+    }
+
+    #[tokio::test]
+    async fn audit_command_table_format_on_empty_db_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        run_audit_command(audit_args(), dir.path())
+            .await
+            .expect("empty isolated DB must succeed");
+    }
+
+    // ── Admin users CLI ──────────────────────────────────────────────
+
+    fn create_args(email: &str, password: Option<&str>) -> CreateUserArgs {
+        CreateUserArgs {
+            email: email.into(),
+            name: None,
+            password_file: None,
+            password: password.map(|s| s.into()),
+            admin: false,
+            no_session: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn users_create_persists_account_and_allows_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        run_users_command(
+            UsersCommand::Create(create_args("dev@example.com", Some("hunter2a"))),
+            dir.path(),
+        )
+        .await
+        .expect("create must succeed");
+
+        // Listing should surface the freshly-created account.
+        run_users_command(UsersCommand::List, dir.path())
+            .await
+            .expect("list must succeed");
+
+        // Second attempt with the same email is a conflict.
+        let err = run_users_command(
+            UsersCommand::Create(create_args("dev@example.com", Some("hunter2a"))),
+            dir.path(),
+        )
+        .await
+        .expect_err("duplicate email must error");
+        assert!(
+            err.to_string().to_lowercase().contains("already exists"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn users_create_rejects_invalid_email() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run_users_command(
+            UsersCommand::Create(create_args("not-an-email", Some("hunter2a"))),
+            dir.path(),
+        )
+        .await
+        .expect_err("missing '@' must error");
+        assert!(err.to_string().contains("@"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn users_create_uses_password_file_when_supplied() {
+        let dir = tempfile::tempdir().unwrap();
+        let pw_path = dir.path().join("pw.txt");
+        std::fs::write(&pw_path, "file-pass-1\n").unwrap();
+        let args = CreateUserArgs {
+            email: "filed@example.com".into(),
+            name: Some("filed".into()),
+            password_file: Some(pw_path),
+            password: None,
+            admin: false,
+            no_session: false,
+        };
+        run_users_command(UsersCommand::Create(args), dir.path())
+            .await
+            .expect("password-file path must succeed");
+
+        // Trimmed password should authenticate via AuthService::login.
+        let storage = open_storage(dir.path()).await.unwrap();
+        let audit = Arc::new(AuditSink::new(storage.clone()));
+        let svc = AuthService::new(storage, None, audit);
+        svc.login("filed@example.com", "file-pass-1")
+            .await
+            .expect("login with the file-sourced password");
+    }
+
+    #[tokio::test]
+    async fn users_create_empty_password_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let pw_path = dir.path().join("empty.txt");
+        std::fs::write(&pw_path, "\n").unwrap();
+        let args = CreateUserArgs {
+            email: "e@example.com".into(),
+            name: None,
+            password_file: Some(pw_path),
+            password: None,
+            admin: false,
+            no_session: false,
+        };
+        let err = run_users_command(UsersCommand::Create(args), dir.path())
+            .await
+            .expect_err("empty password-file must error");
+        assert!(err.to_string().contains("empty"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn users_enable_disable_flips_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        run_users_command(
+            UsersCommand::Create(create_args("toggle@example.com", Some("hunter2a"))),
+            dir.path(),
+        )
+        .await
+        .unwrap();
+
+        run_users_command(
+            UsersCommand::Disable {
+                user: "toggle@example.com".into(),
+            },
+            dir.path(),
+        )
+        .await
+        .expect("disable must succeed");
+
+        let storage = open_storage(dir.path()).await.unwrap();
+        let user = storage
+            .get_user_by_email("toggle@example.com")
+            .await
+            .unwrap()
+            .expect("user must exist");
+        assert!(!user.session_enabled, "disable should clear the bit");
+
+        run_users_command(
+            UsersCommand::Enable {
+                user: "toggle@example.com".into(),
+            },
+            dir.path(),
+        )
+        .await
+        .unwrap();
+
+        let user = storage
+            .get_user_by_email("toggle@example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(user.session_enabled, "enable should restore the bit");
+    }
+
+    #[tokio::test]
+    async fn users_enable_unknown_user_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run_users_command(
+            UsersCommand::Enable {
+                user: "nobody@example.com".into(),
+            },
+            dir.path(),
+        )
+        .await
+        .expect_err("unknown user must error");
+        assert!(err.to_string().contains("nobody@example.com"), "got: {err}");
     }
 }

@@ -1673,6 +1673,62 @@ impl Storage for SqliteStorage {
         row.map(|r| row_to_user(&r)).transpose()
     }
 
+    async fn admin_create_password_user(
+        &self,
+        email: &str,
+        name: &str,
+        password_hash: &str,
+        is_admin: bool,
+        session_enabled: bool,
+    ) -> Result<(User, String)> {
+        let id = Uuid::new_v4();
+        let (token, sha256_hex) = generate_token();
+        let now = Utc::now();
+        let now_str = rfc3339(now);
+
+        sqlx::query(
+            "INSERT INTO users \
+               (id, name, token_sha256, is_admin, scoped_session_id, \
+                email, password_hash, verified, session_enabled, \
+                approval_state, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, NULL, ?, ?, TRUE, ?, 'approved', ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(name)
+        .bind(&sha256_hex)
+        .bind(is_admin)
+        .bind(email)
+        .bind(password_hash)
+        .bind(session_enabled)
+        .bind(&now_str)
+        .bind(&now_str)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(ref db) = e
+                && db.is_unique_violation()
+            {
+                return Error::Conflict(format!(
+                    "a user with name '{name}' or email '{email}' already exists"
+                ));
+            }
+            Error::Storage(e)
+        })?;
+
+        let user = User {
+            id,
+            name: name.into(),
+            is_admin,
+            scoped_session_id: None,
+            email: Some(email.to_string()),
+            session_enabled,
+            approval_state: ApprovalState::Approved,
+            created_at: now,
+            updated_at: now,
+        };
+        Ok((user, token))
+    }
+
     // ── Admin user management ─────────────────────────────────────────────
 
     async fn list_accounts(&self) -> Result<Vec<User>> {
@@ -2616,6 +2672,68 @@ mod tests {
         assert_eq!(state_of(active_id).await, "approved");
         assert_eq!(state_of(admin_id).await, "approved");
         assert_eq!(state_of(guest_id).await, "approved");
+    }
+
+    #[tokio::test]
+    async fn admin_create_password_user_writes_approved_row() {
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let (user, token) = s
+            .admin_create_password_user("alice@example.com", "alice", "hash", false, true)
+            .await
+            .unwrap();
+        assert_eq!(user.name, "alice");
+        assert_eq!(user.email.as_deref(), Some("alice@example.com"));
+        assert!(user.session_enabled);
+        assert!(!user.is_admin);
+        assert_eq!(user.approval_state, ApprovalState::Approved);
+        assert!(!token.is_empty());
+        // Token round-trips through validate_token.
+        let resolved = s.validate_token(&token).await.unwrap();
+        assert_eq!(resolved.id, user.id);
+        // Password hash lands on the row.
+        let hash = s.get_password_hash(user.id).await.unwrap();
+        assert_eq!(hash.as_deref(), Some("hash"));
+    }
+
+    #[tokio::test]
+    async fn admin_create_password_user_respects_session_enabled_false() {
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let (user, _) = s
+            .admin_create_password_user("bob@example.com", "bob", "h", false, false)
+            .await
+            .unwrap();
+        assert!(!user.session_enabled);
+        assert_eq!(user.approval_state, ApprovalState::Approved);
+    }
+
+    #[tokio::test]
+    async fn admin_create_password_user_admin_flag_sticks() {
+        let s = SqliteStorage::new_memory().await.unwrap();
+        let (user, _) = s
+            .admin_create_password_user("root@example.com", "root", "h", true, true)
+            .await
+            .unwrap();
+        assert!(user.is_admin);
+    }
+
+    #[tokio::test]
+    async fn admin_create_password_user_duplicate_is_conflict() {
+        let s = SqliteStorage::new_memory().await.unwrap();
+        s.admin_create_password_user("a@example.com", "alice", "h", false, true)
+            .await
+            .unwrap();
+        // Same email, different name → still a conflict.
+        let err = s
+            .admin_create_password_user("a@example.com", "alice2", "h", false, true)
+            .await
+            .expect_err("duplicate email must error");
+        assert!(matches!(err, Error::Conflict(_)), "got {err:?}");
+        // Same name, different email → also a conflict (name UNIQUE).
+        let err = s
+            .admin_create_password_user("b@example.com", "alice", "h", false, true)
+            .await
+            .expect_err("duplicate name must error");
+        assert!(matches!(err, Error::Conflict(_)), "got {err:?}");
     }
 
     #[tokio::test]
