@@ -212,21 +212,51 @@ impl SessionService {
     /// - `user.is_admin == false` → the user-scoped variant, i.e.
     ///   only rows they owned or participated in.
     ///
-    /// Guest/scoped tokens are still non-admin by construction
-    /// (see `User::is_guest`), so a guest calling this method sees
-    /// only their own session. The gateway continues to enforce
-    /// `require_unscoped` separately on handlers that must reject
-    /// guests entirely; this method is safe to expose to everyone.
+    /// Guest/scoped tokens take a dedicated path that filters on the
+    /// scoped session id only. The participant-row-based query is a
+    /// *correct* filter for guests today, but it answers "which
+    /// sessions am I a participant of" and trusts that invariant end
+    /// to end. Scoping on `scoped_session_id` instead is a narrower
+    /// statement — "the single session this credential was minted
+    /// for" — so it holds even if a future code path accidentally
+    /// creates a second participant row for a guest. The gateway
+    /// continues to enforce `require_unscoped` separately on
+    /// handlers that must reject guests entirely; this method is
+    /// safe to expose to everyone.
     pub async fn list_sessions_visible_to(
         &self,
         user: &User,
         filter: SessionListFilter,
     ) -> Result<Vec<Session>> {
         if user.is_admin {
-            self.storage.list_all_sessions(filter).await
-        } else {
-            self.storage.list_sessions_for_user(user.id, filter).await
+            return self.storage.list_all_sessions(filter).await;
         }
+        if let Some(scoped_id) = user.scoped_session_id.as_deref() {
+            // A guest can only ever see their one session. Fetch it
+            // directly and apply the same predicates the storage
+            // queries apply so status/target_name filters behave the
+            // same as they do for unscoped users. An `Option::None`
+            // (session was closed and pruned) collapses to an empty
+            // list; legit UX because the credential outlives nothing.
+            let Some(session) = self.storage.get_session(scoped_id).await? else {
+                return Ok(Vec::new());
+            };
+            if filter
+                .status
+                .is_some_and(|s| session.status.as_str() != s.as_str())
+            {
+                return Ok(Vec::new());
+            }
+            if filter
+                .target_name
+                .as_deref()
+                .is_some_and(|t| session.target_name != t)
+            {
+                return Ok(Vec::new());
+            }
+            return Ok(vec![session]);
+        }
+        self.storage.list_sessions_for_user(user.id, filter).await
     }
 
     /// Count how many sessions are marked `status='active'` in the

@@ -993,6 +993,47 @@ async fn list_sessions_only_shows_own_sessions() {
 }
 
 #[tokio::test]
+async fn guest_token_only_sees_its_own_session_on_list() {
+    // F5-q1 regression: a scoped guest minted via invite redemption
+    // must only see the session they were invited to when they call
+    // `GET /api/sessions`. The QA run observed a guest token listing
+    // a session they had no participant row for — this test locks
+    // down that a guest's view is the intersection of "sessions I
+    // joined" and "everything", even when other sessions exist.
+    //
+    // Anchor setup: two independent owners, two sessions. The guest
+    // is only invited into `session_a`; `session_b` must never leak.
+    let (state, app, owner_a_token) = setup().await;
+    let owner_b_token = state.create_test_user("owner_b").await;
+
+    let session_a = create_session(&app, &owner_a_token).await;
+    let session_b = create_session(&app, &owner_b_token).await;
+
+    let raw_invite = mint_invite(&app, &owner_a_token, &session_a).await;
+    let guest_token = anonymous_redeem(&app, &raw_invite).await;
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/sessions")
+                .header("Authorization", format!("Bearer {guest_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let sessions: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+    let ids: Vec<&str> = sessions.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec![session_a.as_str()]);
+    assert!(
+        !ids.iter().any(|id| *id == session_b),
+        "guest must not see session_b in the list"
+    );
+}
+
+#[tokio::test]
 async fn redeem_exhausted_invite_rejected() {
     let (state, app, owner_token) = setup().await;
     let session_id = create_session(&app, &owner_token).await;
