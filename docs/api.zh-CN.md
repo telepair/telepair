@@ -706,6 +706,15 @@ engine —— 整个过程没有锁窗口。
 
 成功时会发一条 `target.reloaded` 的审计事件,detail 里带 `{path, targets}`。
 
+**请求体**(可选)
+```json
+{ "expected_sha256": "<来自前置 validate 响应的 hex sha-256>" }
+```
+
+带上这个字段时,服务器会再次读取磁盘并比对哈希,如果文件在 validate→confirm
+之间被改动,会以 `409` 拒绝重载。这关闭了"预览 A、实际应用 B"的 TOCTOU 窗口。
+CLI 等不做预览的调用方可以省略 body 以跳过该保护。
+
 **响应** `200 OK`
 ```json
 {
@@ -723,6 +732,7 @@ engine —— 整个过程没有锁窗口。
 - `400 Bad Request`,body 为 `{ "reason": "no_targets_path", "message": "..." }` —— 服务器启动时没有配置 `targets.yaml` 路径,没有东西可以重载。旧 engine 保持不动。
 - `400 Bad Request`,body 为 `{ "reason": "parse_error", "message": "...", "path": "..." }` —— 磁盘上的文件当前不合法。旧 engine 保持不动,`message` 原样带上 parse 错误,方便管理员修复 yaml。
 - `400 Bad Request`,body 为 `{ "reason": "still_referenced", "message": "...", "targets": [{ "target": "...", "active_sessions": N }, ...] }` —— 新的 `targets.yaml` 会删掉仍有活跃会话的 target。旧 engine 保持不动,`targets` 数组精确列出哪些 target 正在阻塞重载以及各自的活跃会话数,管理员可以先关掉这些会话(或在 yaml 中恢复 target)再重试。admin 页面会把它渲染为常驻的 banner,而不是一闪而过的 toast。
+- `409 Conflict`,body 为 `{ "reason": "file_changed", "message": "...", "expected_sha256": "...", "actual_sha256": "..." }` —— 调用方带上了 `expected_sha256`,但磁盘当前字节哈希与之不符。旧 engine 保持不动;管理员需要重新 validate 后再重试。
 - `401 Unauthorized` —— token 缺失或无效
 - `403 Forbidden` —— 调用方已认证但不是管理员
 

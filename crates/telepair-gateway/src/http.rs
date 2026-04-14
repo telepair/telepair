@@ -6,6 +6,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use telepair_control::invite_service::CreateInviteParams;
 use telepair_control::user_target_service::{CreateTargetParams, UpdateTargetParams};
@@ -970,12 +971,37 @@ pub async fn list_admin_targets(
 /// - 200: swap succeeded; response carries the new target count
 ///   and the absolute path that was re-read, and an audit event
 ///   (`target.reloaded`) is emitted with the same payload.
+#[derive(Debug, Default, Deserialize)]
+pub struct ReloadTargetsBody {
+    /// Hex SHA-256 of the `targets.yaml` bytes as seen by a preceding
+    /// `/api/admin/targets/validate`. When present, the server reads
+    /// the file a second time, hashes it, and refuses the reload with
+    /// `reason: "file_changed"` if the hash has drifted — the admin
+    /// approved diff A, we will not apply diff B. Omit to opt out
+    /// (legacy CLI callers with no preview step).
+    #[serde(default)]
+    pub expected_sha256: Option<String>,
+}
+
 pub async fn reload_targets(
     State(state): State<AppState>,
     headers: HeaderMap,
+    body: Result<Json<ReloadTargetsBody>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = extract_user(&state, &headers).await?;
     require_admin(&user)?;
+
+    // The legacy CLI caller posts no body; only reject when a body
+    // *was* provided but failed to parse. `MissingJsonContentType`
+    // and `BytesRejection` both surface on no-body requests and are
+    // treated as "opt out of the sha guard".
+    let ReloadTargetsBody { expected_sha256 } = match body {
+        Ok(Json(b)) => b,
+        Err(JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_)) => {
+            return Err(ApiError(StatusCode::BAD_REQUEST));
+        }
+        Err(_) => ReloadTargetsBody::default(),
+    };
 
     let Some(path) = state.targets_path.clone() else {
         // No configured targets file — nothing to reload. 400 so
@@ -992,12 +1018,20 @@ pub async fn reload_targets(
     };
 
     // Parse in a blocking context so a pathologically large yaml
-    // doesn't stall the tokio worker. `TargetEngine::from_file` reads
-    // the file synchronously; spawn_blocking keeps the runtime healthy.
+    // doesn't stall the tokio worker. The closure also returns the
+    // hex SHA-256 of the raw bytes so we can compare against the
+    // `expected_sha256` the admin previewed before applying. Reading
+    // the file twice (here and in `from_file`) is an acceptable cost
+    // for closing the validate→reload TOCTOU: a second admin racing
+    // `targets.yaml` between preview and confirm now gets rejected
+    // instead of silently applying an un-reviewed diff.
     let path_for_blocking = path.clone();
-    let parse_result = tokio::task::spawn_blocking(move || {
-        telepair_agent::virtual_target::TargetEngine::from_file(&path_for_blocking)
-            .map_err(|e| e.to_string())
+    let parse_result = tokio::task::spawn_blocking(move || -> Result<_, String> {
+        let bytes = std::fs::read(&path_for_blocking).map_err(|e| e.to_string())?;
+        let sha = hex_sha256(&bytes);
+        let engine = telepair_agent::virtual_target::TargetEngine::from_file(&path_for_blocking)
+            .map_err(|e| e.to_string())?;
+        Ok((engine, sha))
     })
     .await
     .map_err(|e| {
@@ -1005,8 +1039,8 @@ pub async fn reload_targets(
         ApiError(StatusCode::INTERNAL_SERVER_ERROR)
     })?;
 
-    let new_engine = match parse_result {
-        Ok(engine) => engine,
+    let (new_engine, file_sha256) = match parse_result {
+        Ok(pair) => pair,
         Err(err_msg) => {
             // Old engine stays loaded — `ArcSwap::store` is the only
             // site that replaces the pointer, and we haven't called
@@ -1027,6 +1061,33 @@ pub async fn reload_targets(
             ));
         }
     };
+
+    // TOCTOU guard: if the caller previewed a specific file version
+    // through validate, reject when the on-disk bytes no longer match.
+    // The admin must re-run validate so the confirm dialog reflects
+    // the current file. Case-insensitive because the wire value is
+    // hex and some clients uppercase it.
+    if let Some(expected) = expected_sha256.as_deref()
+        && !expected.eq_ignore_ascii_case(&file_sha256)
+    {
+        tracing::warn!(
+            path = %path.display(),
+            actor = %user.name,
+            expected = %expected,
+            actual = %file_sha256,
+            "targets reload: rejected — file changed since validate"
+        );
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "reason": "file_changed",
+                "message": "targets.yaml changed since validate; \
+                            re-run validate before reloading",
+                "expected_sha256": expected,
+                "actual_sha256": file_sha256,
+            })),
+        ));
+    }
 
     // Refuse to drop or rename a target that still has a **live**
     // session referencing it by name. Without this guard a reload
@@ -1120,6 +1181,96 @@ pub async fn reload_targets(
             "targets": new_count,
         })),
     ))
+}
+
+/// `POST /api/admin/targets/validate`
+///
+/// Parse `targets.yaml` from disk and diff it against the in-memory engine
+/// without applying any changes. Admin-only, read-only, safe to call at any
+/// time. Useful for previewing what a subsequent `reload` would do.
+///
+/// Response shape:
+/// - `valid: false` + `errors: [...]`: file is missing or unparseable; no
+///   diff is produced.
+/// - `valid: true` + `diff: {...}`: diff between current engine and the file
+///   on disk. `blocked` lists removed targets that have active sessions —
+///   a reload would fail for these, but validate does NOT block on them.
+pub async fn validate_targets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    require_admin(&user)?;
+
+    let Some(path) = state.targets_path.clone() else {
+        return Ok(Json(serde_json::json!({
+            "valid": false,
+            "errors": ["No targets.yaml path configured. Start telepair with a targets file."],
+        })));
+    };
+
+    let path_clone = path.clone();
+    let parse_result = tokio::task::spawn_blocking(move || -> Result<_, String> {
+        let bytes = std::fs::read(&path_clone).map_err(|e| e.to_string())?;
+        let sha = hex_sha256(&bytes);
+        let engine = telepair_agent::virtual_target::TargetEngine::from_file(&path_clone)
+            .map_err(|e| e.to_string())?;
+        Ok((engine, sha))
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "targets validate: spawn_blocking join error");
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR)
+    })?;
+
+    let (new_engine, expected_sha256) = match parse_result {
+        Ok(pair) => pair,
+        Err(err) => {
+            return Ok(Json(serde_json::json!({
+                "valid": false,
+                "errors": [err],
+            })));
+        }
+    };
+
+    let current_engine = state.targets.load();
+    let diff = current_engine.diff(&new_engine);
+
+    // Check for blocked removals (targets with active sessions)
+    let live_counts = state.hub.count_live_sessions_per_target().await;
+    let blocked: Vec<serde_json::Value> = diff
+        .removed
+        .iter()
+        .filter_map(|name| {
+            live_counts.get(name.as_str()).map(|&count| {
+                serde_json::json!({
+                    "target": name,
+                    "active_sessions": count,
+                })
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "valid": true,
+        "path": path.display().to_string(),
+        "total": new_engine.list_targets().len(),
+        "diff": diff,
+        "blocked": blocked,
+        "expected_sha256": expected_sha256,
+    })))
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 // ── User-owned target CRUD ────────────────────────────────────────────────────

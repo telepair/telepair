@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
+use serde::Serialize;
 use telepair_core::error::{Error, Result};
-use telepair_core::target::{Target, TargetConfig, TargetKind, substitute_env_vars};
+use telepair_core::target::{substitute_env_vars, Target, TargetConfig, TargetKind};
 
 #[derive(Debug)]
 pub struct TargetEngine {
@@ -70,6 +71,57 @@ impl TargetEngine {
             }
         }
     }
+
+    /// Compare `self` (old state) with `other` (new state) and return a diff.
+    ///
+    /// - `added`: name present in `other` but not in `self`
+    /// - `removed`: name present in `self` but not in `other`
+    /// - `changed`: name present in both but the `Target` value differs
+    /// - `unchanged`: identical in both
+    ///
+    /// All lists are sorted alphabetically.
+    pub fn diff(&self, other: &TargetEngine) -> TargetDiff {
+        let old_map: HashMap<&str, &Target> =
+            self.targets.iter().map(|t| (t.name.as_str(), t)).collect();
+        let new_map: HashMap<&str, &Target> =
+            other.targets.iter().map(|t| (t.name.as_str(), t)).collect();
+
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+        let mut changed = Vec::new();
+        let mut unchanged = Vec::new();
+
+        for (name, new_target) in &new_map {
+            match old_map.get(name) {
+                None => added.push(name.to_string()),
+                Some(old_target) => {
+                    if old_target == new_target {
+                        unchanged.push(name.to_string());
+                    } else {
+                        changed.push(name.to_string());
+                    }
+                }
+            }
+        }
+
+        for name in old_map.keys() {
+            if !new_map.contains_key(name) {
+                removed.push(name.to_string());
+            }
+        }
+
+        added.sort();
+        removed.sort();
+        changed.sort();
+        unchanged.sort();
+
+        TargetDiff {
+            added,
+            removed,
+            changed,
+            unchanged,
+        }
+    }
 }
 
 /// Validate business rules that serde cannot enforce:
@@ -127,4 +179,13 @@ fn default_local_shell() -> Target {
         admin_only: false,
         shell: None,
     }
+}
+
+/// Result of comparing two `TargetEngine` states.
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetDiff {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub changed: Vec<String>,
+    pub unchanged: Vec<String>,
 }

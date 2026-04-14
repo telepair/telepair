@@ -353,6 +353,8 @@ export const zh: Dict = {
     validate_blocked_hint: '请先关闭上述会话，有活跃会话的目标无法移除。',
     validate_no_changes: '未检测到变更 — 已重载目标。',
     validate_error: '验证失败: {{ msg }}',
+    reload_file_changed:
+      'targets.yaml 在预览后被改动 — 请重新验证以查看最新 diff 后再重载。',
   },
   admin_users: {
     title: '用户管理',

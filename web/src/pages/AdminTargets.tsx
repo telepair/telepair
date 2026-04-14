@@ -14,11 +14,13 @@
 import { createResource, createSignal, For, Show } from 'solid-js';
 import { useNavigate } from '@solidjs/router';
 import { api, ApiError, errorMessage } from '../lib/api';
-import type { AdminTargetInfo } from '../lib/protocol';
+import type { AdminTargetInfo, ValidateTargetsResult } from '../lib/protocol';
 import { toast } from '../stores/toast';
 import { useI18n, type Translator } from '../i18n';
 import LocaleSwitcher from '../components/LocaleSwitcher';
+import AdminNav from '../components/AdminNav';
 import Banner from '../components/Banner';
+import ReloadConfirmDialog from '../components/ReloadConfirmDialog';
 
 /**
  * One row of the `still_referenced` payload: a target name and the
@@ -132,13 +134,58 @@ export default function AdminTargets() {
   const [blockingTargets, setBlockingTargets] = createSignal<
     BlockingTarget[] | null
   >(null);
+  const [validateResult, setValidateResult] = createSignal<ValidateTargetsResult | null>(null);
 
-  const handleReload = async () => {
+  const handleReloadClick = async () => {
     if (reloading()) return;
     setReloading(true);
     setBlockingTargets(null);
     try {
-      const result = await api.reloadTargets();
+      const result = await api.validateTargets();
+      if (!result.valid) {
+        toast.error(
+          t('admin_targets.validate_error', {
+            msg: result.errors?.join('; ') ?? 'Unknown error',
+          }),
+          { id: 'admin-targets-reload' },
+        );
+        return;
+      }
+
+      const diff = result.diff;
+      const hasChanges =
+        diff &&
+        (diff.added.length > 0 || diff.removed.length > 0 || diff.changed.length > 0);
+
+      if (!hasChanges) {
+        // No changes — still pin the reload to the sha we just
+        // previewed; if the file changes before this call hits the
+        // server, the 409 path below surfaces the race to the admin.
+        await api.reloadTargets(result.expected_sha256);
+        toast.success(t('admin_targets.validate_no_changes'), {
+          id: 'admin-targets-reload',
+        });
+        await refetch();
+        return;
+      }
+
+      // Show confirmation dialog
+      setValidateResult(result);
+    } catch (e) {
+      toast.error(
+        t('admin_targets.reload_failed_generic', { msg: errorMessage(e) }),
+        { id: 'admin-targets-reload' },
+      );
+    } finally {
+      setReloading(false);
+    }
+  };
+
+  const handleConfirmReload = async () => {
+    setReloading(true);
+    const expectedSha = validateResult()?.expected_sha256;
+    try {
+      const result = await api.reloadTargets(expectedSha);
       toast.success(
         t('admin_targets.reload_success', {
           count: String(result.targets),
@@ -146,27 +193,22 @@ export default function AdminTargets() {
         }),
         { id: 'admin-targets-reload' },
       );
-      // Refetch the list so the card grid reflects the new engine —
-      // the server swap is atomic, but the client is still holding
-      // the pre-reload snapshot until we fetch again.
+      setValidateResult(null);
       await refetch();
     } catch (e) {
       if (e instanceof ApiError) {
         const parsed = parseReloadError(e.message);
-        if (parsed?.reason === 'no_targets_path') {
-          toast.error(t('admin_targets.reload_failed_no_path'), {
+        if (parsed?.reason === 'still_referenced' && parsed.targets) {
+          setBlockingTargets(parsed.targets);
+          setValidateResult(null);
+        } else if (parsed?.reason === 'file_changed') {
+          // Another writer touched targets.yaml between validate and
+          // confirm. Drop the dialog and force the admin to re-preview
+          // so what they approve matches what the server would apply.
+          setValidateResult(null);
+          toast.error(t('admin_targets.reload_file_changed'), {
             id: 'admin-targets-reload',
           });
-        } else if (parsed?.reason === 'parse_error') {
-          toast.error(
-            t('admin_targets.reload_failed_parse', { msg: parsed.message }),
-            { id: 'admin-targets-reload' },
-          );
-        } else if (parsed?.reason === 'still_referenced' && parsed.targets) {
-          // Persistent banner instead of a toast — the row list is
-          // the load-bearing part of the message, and a toast would
-          // dismiss before the admin finished reading it.
-          setBlockingTargets(parsed.targets);
         } else {
           toast.error(
             t('admin_targets.reload_failed_generic', { msg: e.message }),
@@ -194,16 +236,13 @@ export default function AdminTargets() {
     <div class="admin-targets">
       <header class="topbar">
         <div class="topbar-left">
-          <a class="back-link" href="/">
-            {t('admin_targets.back_to_dashboard')}
-          </a>
-          <h1>{t('admin_targets.title')}</h1>
+          <AdminNav current="/admin/targets" />
         </div>
         <div class="topbar-actions">
           <LocaleSwitcher variant="topbar" />
           <button
             class="reload-btn"
-            onClick={handleReload}
+            onClick={handleReloadClick}
             disabled={reloading()}
             data-testid="admin-targets-reload-button"
           >
@@ -290,6 +329,13 @@ export default function AdminTargets() {
         </Show>
       </main>
 
+      <ReloadConfirmDialog
+        result={validateResult()}
+        reloading={reloading()}
+        onConfirm={handleConfirmReload}
+        onCancel={() => setValidateResult(null)}
+      />
+
       <style>{`
         .admin-targets { min-height: 100vh; }
         .topbar {
@@ -307,19 +353,6 @@ export default function AdminTargets() {
           gap: 16px;
           min-width: 0;
         }
-        .topbar h1 {
-          font-size: 18px;
-          font-weight: 700;
-          white-space: nowrap;
-          overflow: hidden;
-          text-overflow: ellipsis;
-        }
-        .back-link {
-          color: var(--text-secondary);
-          text-decoration: none;
-          font-size: 13px;
-        }
-        .back-link:hover { color: var(--text-primary); }
         .topbar-actions { display: flex; gap: 8px; align-items: center; }
         .reload-btn:disabled {
           opacity: 0.6;

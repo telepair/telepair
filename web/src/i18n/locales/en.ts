@@ -375,6 +375,8 @@ export const en = {
     validate_blocked_hint: 'Close the sessions above before reloading. Targets with active sessions cannot be removed.',
     validate_no_changes: 'No changes detected — targets reloaded.',
     validate_error: 'Validation failed: {{ msg }}',
+    reload_file_changed:
+      'targets.yaml changed since preview — re-run validate to see the latest diff before reloading.',
   },
   admin_users: {
     title: 'User management',

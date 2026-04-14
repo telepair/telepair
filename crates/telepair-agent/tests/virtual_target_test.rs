@@ -218,6 +218,61 @@ targets:
     );
 }
 
+// ── TargetEngine::diff ───────────────────────────────────────────
+
+const OLD_YAML: &str = r#"
+targets:
+  - name: keep-same
+    display: Keep Same
+    command: echo
+  - name: will-change
+    display: Old Display
+    command: old-cmd
+  - name: will-remove
+    display: Remove Me
+    command: rm
+"#;
+
+const NEW_YAML: &str = r#"
+targets:
+  - name: keep-same
+    display: Keep Same
+    command: echo
+  - name: will-change
+    display: New Display
+    command: new-cmd
+  - name: brand-new
+    display: Brand New
+    command: true
+"#;
+
+#[test]
+fn diff_detects_added_removed_changed_unchanged() {
+    let old = TargetEngine::from_yaml(OLD_YAML).unwrap();
+    let new = TargetEngine::from_yaml(NEW_YAML).unwrap();
+    let diff = old.diff(&new);
+
+    assert_eq!(diff.added, vec!["brand-new"]);
+    assert_eq!(diff.removed, vec!["will-remove"]);
+    assert_eq!(diff.changed, vec!["will-change"]);
+    // from_yaml injects local-shell into both sides, so it appears in unchanged
+    assert_eq!(diff.unchanged, vec!["keep-same", "local-shell"]);
+}
+
+#[test]
+fn diff_empty_to_populated() {
+    let old = TargetEngine::empty();
+    let new = TargetEngine::from_yaml(NEW_YAML).unwrap();
+    let diff = old.diff(&new);
+
+    // from_yaml injects local-shell into NEW_YAML too, so it matches empty()'s local-shell
+    // → local-shell ends up in unchanged, not removed
+    assert!(diff.removed.is_empty());
+    assert_eq!(diff.added, vec!["brand-new", "keep-same", "will-change"]);
+    assert!(diff.changed.is_empty());
+    assert_eq!(diff.unchanged, vec!["local-shell"]);
+}
+
 // ── Multiple validation errors reported at once ──────────────────
 
 #[test]
