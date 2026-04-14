@@ -76,7 +76,7 @@ async fn system_info_returns_expected_fields() {
     assert_eq!(json["registered_users"].as_i64().unwrap(), 2);
 
     // SMTP not configured in test
-    assert_eq!(json["smtp_configured"].as_bool().unwrap(), false);
+    assert!(!json["smtp_configured"].as_bool().unwrap());
 
     // targets_path is null when not configured
     assert!(json["targets_path"].is_null());

@@ -85,7 +85,14 @@ async fn setup(
     let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
     let (_, admin_token) = storage.create_user("admin", true).await.unwrap();
     let (_, user_token) = storage.create_user("regular", false).await.unwrap();
-    let state = AppState::new(storage.clone(), engine, Some(path.clone()), None, std::path::PathBuf::from("/tmp/telepair-test")).await;
+    let state = AppState::new(
+        storage.clone(),
+        engine,
+        Some(path.clone()),
+        None,
+        std::path::PathBuf::from("/tmp/telepair-test"),
+    )
+    .await;
     let router = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
     (router, admin_token, user_token, path, file)
 }
@@ -289,7 +296,14 @@ async fn reload_targets_audit_event_is_recorded() {
     let engine = TargetEngine::from_file(&path).expect("parse initial yaml");
     let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
     let (_, admin_token) = storage.create_user("admin", true).await.unwrap();
-    let state = AppState::new(storage.clone(), engine, Some(path.clone()), None, std::path::PathBuf::from("/tmp/telepair-test")).await;
+    let state = AppState::new(
+        storage.clone(),
+        engine,
+        Some(path.clone()),
+        None,
+        std::path::PathBuf::from("/tmp/telepair-test"),
+    )
+    .await;
     let app = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
 
     std::fs::write(&path, RELOADED_TARGETS_YAML).unwrap();
@@ -438,7 +452,14 @@ async fn reload_targets_rejects_drop_of_still_referenced_target() {
         .await
         .unwrap();
 
-    let state = AppState::new(storage.clone(), engine, Some(path.clone()), None, std::path::PathBuf::from("/tmp/telepair-test")).await;
+    let state = AppState::new(
+        storage.clone(),
+        engine,
+        Some(path.clone()),
+        None,
+        std::path::PathBuf::from("/tmp/telepair-test"),
+    )
+    .await;
     state
         .hub
         .start_or_join(
@@ -550,7 +571,14 @@ async fn reload_targets_allows_adding_new_target_with_referenced_alive() {
         .await
         .unwrap();
 
-    let state = AppState::new(storage.clone(), engine, Some(path.clone()), None, std::path::PathBuf::from("/tmp/telepair-test")).await;
+    let state = AppState::new(
+        storage.clone(),
+        engine,
+        Some(path.clone()),
+        None,
+        std::path::PathBuf::from("/tmp/telepair-test"),
+    )
+    .await;
     state
         .hub
         .start_or_join(
@@ -630,7 +658,14 @@ async fn reload_targets_allows_drop_when_only_stale_db_row_present() {
         .await
         .unwrap();
 
-    let state = AppState::new(storage.clone(), engine, Some(path.clone()), None, std::path::PathBuf::from("/tmp/telepair-test")).await;
+    let state = AppState::new(
+        storage.clone(),
+        engine,
+        Some(path.clone()),
+        None,
+        std::path::PathBuf::from("/tmp/telepair-test"),
+    )
+    .await;
     let app = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
 
     // Rewrite yaml to drop alpha — with the old DB-backed guard
@@ -701,7 +736,14 @@ async fn reload_targets_rejects_drop_during_create_to_attach_gap() {
     let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
     let (_, admin_token) = storage.create_user("admin", true).await.unwrap();
 
-    let state = AppState::new(storage.clone(), engine, Some(path.clone()), None, std::path::PathBuf::from("/tmp/telepair-test")).await;
+    let state = AppState::new(
+        storage.clone(),
+        engine,
+        Some(path.clone()),
+        None,
+        std::path::PathBuf::from("/tmp/telepair-test"),
+    )
+    .await;
     let app = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
 
     // Step 1: create a session via the HTTP handler — this is

@@ -60,20 +60,22 @@ async fn export_json_returns_all_rows() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(resp
-        .headers()
-        .get("content-type")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .contains("application/json"));
-    assert!(resp
-        .headers()
-        .get("content-disposition")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .contains("attachment"));
+    assert!(
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("application/json")
+    );
+    assert!(
+        resp.headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("attachment")
+    );
 
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let events: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
@@ -93,13 +95,14 @@ async fn export_csv_returns_valid_csv() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(resp
-        .headers()
-        .get("content-type")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .contains("text/csv"));
+    assert!(
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("text/csv")
+    );
 
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let text = std::str::from_utf8(&body).unwrap();
@@ -112,9 +115,15 @@ async fn export_csv_returns_valid_csv() {
     // String fields (actor_name, session_id) should be quoted per RFC 4180
     let data_line = text.lines().nth(1).unwrap();
     // actor_name "admin" is quoted → "admin" appears in the line
-    assert!(data_line.contains("\"admin\""), "actor_name should be RFC 4180 quoted: {data_line}");
+    assert!(
+        data_line.contains("\"admin\""),
+        "actor_name should be RFC 4180 quoted: {data_line}"
+    );
     // session_id "sess-1" is quoted
-    assert!(data_line.contains("\"sess-1\""), "session_id should be RFC 4180 quoted: {data_line}");
+    assert!(
+        data_line.contains("\"sess-1\""),
+        "session_id should be RFC 4180 quoted: {data_line}"
+    );
 }
 
 #[tokio::test]
