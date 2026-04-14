@@ -179,6 +179,28 @@ export default function SessionPage() {
           );
         }
         break;
+      case 'PeerEvicted':
+        // Force-removal of a participant. We prune the row the same
+        // way `PeerLeft` does, but swap the system chat string based
+        // on `reason` so collaborators don't mistake a routine
+        // password rotation for an admin action:
+        //   - `account_disabled` → "was removed by an admin"
+        //   - `token_rotated`    → "re-authenticated" (neutral)
+        // For the evicted user themselves, the server follows this
+        // frame with `Close(CLOSE_CODE_TERMINAL)`, so the chat entry
+        // is mostly for anyone who captured the frame before
+        // teardown — consistent behavior is cheaper than a self-check.
+        {
+          const leaving = participants().find((p) => p.user_id === msg.user_id);
+          const leavingName = leaving?.name ?? msg.user_id;
+          setParticipants((prev) => prev.filter((p) => p.user_id !== msg.user_id));
+          const chatKey: TranslationKey =
+            msg.reason === 'token_rotated'
+              ? 'chat.system_reauth_required'
+              : 'chat.system_evicted';
+          appendSystemChat(`peer-evicted:${msg.user_id}`, t(chatKey, { name: leavingName }));
+        }
+        break;
       case 'PeerChat':
         setChatMessages((prev) => [
           ...prev.slice(-(MAX_CHAT_HISTORY - 1)),
@@ -590,9 +612,16 @@ export default function SessionPage() {
       />
 
       <style>{`
-        .session-page { display: flex; flex-direction: column; height: 100vh; }
+        .session-page {
+          display: flex; flex-direction: column; height: 100vh;
+          /* Mobile viewports otherwise overflow horizontally when the
+             topbar buttons and fixed-width sidebar sum wider than the
+             viewport; belt-and-suspenders against a stray long token
+             or long session id string. */
+          overflow-x: hidden;
+        }
         .session-topbar {
-          display: flex; align-items: center; gap: 12px;
+          display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
           padding: 8px 16px; border-bottom: 1px solid var(--border);
           background: var(--bg-secondary); font-size: 13px;
         }
@@ -625,8 +654,8 @@ export default function SessionPage() {
           0%, 100% { box-shadow: 0 0 0 0 rgba(248, 81, 73, 0.5); }
           50%      { box-shadow: 0 0 0 4px rgba(248, 81, 73, 0); }
         }
-        .session-body { flex: 1; display: flex; overflow: hidden; }
-        .terminal-container { flex: 1; padding: 4px; overflow: hidden; }
+        .session-body { flex: 1; display: flex; overflow: hidden; position: relative; }
+        .terminal-container { flex: 1; padding: 4px; overflow: hidden; min-width: 0; }
         .sidebar {
           width: 260px; border-left: 1px solid var(--border);
           background: var(--bg-secondary); display: flex;
@@ -636,6 +665,30 @@ export default function SessionPage() {
         .sidebar-section.chat-section {
           flex: 1; border-top: 1px solid var(--border);
           min-height: 0; display: flex; flex-direction: column;
+        }
+
+        /* Narrow viewports: the 260px fixed sidebar leaves <120px
+           for the terminal on a phone, and forces horizontal scroll.
+           Promote the sidebar to a full-width overlay drawer so the
+           terminal keeps its whole width; toggling "Show sidebar" in
+           the topbar still works as the same show/hide control.
+           The topbar's outer flex-wrap lets topbar-actions drop to a
+           second row, but the action cluster itself is also a single
+           flex line — when the owner close button toggles to the
+           armed label (~140px) the Locale/Invite/Close/Show-Sidebar
+           row exceeds 375px and overflow-x:hidden clips the
+           rightmost controls. Add an inner wrap and right-align so
+           every button stays tappable. */
+        @media (max-width: 640px) {
+          .sidebar {
+            position: absolute; inset: 0; width: 100%;
+            border-left: none; z-index: 10;
+          }
+          .topbar-actions {
+            flex-wrap: wrap;
+            justify-content: flex-end;
+            row-gap: 6px;
+          }
         }
       `}</style>
     </div>

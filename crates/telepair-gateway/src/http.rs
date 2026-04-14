@@ -72,6 +72,23 @@ impl From<StatusCode> for ApiError {
     }
 }
 
+/// Surface axum's JSON-body rejection text instead of collapsing it to a
+/// blank 400. The default `body_text()` names the offending field and the
+/// serde error ("missing field `display_name` at line 1 column 42"),
+/// which is exactly what an API integrator needs to debug a malformed
+/// request. We *do* normalize the status back to 400 — axum's default
+/// returns 422 for `JsonDataError` (semantically valid JSON, invalid
+/// shape) and 415 for content-type mismatch, but the rest of telepair
+/// (frontend auth error mapping, tests that pin `create_session` typos
+/// to a "loud 400", integration clients) treats any malformed body as
+/// 400. Keeping the status uniform avoids a breaking change while still
+/// delivering the diagnostic string.
+impl From<JsonRejection> for ApiError {
+    fn from(rej: JsonRejection) -> Self {
+        Self::with_message(StatusCode::BAD_REQUEST, rej.body_text())
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         // 5xx bodies never echo `Error::Display` — `Storage`/`Io`/`Yaml`
@@ -257,7 +274,7 @@ pub async fn register(
     headers: HeaderMap,
     body: Result<Json<RegisterRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body?;
 
     // Only enforce the IP throttle when we actually know the caller's
     // address. If either piece is missing we skip the gate rather than
@@ -312,7 +329,7 @@ pub async fn verify_otp(
     State(state): State<AppState>,
     body: Result<Json<VerifyOtpRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body?;
     let token = state
         .auth_service
         .verify_otp(&body.email, &body.code)
@@ -333,7 +350,7 @@ pub async fn login(
     State(state): State<AppState>,
     body: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body?;
     let token = if let Some(t) = body.token {
         // Validate existing bearer token (admin / guest path).
         state.auth.validate(&t).await?;
@@ -390,17 +407,42 @@ pub struct ChangePasswordRequest {
 }
 
 /// `POST /api/auth/change-password` — authenticated password update.
+///
+/// The auth-service atomically rotates the bearer token so every
+/// future HTTP call with the old token fails 401. WebSocket
+/// connections authenticated with the old token during their
+/// handshake stay open, though — the handshake doesn't re-check
+/// auth per frame. That leaves a leaked-token scenario where
+/// rotating the password fails to actually kick the attacker off
+/// live sessions. Evict them here with `EvictReason::TokenRotated`
+/// so the client can route the user to re-login (the account is
+/// fine, only the bearer they were holding is dead) and
+/// co-participants see a "re-authentication required" notice
+/// rather than the admin-disable "removed by an admin" string.
 pub async fn change_password(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Result<Json<ChangePasswordRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body?;
     let user = extract_user(&state, &headers).await?;
     let new_token = state
         .auth_service
         .change_password(&user, &body.current_password, &body.new_password)
         .await?;
+
+    let evicted = state
+        .hub
+        .evict_user(user.id, telepair_core::protocol::EvictReason::TokenRotated)
+        .await;
+    if evicted > 0 {
+        tracing::info!(
+            user_id = %user.id,
+            affected_sessions = evicted,
+            "password change: evicted live WS connections using rotated token"
+        );
+    }
+
     Ok(Json(serde_json::json!({ "token": new_token })))
 }
 
@@ -539,7 +581,7 @@ pub async fn create_session(
     // Axum's default JSON rejection is 422; we want 400 so an unknown
     // `input_mode` value reads as "client sent garbage" instead of
     // "server doesn't know what to do with it".
-    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body?;
     let selector = pick_target_selector(&body)?;
 
     // Resolve the target without crossing namespaces. `target_name`
@@ -726,7 +768,7 @@ pub async fn create_invite(
     // Axum's default JSON rejection is 422; every other handler in this
     // file remaps to 400 so clients get a consistent "you sent garbage"
     // signal regardless of which field was wrong.
-    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body?;
 
     // Ownership, alive gate, TTL precedence/clamping, role/max_uses
     // validation, token mint — all live inside `InviteService::create`.
@@ -770,6 +812,19 @@ pub async fn close_session(
     // not worth keeping a second copy of the policy in the gateway,
     // since DELETE fires once per session lifetime.
     let user = extract_user(&state, &headers).await?;
+    // A disabled owner must not be able to ride their still-valid
+    // bearer token to close (and tear down for everyone else) a
+    // session that outlived the disable event. Mirrors the gate on
+    // POST /api/sessions so "disabled" consistently means "no
+    // session-level mutations". Admins bypass for the same reason as
+    // everywhere else: bootstrap must not be able to lock itself out.
+    require_session_enabled(
+        &state,
+        &user,
+        "DELETE /api/sessions/{id}",
+        Some(&session_id),
+    )
+    .await?;
     state
         .sessions
         .close_session_as_owner(&user, &session_id)
@@ -799,7 +854,7 @@ pub async fn update_participant_role(
     Path((session_id, target_user_id)): Path<(String, String)>,
     body: Result<Json<UpdateRoleRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let body = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?.0;
+    let body = body?.0;
     let user = extract_user(&state, &headers).await?;
     require_session_enabled(
         &state,
@@ -933,7 +988,7 @@ pub async fn redeem_invite(
     // frontend's error-handling code which branches on "bad request"
     // (show form error) vs "server error" (show toast + retry) — the
     // old 422 made bogus redeems look like a server crash.
-    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body?;
 
     // Everything else — preview, scoped-guest check, closed-session
     // gate, existing-member no-op, atomic consume, guest mint,
@@ -1518,8 +1573,8 @@ fn load_and_hash_targets(
     };
     let sha = hex_sha256(&bytes);
     let yaml = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
-    let engine = telepair_agent::virtual_target::TargetEngine::from_yaml(yaml)
-        .map_err(|e| e.to_string())?;
+    let engine =
+        telepair_agent::virtual_target::TargetEngine::from_yaml(yaml).map_err(|e| e.to_string())?;
     Ok(Some((engine, sha)))
 }
 
@@ -1546,7 +1601,7 @@ pub async fn create_user_target(
 ) -> Result<impl IntoResponse, ApiError> {
     let user = extract_user(&state, &headers).await?;
     require_unscoped(&user)?;
-    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body?;
     let name = body.name.ok_or(ApiError::bare(StatusCode::BAD_REQUEST))?;
     let target = state
         .user_targets
@@ -1574,7 +1629,7 @@ pub async fn update_user_target(
 ) -> Result<impl IntoResponse, ApiError> {
     let user = extract_user(&state, &headers).await?;
     require_unscoped(&user)?;
-    let Json(body) = body.map_err(|_| ApiError::bare(StatusCode::BAD_REQUEST))?;
+    let Json(body) = body?;
     let target = state
         .user_targets
         .update(
@@ -1765,6 +1820,31 @@ async fn set_user_enabled(
         Error::InvalidInput(_) => ApiError::bare(StatusCode::NOT_FOUND),
         other => ApiError::from(other),
     })?;
+
+    // Disable must be an *immediate* kill switch: the HTTP gate
+    // already closes new session-level mutations, but any WS
+    // connection the user had open before the disable keeps the
+    // terminal hooks alive (input, chat, resize) until they click
+    // away. Evicting here forces the already-attached handlers to
+    // tear down through the `PeerEvicted` arm in `ws.rs`. No-op on
+    // enable — flipping the bit back ON should not disturb any
+    // session the user happens to be in.
+    if !enabled {
+        let evicted = state
+            .hub
+            .evict_user(
+                target_uuid,
+                telepair_core::protocol::EvictReason::AccountDisabled,
+            )
+            .await;
+        if evicted > 0 {
+            tracing::info!(
+                target_user_id = %target_uuid,
+                affected_sessions = evicted,
+                "disable: evicted live WS connections"
+            );
+        }
+    }
 
     Ok(Json(AdminUserInfo::from(updated)))
 }

@@ -110,6 +110,29 @@ pub enum ClientMessage {
     },
 }
 
+/// Why a participant is being force-disconnected. Carried on
+/// [`ServerMessage::PeerEvicted`] so the client can split the UX
+/// between "your account was just disabled" (terminal, go to
+/// pending-approval) and "your bearer token rotated" (recoverable,
+/// go to login). Also shapes the close-frame reason string the
+/// server attaches when it tears down the evicted socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvictReason {
+    /// Admin flipped `session_enabled = FALSE` (or an equivalent
+    /// permanent revoke). Token is dead on every endpoint; the UI
+    /// should route the user to the pending-approval page and other
+    /// participants should see a "removed by an admin" notice.
+    AccountDisabled,
+    /// The user's own password change atomically rotated their
+    /// bearer token. The session must drop because the old token is
+    /// no longer accepted, but the account is in good standing —
+    /// the UI should route to login/re-auth and other participants
+    /// should see a neutral "re-authentication required" notice,
+    /// not an admin action.
+    TokenRotated,
+}
+
 // --- Server -> Client ---
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -132,6 +155,27 @@ pub enum ServerMessage {
     },
     PeerLeft {
         user_id: Uuid,
+    },
+    /// Broadcast when a participant is force-removed from a session
+    /// *without* them choosing to leave. Distinct from `PeerLeft`
+    /// because the meaning for the client UI is different: other
+    /// participants render a "was removed" notice and the evicted
+    /// user's own WS handler treats this as a close signal (their
+    /// session tab must drop immediately so the session can no
+    /// longer be driven from their browser).
+    ///
+    /// `reason` separates the two triggers so the client can split
+    /// the UX cleanly: `AccountDisabled` routes the user to the
+    /// pending-approval page (their token is now invalid for every
+    /// endpoint), while `TokenRotated` routes them to re-login
+    /// (their account is fine, only the bearer they were holding is
+    /// dead after they rotated their own password). Collaborators
+    /// see a different chat string in each case so the same "was
+    /// removed" affordance doesn't misattribute a routine password
+    /// change as an admin action.
+    PeerEvicted {
+        user_id: Uuid,
+        reason: EvictReason,
     },
     /// Broadcast when the owner changes another participant's role via
     /// `PUT /api/sessions/:id/participants/:user_id/role`. Every

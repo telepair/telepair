@@ -312,6 +312,8 @@ export const en = {
     send: 'Send',
     system_joined: '{{ name }} joined the session',
     system_left: '{{ name }} left the session',
+    system_evicted: '{{ name }} was removed by an admin',
+    system_reauth_required: '{{ name }} signed out — re-authentication required',
   },
   participants: {
     heading: 'Participants ({{ count }})',
@@ -459,6 +461,7 @@ export const en = {
     error_invalid_credentials: 'Invalid email or password',
     error_not_verified: 'Email not yet verified — check your inbox',
     error_rate_limited: 'Please wait before requesting another code',
+    error_register_rate_limited: 'Too many registration attempts from this network — please wait a moment before trying again',
     error_smtp_unavailable: 'Email service unavailable — contact your administrator',
     error_password_too_short: 'Password must be at least 8 characters.',
   },
