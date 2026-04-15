@@ -1,6 +1,6 @@
 // web/src/App.tsx
 import { Router, Route, Navigate } from '@solidjs/router';
-import { Show, onMount } from 'solid-js';
+import { Show, onMount, type JSX } from 'solid-js';
 import { auth } from './stores/auth';
 import { I18nProvider } from './i18n';
 import Login from './pages/Login';
@@ -15,7 +15,7 @@ import AdminSystem from './pages/AdminSystem';
 import ChangePassword from './pages/ChangePassword';
 import ToastContainer from './components/Toast';
 
-function AuthGuard(props: { children: any }) {
+function AuthGuard(props: { children: JSX.Element }) {
   return (
     <Show when={auth.isAuthenticated()} fallback={<Navigate href="/login" />}>
       {props.children}
@@ -41,7 +41,7 @@ function AuthGuard(props: { children: any }) {
  *     `/`. The dashboard's `onMount` will retry `loadIdentity` so the
  *     user gets another chance without being forced through /login.
  */
-function AdminGuard(props: { children: any }) {
+function AdminGuard(props: { children: JSX.Element }) {
   onMount(() => {
     // Fire-and-forget: loadIdentity is idempotent and de-duplicated.
     // Covers the "hard reload on /admin/targets" path where the
