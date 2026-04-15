@@ -122,11 +122,42 @@ jobs:
           pattern: telepair-*
           merge-multiple: true
 
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NOTES_FILE="$(mktemp)"
+          # Print everything between `## [VERSION]` and the next `## [` heading,
+          # inclusive of the `## [VERSION]` heading itself so the section title
+          # survives in the GitHub Release body.
+          awk -v target="## [$VERSION]" '
+            index($0, "## [") == 1 {
+              if (in_section) exit
+              if (index($0, target) == 1) in_section = 1
+            }
+            in_section
+          ' CHANGELOG.md > "$NOTES_FILE"
+
+          if [ -s "$NOTES_FILE" ]; then
+            echo "notes_file=$NOTES_FILE" >> "$GITHUB_OUTPUT"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No CHANGELOG entry for $VERSION — falling back to auto-generated notes"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-            artifacts/*.tar.gz
+          if [ "${{ steps.notes.outputs.found }}" = "true" ]; then
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file "${{ steps.notes.outputs.notes_file }}" \
+              artifacts/*.tar.gz
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              artifacts/*.tar.gz
+          fi
