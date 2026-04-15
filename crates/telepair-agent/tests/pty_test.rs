@@ -80,16 +80,21 @@ fn spawn_nonexistent_binary_returns_error() {
 async fn write_after_child_exit_eventually_fails() {
     let mut pty = PtyManager::spawn_command("true", &[], 80, 24, &HashMap::new()).unwrap();
     while pty.read().await.is_some() {}
-    // The writer thread detects the broken pipe lazily — keep pushing
-    // data until the channel closes or we give up after a generous window.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    // The writer thread detects the broken pipe lazily: on Linux the PTY
+    // kernel buffer is generous, so small writes accumulate silently
+    // until the buffer fills. Push a 4 KiB payload per iteration to
+    // saturate the buffer fast, and allow a 5-second window so the
+    // writer thread has time to observe the broken pipe on slower CI
+    // runners.
+    let payload = Bytes::from(vec![b'x'; 4096]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut failed = false;
     while tokio::time::Instant::now() < deadline {
-        if pty.write(Bytes::from_static(b"data\n")).await.is_err() {
+        if pty.write(payload.clone()).await.is_err() {
             failed = true;
             break;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(failed, "writing to a dead PTY must eventually fail");
 }
