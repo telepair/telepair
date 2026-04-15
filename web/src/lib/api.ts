@@ -108,7 +108,7 @@ export function __setAuthExpiredHandler(fn: () => void) {
  * full shape from `ApiError.message`. Plain-text bodies (some older
  * 500 paths, proxies, static file errors) fall through unchanged.
  */
-export async function readErrorMessage(resp: Response): Promise<string> {
+async function readErrorMessage(resp: Response): Promise<string> {
   const raw = await resp.text();
   try {
     const parsed = JSON.parse(raw);

@@ -190,6 +190,7 @@ export const zh: Dict = {
     toast_role_promoted_to_operator: '你已被提升为操作者 — 可以在终端输入。',
     sidebar_show: '显示侧栏',
     sidebar_hide: '隐藏侧栏',
+    viewer_readonly_badge: '观察者 · 只读',
     banner_ended: '此会话已结束。',
     banner_not_found: '会话不存在 — 可能已被删除。',
     banner_not_participant: '你不是此会话的参与者。',

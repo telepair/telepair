@@ -72,20 +72,20 @@ impl From<StatusCode> for ApiError {
     }
 }
 
-/// Surface axum's JSON-body rejection text instead of collapsing it to a
-/// blank 400. The default `body_text()` names the offending field and the
-/// serde error ("missing field `display_name` at line 1 column 42"),
-/// which is exactly what an API integrator needs to debug a malformed
-/// request. We *do* normalize the status back to 400 — axum's default
-/// returns 422 for `JsonDataError` (semantically valid JSON, invalid
-/// shape) and 415 for content-type mismatch, but the rest of telepair
-/// (frontend auth error mapping, tests that pin `create_session` typos
-/// to a "loud 400", integration clients) treats any malformed body as
-/// 400. Keeping the status uniform avoids a breaking change while still
-/// delivering the diagnostic string.
+/// Normalize axum's JSON-body rejections to a generic 400 without
+/// echoing serde's diagnostic string. The default `body_text()` would
+/// leak field names and byte positions ("missing field `code` at line
+/// 1 column 25") — harmless for internal APIs but an unnecessary info
+/// leak on the public auth surface (`/api/auth/register`, `/verify`,
+/// `/login`, `/invite/redeem`) where the error body is shown to
+/// anonymous callers. QA finding F2-3 flagged this. We still normalize
+/// the status to 400 so the frontend error-mapping and existing tests
+/// that pin malformed bodies to "loud 400" keep working; the raw
+/// rejection is recorded at `tracing::debug` for server-side debugging.
 impl From<JsonRejection> for ApiError {
     fn from(rej: JsonRejection) -> Self {
-        Self::with_message(StatusCode::BAD_REQUEST, rej.body_text())
+        tracing::debug!(target: "telepair::http", rejection = %rej.body_text(), "JSON body rejected");
+        Self::with_message(StatusCode::BAD_REQUEST, "invalid request body")
     }
 }
 
@@ -716,6 +716,7 @@ pub async fn list_sessions(
 // --- Invite handlers ---
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateInviteRequest {
     pub role: Role,
     #[serde(default = "default_max_uses")]
@@ -996,7 +997,16 @@ pub async fn redeem_invite(
     // `RedeemResult` derives `Serialize` with `issued_token` renamed
     // to `token`, so we can hand it straight to `Json` without a
     // per-field copy.
-    let result = state.invites.redeem(existing_user, &body.token).await?;
+    // Trim the invite token before lookup: copy-pasted tokens routinely
+    // pick up surrounding whitespace or a trailing newline, and the
+    // storage lookup is a strict sha256(token) match — a single stray
+    // byte turns a valid invite into "invalid invite token". This
+    // mirrors the client-side trim in `validateToken` for the admin
+    // bearer and closes QA finding F5-6.
+    let result = state
+        .invites
+        .redeem(existing_user, body.token.trim())
+        .await?;
     Ok(Json(result))
 }
 

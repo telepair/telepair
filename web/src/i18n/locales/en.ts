@@ -202,6 +202,7 @@ export const en = {
       'Your role is now Operator — you can type in the terminal.',
     sidebar_show: 'Show Sidebar',
     sidebar_hide: 'Hide Sidebar',
+    viewer_readonly_badge: 'Viewer · read-only',
     banner_ended: 'This session has ended.',
     banner_not_found: 'Session not found — it may have been deleted.',
     banner_not_participant: 'You are not a participant of this session.',
