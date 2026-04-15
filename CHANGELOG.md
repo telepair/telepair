@@ -7,6 +7,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-04-15
+
+Patch release focused on **security and resilience**: privileged actions
+now evict live sessions, the register path is rate-limited, chat context
+is preserved for late joiners, and a CLI admin surface unblocks ops
+workflows that previously required the web UI. Three independent
+correctness fixes (OTP bias, `$$` var-escape, structured API errors)
+land alongside a deep-QA sweep that hardens edge cases surfaced by the
+new test coverage.
+
+No schema migration required. No wire-format changes. A one-line bump
+of the workspace version is all that's needed to upgrade from 0.1.4.
+
+### Added — Admin users CLI
+
+- `telepair admin users list | show | enable | disable | approve |
+  reset-password` operate directly against the SQLite store so admin
+  workflows no longer require the web UI.
+- Commands accept `--data-dir` (or `TELEPAIR_DATA_DIR`) so an operator
+  can target a non-default deployment, and integration tests can point
+  at a throwaway directory without touching the user's real data.
+- The same `--data-dir` flag is honoured by the server binary.
+
+### Added — Session eviction on privileged actions
+
+- Disabling an account now evicts every live WebSocket owned by that
+  user so a compromised session cannot continue past revocation.
+- Rotating a user's token (via password change) evicts connections
+  still carrying the old token on the next heartbeat.
+- Admin token persistence trims whitespace so stray newlines from
+  copy/paste no longer break auth.
+
+### Added — Register rate limiting
+
+- A token-bucket limiter guards `/api/register` and the `session_enabled`
+  gate widens to block disabled accounts from hitting auth paths.
+- `X-Forwarded-For` and `Forwarded` are trusted when keying the limiter
+  so deployments behind a proxy key per-client, not per-proxy.
+- Rate-limit, self-disable, missing-targets.yaml, and admin-token-prefix
+  hints are polished to surface actionable messages.
+
+### Added — Chat backlog replay
+
+- Live sessions buffer a bounded window of chat messages and replay them
+  to late joiners so participants who connect after a conversation
+  started still see the recent context. The buffer is capped to prevent
+  unbounded growth on long-running sessions.
+
+### Added — Viewer role UX
+
+- The operator/viewer toggle becomes a role dropdown with explicit
+  choices, and the terminal locks input for viewers demoted mid-session
+  so stale PTY focus cannot bypass the permission change until the next
+  reconnect.
+- A persistent "Viewer · read-only" badge renders over the terminal
+  while the role is viewer so the lock is never ambiguous.
+
+### Fixed — Security correctness
+
+- **OTP bias**: OTP generation now uses rejection sampling instead of
+  modulo, removing the bias that skewed the digit distribution.
+- **Variable escape**: literal `$$` outside of `${VAR}` escape
+  sequences is preserved so shell scripts templated through target
+  rendering are no longer mangled.
+- **Structured API errors**: `ApiError` is serialized as typed JSON
+  end-to-end and the frontend consumes the typed envelope instead of
+  scraping free-form strings from response bodies.
+
+### Fixed — Invite lifecycle
+
+- Revocations are idempotent: an already-revoked token returns success
+  instead of a 404.
+- Exhausted invites collapse into a single `"exhausted"` error rather
+  than leaking internal attempt counts.
+- `expires_in_secs` is accepted alongside `expires_in` for tooling that
+  prefers the seconds-suffix convention.
+- TTL resolution moves from the HTTP handler into the service layer so
+  the CLI and REST paths share the same expiry rules.
+
+### Fixed — Guest session scoping & UI
+
+- Guest session listings are scoped by the caller's `scoped_session_id`
+  so a guest cannot see sessions owned by a different scope.
+- xterm refits on `visibilitychange` to recover from container resizes
+  while the tab was backgrounded.
+
+### Changed — Refactor & cleanup
+
+- `targets.yaml` is parsed from already-read bytes instead of
+  re-opening the file, closing a small TOCTOU window.
+- Helper functions across cli, storage, gateway, and tests are deduped
+  after they had drifted independently.
+- The targets loader, CLI auth setup, and session UI helpers are
+  simplified now that 0.1.5 features have settled.
+
+### Fixed — Deep-QA hardening
+
+- Gateway edge cases uncovered by QA replay traffic (invite error
+  classification, mobile sidebar default, viewer badge stability).
+- `readErrorMessage` is unexported from the web client so it stops
+  leaking into callers that should go through the structured error
+  path.
+
+### Added — Test & CI coverage
+
+- Agent crate covers PTY spawn failure, post-exit writes, and env
+  isolation so regressions in the sandbox path fail loudly.
+- Web typings are tightened and a single Playwright retry is enabled
+  in CI to absorb genuine flakes without hiding real failures.
+- The Playwright suite runs in a dedicated data dir so concurrent
+  local runs no longer race over `~/.telepair`.
+
 ## [0.1.4] - 2026-04-14
 
 Patch release focused on **admin maturity**: a dedicated system-info
