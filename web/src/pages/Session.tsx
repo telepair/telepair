@@ -70,7 +70,15 @@ export default function SessionPage() {
   const [participants, setParticipants] = createSignal<ParticipantInfo[]>([]);
   const [chatMessages, setChatMessages] = createSignal<ChatMessage[]>([]);
   const [showInvite, setShowInvite] = createSignal(false);
-  const [sidebarOpen, setSidebarOpen] = createSignal(true);
+  // Initial sidebar state is viewport-dependent: on narrow screens
+  // (<=640px matches the @media rule below) the sidebar promotes to a
+  // full-width overlay drawer that covers the terminal, so defaulting
+  // to open hides the actual workspace behind a participant list until
+  // the user discovers the toggle. Start closed there so the terminal
+  // is the first thing they see. QA finding F3-2.
+  const [sidebarOpen, setSidebarOpen] = createSignal(
+    typeof window === 'undefined' ? true : window.innerWidth > 640,
+  );
   // Close-session "armed" latch: the first click flips this on and
   // swaps the button label to a confirmation prompt; a second click
   // within 3s actually closes. The modeless inline-confirm pattern
@@ -572,7 +580,19 @@ export default function SessionPage() {
       </Show>
 
       <div class="session-body">
-        <div class="terminal-container">
+        <div class="terminal-container" data-readonly={rolePinned() && role() === 'viewer' ? 'true' : undefined}>
+          {/* Persistent viewer indicator. The role-change toast only
+              lingers ~5 seconds; once it clears, a demoted user hitting
+              keys sees a dead prompt with no feedback (QA finding
+              F4-3). The pinned badge sits in the corner of the
+              terminal container so the read-only state is always
+              visible without stealing screen space or capturing
+              focus. */}
+          <Show when={rolePinned() && role() === 'viewer'}>
+            <div class="terminal-readonly-badge" role="status" aria-live="polite">
+              {t('session.viewer_readonly_badge')}
+            </div>
+          </Show>
           <Terminal
             onData={handleData}
             onResize={handleResize}
@@ -655,7 +675,27 @@ export default function SessionPage() {
           50%      { box-shadow: 0 0 0 4px rgba(248, 81, 73, 0); }
         }
         .session-body { flex: 1; display: flex; overflow: hidden; position: relative; }
-        .terminal-container { flex: 1; padding: 4px; overflow: hidden; min-width: 0; }
+        .terminal-container { flex: 1; padding: 4px; overflow: hidden; min-width: 0; position: relative; }
+        /* Pinned read-only badge for viewer role (F4-3). Positioned
+           over the terminal so it never scrolls out of view, but
+           pointer-events:none so it doesn't intercept clicks into the
+           xterm area below. */
+        .terminal-readonly-badge {
+          position: absolute;
+          top: 10px;
+          right: 14px;
+          z-index: 5;
+          padding: 3px 10px;
+          border-radius: 10px;
+          background: rgba(210, 153, 34, 0.15);
+          color: #e3b341;
+          border: 1px solid rgba(227, 179, 65, 0.55);
+          font-size: 12px;
+          font-weight: 500;
+          pointer-events: none;
+          user-select: none;
+          letter-spacing: 0.02em;
+        }
         .sidebar {
           width: 260px; border-left: 1px solid var(--border);
           background: var(--bg-secondary); display: flex;
