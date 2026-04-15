@@ -339,7 +339,13 @@ describe('admin audit export', () => {
     expect(url).toBe(`/api${path}`);
     expect(init.headers['Authorization']).toBe('Bearer admin-token');
     expect(filename).toBe('telepair-audit-2026.csv');
-    expect(blob).toBeInstanceOf(Blob);
+    // Duck-type check rather than `instanceof Blob`: on Node 22 the
+    // Blob returned by undici's Response.blob() belongs to a different
+    // realm than happy-dom's global Blob, so the instance check fails
+    // even though the object is a Blob for all practical purposes.
+    expect(blob.type).toBe('text/csv');
+    expect(blob.size).toBeGreaterThan(0);
+    expect(typeof blob.arrayBuffer).toBe('function');
   });
 
   it('downloadBlob trips the global 401 interceptor (regression)', async () => {
