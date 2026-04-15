@@ -1,7 +1,7 @@
 // web/src/pages/ChangePassword.tsx
 import { createSignal, Show } from 'solid-js';
 import { useI18n } from '../i18n';
-import { api, ApiError, errorMessage } from '../lib/api';
+import { api, errorMessage } from '../lib/api';
 import { MIN_PASSWORD_LENGTH } from '../lib/protocol';
 import { auth } from '../stores/auth';
 import LocaleSwitcher from '../components/LocaleSwitcher';
@@ -39,13 +39,8 @@ export default function ChangePassword() {
       setCurrentPw('');
       setNewPw('');
       setConfirmPw('');
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 401) {
-        // 401 from change-password means wrong current password
-        setError(e.message);
-      } else {
-        setError(errorMessage(e));
-      }
+    } catch (err) {
+      setError(errorMessage(err));
     } finally {
       setSubmitting(false);
     }

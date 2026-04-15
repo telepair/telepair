@@ -1,15 +1,20 @@
-import { readFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
 import type { Page } from '@playwright/test';
+import { E2E_DATA_DIR } from './data-dir';
 
-const TOKEN_PATH = join(
-  process.env.TELEPAIR_TEST_HOME || homedir(),
-  '.telepair',
-  'admin_token',
-);
+// The token lives in the isolated e2e data dir that `playwright.config.ts`
+// hands the webServer via `TELEPAIR_DATA_DIR`. Test workers don't
+// inherit `webServer.env`, so we resolve the path through the shared
+// `E2E_DATA_DIR` constant rather than a runtime env probe.
+const TOKEN_PATH = join(E2E_DATA_DIR, 'admin_token');
 
 export function getAdminToken(): string {
+  if (!existsSync(TOKEN_PATH)) {
+    throw new Error(
+      `admin token not found at ${TOKEN_PATH} — is the telepair server running and did it finish bootstrapping?`,
+    );
+  }
   return readFileSync(TOKEN_PATH, 'utf-8').trim();
 }
 

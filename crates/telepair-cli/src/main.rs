@@ -55,6 +55,13 @@ struct Cli {
     #[arg(long)]
     web_dir: Option<PathBuf>,
 
+    /// Override the data directory (DB, admin token, targets.yaml).
+    /// Defaults to `~/.telepair`. Used by integration tests to avoid
+    /// polluting the user's real data dir; production deployments
+    /// should leave it unset.
+    #[arg(long, env = "TELEPAIR_DATA_DIR")]
+    data_dir: Option<PathBuf>,
+
     /// Allowed CORS origins (comma-separated). Unset defaults to
     /// loopback dev origins (http://localhost:5173, http://127.0.0.1:5173).
     /// Use absolute URLs only. Parse failures are fatal at startup.
@@ -604,8 +611,9 @@ async fn main() -> anyhow::Result<()> {
     // opens its own storage handle inside the handler — the server
     // startup path stays untouched.
     if let Some(command) = cli.command {
+        let data_dir = cli.data_dir.clone().unwrap_or_else(data_dir);
         return match command {
-            Command::Admin { cmd } => run_admin_command(cmd, &data_dir()).await,
+            Command::Admin { cmd } => run_admin_command(cmd, &data_dir).await,
         };
     }
 
@@ -627,8 +635,10 @@ async fn main() -> anyhow::Result<()> {
         "starting telepair"
     );
 
-    // Ensure data directory exists
-    let data_dir = data_dir();
+    // Ensure data directory exists. `--data-dir` / `TELEPAIR_DATA_DIR`
+    // overrides the `~/.telepair` default so integration tests can
+    // point at a throwaway dir without touching the user's real data.
+    let data_dir = cli.data_dir.clone().unwrap_or_else(data_dir);
     std::fs::create_dir_all(&data_dir)?;
 
     // Initialize storage (needed by control)

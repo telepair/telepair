@@ -98,8 +98,8 @@ export default function UserTargetDrawer(props: UserTargetDrawerProps) {
         saved = await api.createUserTarget({ name: name(), ...params });
       }
       props.onSaved(saved);
-    } catch (e) {
-      setSaveError(errorMessage(e));
+    } catch (err) {
+      setSaveError(errorMessage(err));
     } finally {
       setSaving(false);
     }
@@ -113,8 +113,8 @@ export default function UserTargetDrawer(props: UserTargetDrawerProps) {
       const t = props.target as UserTargetInfo;
       await api.deleteUserTarget(t.id);
       props.onDeleted(t.id);
-    } catch (e) {
-      setDeleteError(errorMessage(e));
+    } catch (err) {
+      setDeleteError(errorMessage(err));
       setConfirmDelete(false);
     } finally {
       setDeleting(false);
