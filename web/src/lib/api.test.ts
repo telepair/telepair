@@ -317,9 +317,13 @@ describe('admin audit export', () => {
 
   it('downloadBlob attaches the bearer token and returns blob + filename', async () => {
     auth.setToken('admin-token');
-    const body = new Blob(['id,ts\n1,x\n'], { type: 'text/csv' });
+    // Pass the CSV as a string rather than a Blob: Node 22's undici
+    // Response constructor resolves Blob bodies via `body.stream()`,
+    // which vitest's happy-dom Blob polyfill does not implement. The
+    // production path still receives a Blob because `response.blob()`
+    // reconstitutes one from the bytes.
     mockFetch.mockResolvedValueOnce(
-      new Response(body, {
+      new Response('id,ts\n1,x\n', {
         status: 200,
         headers: {
           'Content-Type': 'text/csv',
