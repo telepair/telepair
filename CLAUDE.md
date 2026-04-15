@@ -56,6 +56,28 @@ make all                                     # required before every push
 If `make all` fails, fix the issue at its root — do not bypass with `--no-verify`,
 `fmt`-only partial runs, or skipping a subcommand.
 
+`make all` is necessary but not sufficient to release: it runs against the
+local toolchain (macOS + whatever Node is on PATH). Use `web/.nvmrc` so
+`nvm use` (or `fnm use`) inside `web/` matches the Node version CI runs
+(currently 22). Cross-platform invariants (PTY, signals, fs semantics)
+still need to be verified by CI itself.
+
+## Release Flow
+
+Releases are tag-driven. **Never tag or publish a GitHub Release before
+CI on `main` is green** for the release commit — the published bits stay
+in lockstep with a verified build.
+
+```text
+1. push the release commit to main
+2. wait for the CI workflow on that commit to go green
+3. git tag -s vX.Y.Z + git push origin vX.Y.Z   (Release workflow uploads artifacts)
+4. gh release create vX.Y.Z                      (only after the Release workflow is green)
+```
+
+If CI fails after a tag/release went out, ship a hotfix to `main`
+immediately rather than retagging — the tag is immutable history.
+
 ## Architecture
 
 Telepair is a web-based terminal collaboration tool — "Google Docs for your terminal." It's a Cargo workspace with 5 crates following a composable role architecture:
