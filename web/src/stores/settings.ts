@@ -13,6 +13,7 @@ export interface TerminalSettings {
   fontFamily: FontFamilyId;
   cursorStyle: CursorStyle;
   cursorBlink: boolean;
+  notificationsEnabled: boolean;
 }
 
 const DEFAULTS: TerminalSettings = {
@@ -21,6 +22,7 @@ const DEFAULTS: TerminalSettings = {
   fontFamily: DEFAULT_FONT_FAMILY,
   cursorStyle: 'block',
   cursorBlink: true,
+  notificationsEnabled: false,
 };
 
 function safeGet(key: string): string | null {
@@ -58,6 +60,7 @@ export function loadSettings(): TerminalSettings {
       fontFamily: parsed.fontFamily ?? DEFAULTS.fontFamily,
       cursorStyle: parsed.cursorStyle ?? DEFAULTS.cursorStyle,
       cursorBlink: typeof parsed.cursorBlink === 'boolean' ? parsed.cursorBlink : DEFAULTS.cursorBlink,
+      notificationsEnabled: typeof parsed.notificationsEnabled === 'boolean' ? parsed.notificationsEnabled : DEFAULTS.notificationsEnabled,
     };
   } catch {
     return { ...DEFAULTS };
@@ -100,6 +103,10 @@ export function setCursorStyle(style: CursorStyle): void {
 
 export function setCursorBlink(blink: boolean): void {
   update({ cursorBlink: blink });
+}
+
+export function setNotificationsEnabled(enabled: boolean): void {
+  update({ notificationsEnabled: enabled });
 }
 
 export function resetSettings(): void {

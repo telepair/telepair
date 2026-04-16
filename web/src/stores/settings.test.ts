@@ -14,7 +14,7 @@ vi.stubGlobal('localStorage', {
   },
 });
 
-const { terminalSettings, setTheme, setFontSize, setFontFamily, setCursorStyle, setCursorBlink, resetSettings, SETTINGS_KEY } = await import('./settings');
+const { terminalSettings, setTheme, setFontSize, setFontFamily, setCursorStyle, setCursorBlink, resetSettings, setNotificationsEnabled, SETTINGS_KEY } = await import('./settings');
 
 beforeEach(() => {
   for (const key of Object.keys(store)) delete store[key];
@@ -96,5 +96,22 @@ describe('terminalSettings', () => {
     storageWritesThrow = true;
     setTheme('dracula');
     expect(terminalSettings().theme).toBe('dracula');
+  });
+
+  it('notificationsEnabled defaults to false', () => {
+    expect(terminalSettings().notificationsEnabled).toBe(false);
+  });
+
+  it('persists notificationsEnabled change', () => {
+    setNotificationsEnabled(true);
+    expect(terminalSettings().notificationsEnabled).toBe(true);
+    const saved = JSON.parse(store[SETTINGS_KEY]);
+    expect(saved.notificationsEnabled).toBe(true);
+  });
+
+  it('resetSettings restores notificationsEnabled to false', () => {
+    setNotificationsEnabled(true);
+    resetSettings();
+    expect(terminalSettings().notificationsEnabled).toBe(false);
   });
 });
