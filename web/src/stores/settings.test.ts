@@ -114,4 +114,34 @@ describe('terminalSettings', () => {
     resetSettings();
     expect(terminalSettings().notificationsEnabled).toBe(false);
   });
+
+  it('falls back to default for non-numeric fontSize in storage', async () => {
+    store[SETTINGS_KEY] = JSON.stringify({ fontSize: 'abc' });
+    const { loadSettings } = await import('./settings');
+    expect(loadSettings().fontSize).toBe(14);
+  });
+
+  it('falls back to default for NaN fontSize in storage', async () => {
+    store[SETTINGS_KEY] = JSON.stringify({ fontSize: NaN });
+    const { loadSettings } = await import('./settings');
+    expect(loadSettings().fontSize).toBe(14);
+  });
+
+  it('falls back to default for invalid theme in storage', async () => {
+    store[SETTINGS_KEY] = JSON.stringify({ theme: 'neon-pink' });
+    const { loadSettings } = await import('./settings');
+    expect(loadSettings().theme).toBe('github-dark');
+  });
+
+  it('falls back to default for invalid fontFamily in storage', async () => {
+    store[SETTINGS_KEY] = JSON.stringify({ fontFamily: 'comic-sans' });
+    const { loadSettings } = await import('./settings');
+    expect(loadSettings().fontFamily).toBe('jetbrains-mono');
+  });
+
+  it('falls back to default for invalid cursorStyle in storage', async () => {
+    store[SETTINGS_KEY] = JSON.stringify({ cursorStyle: 'crosshair' });
+    const { loadSettings } = await import('./settings');
+    expect(loadSettings().cursorStyle).toBe('block');
+  });
 });

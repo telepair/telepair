@@ -1,12 +1,13 @@
 // web/src/stores/settings.ts
 import { createSignal } from 'solid-js';
 import type { ThemeId, FontFamilyId } from '../lib/terminal-themes';
-import { DEFAULT_THEME, DEFAULT_FONT_FAMILY } from '../lib/terminal-themes';
+import { DEFAULT_THEME, DEFAULT_FONT_FAMILY, THEME_IDS, FONT_FAMILIES } from '../lib/terminal-themes';
 import { safeGet, safeSet, safeRemove } from '../lib/storage';
 
 export const SETTINGS_KEY = 'telepair_terminal_settings';
 
 export type CursorStyle = 'block' | 'underline' | 'bar';
+const CURSOR_STYLES: readonly CursorStyle[] = ['block', 'underline', 'bar'];
 
 export interface TerminalSettings {
   theme: ThemeId;
@@ -32,10 +33,16 @@ export function loadSettings(): TerminalSettings {
   try {
     const parsed = JSON.parse(raw);
     return {
-      theme: parsed.theme ?? DEFAULTS.theme,
-      fontSize: clampFontSize(parsed.fontSize ?? DEFAULTS.fontSize),
-      fontFamily: parsed.fontFamily ?? DEFAULTS.fontFamily,
-      cursorStyle: parsed.cursorStyle ?? DEFAULTS.cursorStyle,
+      theme: THEME_IDS.includes(parsed.theme) ? parsed.theme : DEFAULTS.theme,
+      fontSize: typeof parsed.fontSize === 'number' && Number.isFinite(parsed.fontSize)
+        ? clampFontSize(parsed.fontSize)
+        : DEFAULTS.fontSize,
+      fontFamily: FONT_FAMILIES.some((f) => f.id === parsed.fontFamily)
+        ? parsed.fontFamily
+        : DEFAULTS.fontFamily,
+      cursorStyle: CURSOR_STYLES.includes(parsed.cursorStyle)
+        ? parsed.cursorStyle
+        : DEFAULTS.cursorStyle,
       cursorBlink: typeof parsed.cursorBlink === 'boolean' ? parsed.cursorBlink : DEFAULTS.cursorBlink,
       notificationsEnabled: typeof parsed.notificationsEnabled === 'boolean' ? parsed.notificationsEnabled : DEFAULTS.notificationsEnabled,
     };

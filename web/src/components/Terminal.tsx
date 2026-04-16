@@ -148,7 +148,7 @@ export default function Terminal(props: TerminalProps) {
         // writer or fire `onData`. Returning true (the install-time
         // default) lets the event through.
         term.attachCustomKeyEventHandler(() => !flag);
-        term.options.cursorBlink = !flag;
+        term.options.cursorBlink = flag ? false : terminalSettings().cursorBlink;
         containerRef?.classList.toggle('terminal-readonly', flag);
       },
       get cols() { return term?.cols ?? 80; },
