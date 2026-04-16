@@ -17,6 +17,8 @@ import Banner from '../components/Banner';
 import LocaleSwitcher from '../components/LocaleSwitcher';
 import SettingsPanel from '../components/SettingsPanel';
 import { toast } from '../stores/toast';
+import { terminalSettings } from '../stores/settings';
+import { notify } from '../lib/notifications';
 import {
   renderTemplate,
   roleLabel,
@@ -183,6 +185,13 @@ export default function SessionPage() {
           `peer-joined:${msg.user_id}`,
           t('chat.system_joined', { name: msg.name }),
         );
+        if (
+          terminalSettings().notificationsEnabled &&
+          document.visibilityState !== 'visible' &&
+          msg.user_id !== auth.currentUserId()
+        ) {
+          notify('telepair', t('notifications.joined' as any, { name: msg.name }));
+        }
         break;
       }
       case 'PeerLeft':
@@ -226,6 +235,13 @@ export default function SessionPage() {
           ...prev.slice(-(MAX_CHAT_HISTORY - 1)),
           { user_id: msg.user_id, name: msg.name, text: msg.text, ts: msg.ts },
         ]);
+        if (
+          terminalSettings().notificationsEnabled &&
+          document.visibilityState !== 'visible' &&
+          msg.user_id !== auth.currentUserId()
+        ) {
+          notify('telepair', `${msg.name}: ${msg.text}`);
+        }
         break;
       case 'PeerRoleChanged':
         setParticipants((prev) =>
