@@ -211,8 +211,8 @@ password change.
 | `token` | string | Fresh bearer token. The previous token is invalidated. |
 
 **Errors**
-- `400 Bad Request` — request body is malformed, new password is shorter than 8 characters, or the account does not use password authentication (admin/CLI accounts)
-- `401 Unauthorized` — missing or invalid bearer token, or current password is incorrect
+- `400 Bad Request` — request body is malformed, new password is shorter than 8 characters, current password is incorrect, or the account does not use password authentication (admin/CLI accounts)
+- `401 Unauthorized` — missing or invalid bearer token
 
 ## Targets
 
@@ -529,7 +529,7 @@ for the event taxonomy and write paths.
 | `ts` | string (ISO 8601) | Emit time, UTC. |
 | `actor_id` | string \| null | UUID of the initiator. `null` for system events and failed logins. |
 | `actor_name` | string \| null | Denormalized display name snapshot — a later rename does not rewrite history. |
-| `event_type` | string | Tagged string: `session.created`, `session.closed`, `participant.joined`, `participant.left`, `participant.role_changed`, `invite.minted`, `invite.redeemed`, `invite.revoked`, `auth.login_success`, `auth.login_failed`, `auth.register_rejected`, `auth.register_completed`, `auth.verify_failed`, `auth.user_enabled`, `auth.user_disabled`, `auth.session_access_denied`, `auth.password_changed`, `target.access_denied`, `target.reloaded`. |
+| `event_type` | string | Tagged string: `session.created`, `session.closed`, `participant.joined`, `participant.left`, `participant.role_changed`, `invite.minted`, `invite.redeemed`, `invite.revoked`, `auth.login_success`, `auth.login_failed`, `auth.register_rejected`, `auth.register_completed`, `auth.verify_failed`, `auth.user_enabled`, `auth.user_disabled`, `auth.session_access_denied`, `auth.password_changed`, `auth.admin_user_created`, `target.access_denied`, `target.reloaded`. |
 | `session_id` | string \| null | `null` for events without a session (logins, target reload). |
 | `detail` | object | Event-specific JSON blob. For example, `session.closed` carries `{reason, duration_s}`; `invite.minted` carries `{role, max_uses, expires_at}`. |
 

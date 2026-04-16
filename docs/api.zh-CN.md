@@ -203,8 +203,8 @@ SQLite 事务中完成,所以两次写入之间不会出现旧 token 在密码�
 | `token` | string | 新签发的 bearer token。旧 token 已作废。 |
 
 **错误**
-- `400 Bad Request` —— 请求体格式不合法、新密码短于 8 个字符,或该账号不使用密码认证(admin / CLI 账号)
-- `401 Unauthorized` —— bearer token 缺失或无效,或当前密码不正确
+- `400 Bad Request` —— 请求体格式不合法、新密码短于 8 个字符、当前密码不正确,或该账号不使用密码认证(admin / CLI 账号)
+- `401 Unauthorized` —— bearer token 缺失或无效
 
 ## Targets
 
@@ -514,7 +514,7 @@ SQLite 事务中完成,所以两次写入之间不会出现旧 token 在密码�
 | `ts` | string (ISO 8601) | 事件发射时间,UTC。 |
 | `actor_id` | string \| null | 触发者的 UUID。系统事件和登录失败时为 `null`。 |
 | `actor_name` | string \| null | 发射时刻的用户名快照 —— 用户后续改名不会改写历史。 |
-| `event_type` | string | 形如以下之一:`session.created`、`session.closed`、`participant.joined`、`participant.left`、`participant.role_changed`、`invite.minted`、`invite.redeemed`、`invite.revoked`、`auth.login_success`、`auth.login_failed`、`auth.register_rejected`、`auth.register_completed`、`auth.verify_failed`、`auth.user_enabled`、`auth.user_disabled`、`auth.session_access_denied`、`auth.password_changed`、`target.access_denied`、`target.reloaded`。 |
+| `event_type` | string | 形如以下之一:`session.created`、`session.closed`、`participant.joined`、`participant.left`、`participant.role_changed`、`invite.minted`、`invite.redeemed`、`invite.revoked`、`auth.login_success`、`auth.login_failed`、`auth.register_rejected`、`auth.register_completed`、`auth.verify_failed`、`auth.user_enabled`、`auth.user_disabled`、`auth.session_access_denied`、`auth.password_changed`、`auth.admin_user_created`、`target.access_denied`、`target.reloaded`。 |
 | `session_id` | string \| null | 没有绑定到具体会话的事件为 `null`(登录、目标热重载)。 |
 | `detail` | object | 事件专属的 JSON blob。例如 `session.closed` 带 `{reason, duration_s}`、`invite.minted` 带 `{role, max_uses, expires_at}`。 |
 
