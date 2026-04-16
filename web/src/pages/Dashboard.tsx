@@ -2,7 +2,7 @@
 import { createSignal, onMount, Show, For, createMemo, createEffect } from 'solid-js';
 import { useNavigate, useSearchParams } from '@solidjs/router';
 import { auth } from '../stores/auth';
-import { sessionStore, type SessionsFilter } from '../stores/session';
+import { AuthChangedError, sessionStore, type SessionsFilter } from '../stores/session';
 import type { CloseReason, InputMode, Session, TargetInfo, UserTargetInfo } from '../lib/protocol';
 import { api } from '../lib/api';
 import Banner from '../components/Banner';
@@ -139,6 +139,18 @@ export default function Dashboard() {
       setPendingTarget(null);
       navigate(`/session/${session.id}`);
     } catch (e) {
+      // Token swapped mid-request (guest redeem / change-password in the
+      // same tab). The session was created under the PREVIOUS identity;
+      // navigating would cross-account leak. Stay put and show no error
+      // — the user is already on the post-swap surface. Close the
+      // confirm-launch dialog too: `pendingTarget` is a local Dashboard
+      // signal, so `sessionStore.reset()` cannot reach it, and leaving
+      // it set would keep the OLD target's dialog open on top of the
+      // NEW identity's surface.
+      if (e instanceof AuthChangedError) {
+        setPendingTarget(null);
+        return;
+      }
       // Server errors come back in English from the API; only the
       // local fallback (non-Error throws) needs translating.
       const msg = e instanceof Error ? e.message : t('create_session.error_failed');

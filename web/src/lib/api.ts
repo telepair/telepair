@@ -68,13 +68,23 @@ class ApiError extends Error {
  * the obvious one — the whole point of the new invite flow is that
  * guests hit it anonymously — but anything added here should be the
  * exception, not the rule.
+ *
+ * `/auth/change-password` was historically on this list to prevent a
+ * "wrong current password" response from kicking the user out of
+ * their valid session. That worked, but it also swallowed the real
+ * bearer-invalid 401 (e.g. another tab rotated the token), leaving
+ * the caller stranded on a protected page with a dead credential
+ * until they tried a different endpoint. The backend now returns 400
+ * for wrong-current-password specifically (see `change_password`
+ * handler in `crates/telepair-gateway/src/http.rs`), so a 401 from
+ * this endpoint genuinely means "bearer invalid" and should trigger
+ * the standard logout path like everything else.
  */
 const PUBLIC_PATHS = new Set<string>([
   '/invite/redeem',
   '/auth/register',
   '/auth/verify',
   '/auth/login',
-  '/auth/change-password',
 ]);
 
 /**

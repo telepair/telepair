@@ -419,6 +419,18 @@ pub struct ChangePasswordRequest {
 /// fine, only the bearer they were holding is dead) and
 /// co-participants see a "re-authentication required" notice
 /// rather than the admin-disable "removed by an admin" string.
+///
+/// Status-code contract: a *missing or invalid bearer* surfaces as
+/// 401 from `extract_user` — the frontend's global interceptor
+/// correctly treats that as a session expiry and bounces the caller
+/// to `/login`. A *wrong current password* returns 400 instead, so
+/// the same interceptor does NOT bounce the user. This distinction
+/// is load-bearing: the previous fix exempted `/auth/change-password`
+/// from the 401→logout interceptor path-wide, which incidentally
+/// swallowed real token-expiry 401s too (a second tab that rotated
+/// the bearer would leave this tab running with a dead token until
+/// the next request outside this endpoint). Splitting by status code
+/// keeps the global interceptor simple and honest.
 pub async fn change_password(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -429,7 +441,17 @@ pub async fn change_password(
     let new_token = state
         .auth_service
         .change_password(&user, &body.current_password, &body.new_password)
-        .await?;
+        .await
+        .map_err(|e| match e {
+            // The auth-service returns `Error::Auth` both for "wrong
+            // current password" and for the password-hash verify
+            // task panic (also Internal/500-eligible but we never see
+            // it in practice). Either way the bearer is still valid —
+            // only the supplied current_password is wrong — so map to
+            // 400 with the service's message preserved for the toast.
+            Error::Auth(msg) => ApiError::with_message(StatusCode::BAD_REQUEST, msg),
+            other => ApiError::from(other),
+        })?;
 
     let evicted = state
         .hub
@@ -2073,7 +2095,7 @@ pub async fn export_audit(
             );
         }
 
-        Ok(axum::http::Response::builder()
+        axum::http::Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
             .header(
@@ -2081,11 +2103,11 @@ pub async fn export_audit(
                 format!("attachment; filename=\"telepair-audit-{now}.csv\""),
             )
             .body(axum::body::Body::from(csv))
-            .unwrap())
+            .map_err(|_| ApiError::bare(StatusCode::INTERNAL_SERVER_ERROR))
     } else {
         let json_bytes = serde_json::to_vec(&rows)
             .map_err(|_| ApiError::bare(StatusCode::INTERNAL_SERVER_ERROR))?;
-        Ok(axum::http::Response::builder()
+        axum::http::Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/json")
             .header(
@@ -2093,7 +2115,7 @@ pub async fn export_audit(
                 format!("attachment; filename=\"telepair-audit-{now}.json\""),
             )
             .body(axum::body::Body::from(json_bytes))
-            .unwrap())
+            .map_err(|_| ApiError::bare(StatusCode::INTERNAL_SERVER_ERROR))
     }
 }
 
