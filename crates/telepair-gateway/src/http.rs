@@ -2095,7 +2095,7 @@ pub async fn export_audit(
             );
         }
 
-        Ok(axum::http::Response::builder()
+        axum::http::Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
             .header(
@@ -2103,11 +2103,11 @@ pub async fn export_audit(
                 format!("attachment; filename=\"telepair-audit-{now}.csv\""),
             )
             .body(axum::body::Body::from(csv))
-            .unwrap())
+            .map_err(|_| ApiError::bare(StatusCode::INTERNAL_SERVER_ERROR))
     } else {
         let json_bytes = serde_json::to_vec(&rows)
             .map_err(|_| ApiError::bare(StatusCode::INTERNAL_SERVER_ERROR))?;
-        Ok(axum::http::Response::builder()
+        axum::http::Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/json")
             .header(
@@ -2115,7 +2115,7 @@ pub async fn export_audit(
                 format!("attachment; filename=\"telepair-audit-{now}.json\""),
             )
             .body(axum::body::Body::from(json_bytes))
-            .unwrap())
+            .map_err(|_| ApiError::bare(StatusCode::INTERNAL_SERVER_ERROR))
     }
 }
 
