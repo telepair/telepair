@@ -11,6 +11,7 @@ import CreateSessionDialog from '../components/CreateSessionDialog';
 import SessionDetailDialog from '../components/SessionDetailDialog';
 import UserTargetDrawer from '../components/UserTargetDrawer';
 import LocaleSwitcher from '../components/LocaleSwitcher';
+import SettingsPanel from '../components/SettingsPanel';
 import { inputModeLabel, useI18n, type Translator } from '../i18n';
 
 /** Narrow the free-form `status` query param to a valid tab value.
@@ -261,6 +262,7 @@ export default function Dashboard() {
         <h1>TELEPAIR</h1>
         <div class="topbar-actions">
           <LocaleSwitcher variant="topbar" />
+          <SettingsPanel />
           {/*
             Admin-only entry point into the target management page.
             The guard uses the three-state `currentUserIsAdmin()` —

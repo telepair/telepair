@@ -15,7 +15,10 @@ import ChatPanel from '../components/ChatPanel';
 import InviteDialog from '../components/InviteDialog';
 import Banner from '../components/Banner';
 import LocaleSwitcher from '../components/LocaleSwitcher';
+import SettingsPanel from '../components/SettingsPanel';
 import { toast } from '../stores/toast';
+import { terminalSettings } from '../stores/settings';
+import { notify } from '../lib/notifications';
 import {
   renderTemplate,
   roleLabel,
@@ -24,6 +27,14 @@ import {
 } from '../i18n';
 
 const MAX_CHAT_HISTORY = 500;
+
+function shouldNotify(senderId: string): boolean {
+  return (
+    terminalSettings().notificationsEnabled &&
+    document.visibilityState !== 'visible' &&
+    senderId !== auth.currentUserId()
+  );
+}
 
 export default function SessionPage() {
   const { t } = useI18n();
@@ -79,6 +90,17 @@ export default function SessionPage() {
   const [sidebarOpen, setSidebarOpen] = createSignal(
     typeof window === 'undefined' ? true : window.innerWidth > 640,
   );
+  // Auto-close sidebar when the viewport shrinks below the overlay
+  // breakpoint (640px). Without this, a user who opens the sidebar on a
+  // wide screen and then rotates their phone to portrait ends up with a
+  // full-screen overlay hiding the terminal and no obvious dismiss cue.
+  const narrowMql =
+    typeof window !== 'undefined' ? window.matchMedia('(max-width: 640px)') : null;
+  const handleNarrow = (e: MediaQueryListEvent) => {
+    if (e.matches) setSidebarOpen(false);
+  };
+  narrowMql?.addEventListener('change', handleNarrow);
+  onCleanup(() => narrowMql?.removeEventListener('change', handleNarrow));
   // Close-session "armed" latch: the first click flips this on and
   // swaps the button label to a confirmation prompt; a second click
   // within 3s actually closes. The modeless inline-confirm pattern
@@ -171,6 +193,9 @@ export default function SessionPage() {
           `peer-joined:${msg.user_id}`,
           t('chat.system_joined', { name: msg.name }),
         );
+        if (shouldNotify(msg.user_id)) {
+          notify('telepair', t('notifications.joined', { name: msg.name }));
+        }
         break;
       }
       case 'PeerLeft':
@@ -214,6 +239,9 @@ export default function SessionPage() {
           ...prev.slice(-(MAX_CHAT_HISTORY - 1)),
           { user_id: msg.user_id, name: msg.name, text: msg.text, ts: msg.ts },
         ]);
+        if (shouldNotify(msg.user_id)) {
+          notify('telepair', `${msg.name}: ${msg.text}`);
+        }
         break;
       case 'PeerRoleChanged':
         setParticipants((prev) =>
@@ -518,6 +546,7 @@ export default function SessionPage() {
         <span class="status-dot" data-status={status()} />
         <div class="topbar-actions">
           <LocaleSwitcher variant="topbar" />
+          <SettingsPanel />
           <Show when={role() === 'owner' && !endedReasonKey()}>
             <button class="action-btn" onClick={() => setShowInvite(true)}>{t('session.invite')}</button>
             <button
@@ -608,20 +637,21 @@ export default function SessionPage() {
           />
         </div>
 
-        <Show when={sidebarOpen()}>
-          <aside class="sidebar">
-            <div class="sidebar-section">
-              <ParticipantList
-                participants={participants()}
-                isOwner={role() === 'owner'}
-                onRoleChange={handleRoleChange}
-              />
-            </div>
-            <div class="sidebar-section chat-section">
-              <ChatPanel messages={chatMessages()} onSend={handleSendChat} />
-            </div>
-          </aside>
-        </Show>
+        {/* Sidebar is hidden via CSS (not <Show>) so ChatPanel stays
+            mounted and preserves unsent draft text across toggles. */}
+        <div class="sidebar-backdrop" classList={{ hidden: !sidebarOpen() }} onClick={() => setSidebarOpen(false)} />
+        <aside class="sidebar" classList={{ hidden: !sidebarOpen() }}>
+          <div class="sidebar-section">
+            <ParticipantList
+              participants={participants()}
+              isOwner={role() === 'owner'}
+              onRoleChange={handleRoleChange}
+            />
+          </div>
+          <div class="sidebar-section chat-section">
+            <ChatPanel messages={chatMessages()} onSend={handleSendChat} />
+          </div>
+        </aside>
       </div>
 
       <InviteDialog
@@ -696,6 +726,8 @@ export default function SessionPage() {
           user-select: none;
           letter-spacing: 0.02em;
         }
+        .sidebar-backdrop { display: none; }
+        .sidebar-backdrop.hidden, .sidebar.hidden { display: none !important; }
         .sidebar {
           width: 260px; border-left: 1px solid var(--border);
           background: var(--bg-secondary); display: flex;
@@ -718,10 +750,21 @@ export default function SessionPage() {
            armed label (~140px) the Locale/Invite/Close/Show-Sidebar
            row exceeds 375px and overflow-x:hidden clips the
            rightmost controls. Add an inner wrap and right-align so
-           every button stays tappable. */
+           every button stays tappable.
+           The backdrop sits behind the drawer (z-index 9 < sidebar 10)
+           so tapping outside the sidebar dismisses it. The matchMedia
+           listener in the component auto-closes the sidebar when the
+           viewport shrinks below the breakpoint. */
         @media (max-width: 640px) {
+          .sidebar-backdrop {
+            display: block;
+            position: absolute; inset: 0;
+            background: rgba(0, 0, 0, 0.4);
+            z-index: 9;
+          }
           .sidebar {
-            position: absolute; inset: 0; width: 100%;
+            position: absolute; top: 0; right: 0; bottom: 0;
+            width: 80%; max-width: 320px;
             border-left: none; z-index: 10;
           }
           .topbar-actions {
