@@ -15,6 +15,7 @@ import ChatPanel from '../components/ChatPanel';
 import InviteDialog from '../components/InviteDialog';
 import Banner from '../components/Banner';
 import LocaleSwitcher from '../components/LocaleSwitcher';
+import SettingsPanel from '../components/SettingsPanel';
 import { toast } from '../stores/toast';
 import {
   renderTemplate,
@@ -529,6 +530,7 @@ export default function SessionPage() {
         <span class="status-dot" data-status={status()} />
         <div class="topbar-actions">
           <LocaleSwitcher variant="topbar" />
+          <SettingsPanel />
           <Show when={role() === 'owner' && !endedReasonKey()}>
             <button class="action-btn" onClick={() => setShowInvite(true)}>{t('session.invite')}</button>
             <button
@@ -619,25 +621,21 @@ export default function SessionPage() {
           />
         </div>
 
-        <Show when={sidebarOpen()}>
-          {/* On narrow viewports the sidebar is a full-screen overlay;
-              a semi-transparent backdrop lets the user tap outside to
-              dismiss it, matching the drawer UX convention. Hidden on
-              wide screens where the sidebar sits inline. */}
-          <div class="sidebar-backdrop" onClick={() => setSidebarOpen(false)} />
-          <aside class="sidebar">
-            <div class="sidebar-section">
-              <ParticipantList
-                participants={participants()}
-                isOwner={role() === 'owner'}
-                onRoleChange={handleRoleChange}
-              />
-            </div>
-            <div class="sidebar-section chat-section">
-              <ChatPanel messages={chatMessages()} onSend={handleSendChat} />
-            </div>
-          </aside>
-        </Show>
+        {/* Sidebar is hidden via CSS (not <Show>) so ChatPanel stays
+            mounted and preserves unsent draft text across toggles. */}
+        <div class="sidebar-backdrop" classList={{ hidden: !sidebarOpen() }} onClick={() => setSidebarOpen(false)} />
+        <aside class="sidebar" classList={{ hidden: !sidebarOpen() }}>
+          <div class="sidebar-section">
+            <ParticipantList
+              participants={participants()}
+              isOwner={role() === 'owner'}
+              onRoleChange={handleRoleChange}
+            />
+          </div>
+          <div class="sidebar-section chat-section">
+            <ChatPanel messages={chatMessages()} onSend={handleSendChat} />
+          </div>
+        </aside>
       </div>
 
       <InviteDialog
@@ -713,6 +711,7 @@ export default function SessionPage() {
           letter-spacing: 0.02em;
         }
         .sidebar-backdrop { display: none; }
+        .sidebar-backdrop.hidden, .sidebar.hidden { display: none !important; }
         .sidebar {
           width: 260px; border-left: 1px solid var(--border);
           background: var(--bg-secondary); display: flex;
