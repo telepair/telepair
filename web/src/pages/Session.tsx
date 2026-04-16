@@ -79,6 +79,17 @@ export default function SessionPage() {
   const [sidebarOpen, setSidebarOpen] = createSignal(
     typeof window === 'undefined' ? true : window.innerWidth > 640,
   );
+  // Auto-close sidebar when the viewport shrinks below the overlay
+  // breakpoint (640px). Without this, a user who opens the sidebar on a
+  // wide screen and then rotates their phone to portrait ends up with a
+  // full-screen overlay hiding the terminal and no obvious dismiss cue.
+  const narrowMql =
+    typeof window !== 'undefined' ? window.matchMedia('(max-width: 640px)') : null;
+  const handleNarrow = (e: MediaQueryListEvent) => {
+    if (e.matches) setSidebarOpen(false);
+  };
+  narrowMql?.addEventListener('change', handleNarrow);
+  onCleanup(() => narrowMql?.removeEventListener('change', handleNarrow));
   // Close-session "armed" latch: the first click flips this on and
   // swaps the button label to a confirmation prompt; a second click
   // within 3s actually closes. The modeless inline-confirm pattern
@@ -609,6 +620,11 @@ export default function SessionPage() {
         </div>
 
         <Show when={sidebarOpen()}>
+          {/* On narrow viewports the sidebar is a full-screen overlay;
+              a semi-transparent backdrop lets the user tap outside to
+              dismiss it, matching the drawer UX convention. Hidden on
+              wide screens where the sidebar sits inline. */}
+          <div class="sidebar-backdrop" onClick={() => setSidebarOpen(false)} />
           <aside class="sidebar">
             <div class="sidebar-section">
               <ParticipantList
@@ -696,6 +712,7 @@ export default function SessionPage() {
           user-select: none;
           letter-spacing: 0.02em;
         }
+        .sidebar-backdrop { display: none; }
         .sidebar {
           width: 260px; border-left: 1px solid var(--border);
           background: var(--bg-secondary); display: flex;
@@ -718,10 +735,21 @@ export default function SessionPage() {
            armed label (~140px) the Locale/Invite/Close/Show-Sidebar
            row exceeds 375px and overflow-x:hidden clips the
            rightmost controls. Add an inner wrap and right-align so
-           every button stays tappable. */
+           every button stays tappable.
+           The backdrop sits behind the drawer (z-index 9 < sidebar 10)
+           so tapping outside the sidebar dismisses it. The matchMedia
+           listener in the component auto-closes the sidebar when the
+           viewport shrinks below the breakpoint. */
         @media (max-width: 640px) {
+          .sidebar-backdrop {
+            display: block;
+            position: absolute; inset: 0;
+            background: rgba(0, 0, 0, 0.4);
+            z-index: 9;
+          }
           .sidebar {
-            position: absolute; inset: 0; width: 100%;
+            position: absolute; top: 0; right: 0; bottom: 0;
+            width: 80%; max-width: 320px;
             border-left: none; z-index: 10;
           }
           .topbar-actions {
