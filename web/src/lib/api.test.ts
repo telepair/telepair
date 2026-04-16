@@ -279,16 +279,42 @@ describe('401 auth-expired interceptor', () => {
     expect(onExpired).not.toHaveBeenCalled();
   });
 
-  it('does NOT invoke the handler on a 401 from change-password (wrong current password is not session expiry)', async () => {
+  it('does NOT invoke the handler on a 400 from change-password (wrong current password)', async () => {
+    // Backend contract: wrong current password is 400, not 401. That
+    // keeps "wrong password" from looking like "bearer expired" to
+    // the global interceptor. Guarded here so a future regression
+    // in the backend (reverting to 401) doesn't silently ship — the
+    // frontend stops shielding this endpoint path-wide as of v0.1.6.
     auth.setToken('valid-token');
     const onExpired = vi.fn();
     __setAuthExpiredHandler(onExpired);
-    mockFetch.mockResolvedValueOnce(errorResponse('Current password is incorrect.', 401));
+    mockFetch.mockResolvedValueOnce(errorResponse('Current password is incorrect.', 400));
 
     await expect(
       api.changePassword('wrong-pw', 'new-pw-12345'),
     ).rejects.toThrow(ApiError);
+    // 400 never triggers the expiry interceptor regardless of path.
     expect(onExpired).not.toHaveBeenCalled();
+  });
+
+  it('DOES invoke the handler on a 401 from change-password (bearer expired mid-call)', async () => {
+    // Regression for the Codex-reported 401-swallow bug: before the
+    // fix, `/auth/change-password` sat in `PUBLIC_PATHS` to hide the
+    // "wrong current password → 401" case, which ALSO hid real
+    // bearer-invalid 401s (e.g. admin rotated the token in another
+    // tab). After the backend split wrong-password to 400, a 401
+    // from this endpoint means the credential itself is bad — it
+    // must bounce the user to /login like every other protected
+    // endpoint.
+    auth.setToken('stale-token');
+    const onExpired = vi.fn();
+    __setAuthExpiredHandler(onExpired);
+    mockFetch.mockResolvedValueOnce(errorResponse('Unauthorized', 401));
+
+    await expect(
+      api.changePassword('any', 'new-pw-12345'),
+    ).rejects.toThrow(ApiError);
+    expect(onExpired).toHaveBeenCalledTimes(1);
   });
 
   it('does NOT invoke the handler on non-401 errors', async () => {

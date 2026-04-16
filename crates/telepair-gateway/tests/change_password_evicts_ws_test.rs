@@ -185,3 +185,65 @@ async fn change_password_evicts_live_ws_connections() {
     drop(state);
     drop(storage);
 }
+
+/// Status-code split: wrong current password returns **400**, a
+/// missing/invalid bearer returns **401**. The frontend global 401
+/// interceptor relies on this split to decide whether to bounce the
+/// user to `/login`. If a future refactor collapses both branches
+/// back to `Error::Auth` → 401, the frontend will treat "wrong
+/// password" like "session expired" and log the caller out of a
+/// perfectly valid session — the same bug the exempt-path workaround
+/// used to mask, and the bug v0.1.6 fixes for good.
+#[tokio::test]
+async fn change_password_wrong_current_returns_400_not_401() {
+    let (_addr, router, state, _storage) = start_server().await;
+
+    let (_user, token) = state
+        .auth_service
+        .admin_create_user("wrongpw@example.test", "wpw", "correct-pw", false, true)
+        .await
+        .expect("seed user");
+
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::post("/api/auth/change-password")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    r#"{"current_password":"NOT-the-right-one","new_password":"newpass321"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "wrong current password must be 400 so the frontend 401 interceptor does not log the user out",
+    );
+}
+
+#[tokio::test]
+async fn change_password_invalid_bearer_returns_401() {
+    let (_addr, router, _state, _storage) = start_server().await;
+
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::post("/api/auth/change-password")
+                .header("Authorization", "Bearer not-a-real-token")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    r#"{"current_password":"anything","new_password":"newpass321"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "bad bearer must still surface as 401 — the frontend needs this to trigger the logout redirect",
+    );
+}

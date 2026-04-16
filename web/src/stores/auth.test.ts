@@ -31,7 +31,7 @@ vi.stubGlobal('localStorage', {
   removeItem: (key: string) => { delete persistStore[key]; },
 });
 
-const { auth, STORAGE_KEY } = await import('./auth');
+const { auth, STORAGE_KEY, onTokenChange } = await import('./auth');
 const { __setAuthExpiredHandler } = await import('../lib/api');
 // Neutralise the stale-token redirect: validateToken intentionally
 // probes with api.listTargets() and a 401 response now fires the
@@ -359,6 +359,77 @@ describe('auth.refreshIdentity', () => {
     auth.logout();
     await auth.refreshIdentity();
     expect(auth.currentUserId()).toBe('');
+  });
+});
+
+describe('onTokenChange', () => {
+  // Regression: module-level stores (sessionStore) cached per-identity
+  // data across tabs. Before `onTokenChange`, logout/login in the same
+  // tab left user A's targets and sessions in memory; on user B's next
+  // Dashboard mount they were rendered for one frame before the refetch
+  // landed. The contract: subscribers fire only when the token *value*
+  // changes, receive both prev and next, and one listener's throw must
+  // not starve others.
+  it('fires on every value change with (prev, next)', () => {
+    const events: Array<[string, string]> = [];
+    const unsubscribe = onTokenChange((prev, next) => {
+      events.push([prev, next]);
+    });
+    try {
+      auth.setToken('a');
+      auth.setToken('b');
+      auth.setToken('');
+      expect(events).toEqual([
+        ['', 'a'],
+        ['a', 'b'],
+        ['b', ''],
+      ]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('does NOT fire when setToken is called with the same value', () => {
+    // Matches the identity-cache invariant: back-to-back writes of the
+    // same token (persist upgrade, retry) must not churn listeners.
+    auth.setToken('same');
+    let count = 0;
+    const unsubscribe = onTokenChange(() => { count += 1; });
+    try {
+      auth.setToken('same');
+      auth.setToken('same', { persist: true });
+      expect(count).toBe(0);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('unsubscribe stops notifications', () => {
+    let count = 0;
+    const unsubscribe = onTokenChange(() => { count += 1; });
+    auth.setToken('first');
+    expect(count).toBe(1);
+    unsubscribe();
+    auth.setToken('second');
+    expect(count).toBe(1);
+  });
+
+  it('a throwing listener does not prevent other listeners from firing', () => {
+    // The emitter wraps each call in try/catch so one buggy subscriber
+    // (e.g. stale module from a hot-reload) cannot strand the others.
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let bCalled = false;
+    const unA = onTokenChange(() => { throw new Error('listener A boom'); });
+    const unB = onTokenChange(() => { bCalled = true; });
+    try {
+      auth.setToken('ok');
+      expect(bCalled).toBe(true);
+      expect(errorSpy).toHaveBeenCalled();
+    } finally {
+      unA();
+      unB();
+      errorSpy.mockRestore();
+    }
   });
 });
 
