@@ -1,9 +1,11 @@
 // web/src/components/Terminal.tsx
-import { onMount, onCleanup } from 'solid-js';
+import { onMount, onCleanup, createEffect } from 'solid-js';
 import { Terminal as XTerm } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
+import { terminalSettings } from '../stores/settings';
+import { themes, fontCss } from '../lib/terminal-themes';
 
 export interface TerminalHandle {
   write(data: string | Uint8Array): void;
@@ -42,35 +44,14 @@ export default function Terminal(props: TerminalProps) {
   onMount(() => {
     if (!containerRef) return;
 
+    const s = terminalSettings();
     term = new XTerm({
-      cursorBlink: true,
-      cursorStyle: 'block',
-      fontSize: 14,
-      fontFamily:
-        "'JetBrainsMono Nerd Font Mono', 'Menlo', 'Monaco', 'Courier New', monospace",
+      cursorBlink: s.cursorBlink,
+      cursorStyle: s.cursorStyle,
+      fontSize: s.fontSize,
+      fontFamily: fontCss(s.fontFamily),
       scrollback: 10000,
-      theme: {
-        background: '#0d1117',
-        foreground: '#e6edf3',
-        cursor: '#e6edf3',
-        selectionBackground: 'rgba(88, 166, 255, 0.3)',
-        black: '#484f58',
-        red: '#ff7b72',
-        green: '#3fb950',
-        yellow: '#d29922',
-        blue: '#58a6ff',
-        magenta: '#bc8cff',
-        cyan: '#39c5cf',
-        white: '#b1bac4',
-        brightBlack: '#6e7681',
-        brightRed: '#ffa198',
-        brightGreen: '#56d364',
-        brightYellow: '#e3b341',
-        brightBlue: '#79c0ff',
-        brightMagenta: '#d2a8ff',
-        brightCyan: '#56d4dd',
-        brightWhite: '#f0f6fc',
-      },
+      theme: themes[s.theme],
     });
 
     fitAddon = new FitAddon();
@@ -96,7 +77,7 @@ export default function Terminal(props: TerminalProps) {
     // refit so character cells are re-measured against the real font.
     if (typeof document !== 'undefined' && document.fonts?.load) {
       document.fonts
-        .load('14px "JetBrainsMono Nerd Font Mono"')
+        .load(`${s.fontSize}px "JetBrainsMono Nerd Font Mono"`)
         .then(() => {
           webglAddon?.clearTextureAtlas();
           fitAddon?.fit();
@@ -175,6 +156,24 @@ export default function Terminal(props: TerminalProps) {
     });
 
     term.focus();
+
+    // Reactively apply settings changes at runtime without recreating
+    // the xterm instance. Each property assignment triggers xterm's
+    // internal renderer update.
+    createEffect(() => {
+      if (!term || !fitAddon) return;
+      const s = terminalSettings();
+      term.options.theme = themes[s.theme];
+      term.options.fontSize = s.fontSize;
+      term.options.fontFamily = fontCss(s.fontFamily);
+      term.options.cursorStyle = s.cursorStyle;
+      // Only set cursorBlink when the terminal is NOT in read-only mode,
+      // because setReadOnly() disables blinking as a visual cue.
+      if (!readOnly) {
+        term.options.cursorBlink = s.cursorBlink;
+      }
+      fitAddon.fit();
+    });
   });
 
   onCleanup(() => {
