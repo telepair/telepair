@@ -9,8 +9,11 @@ import {
   setCursorStyle,
   setCursorBlink,
   resetSettings,
+  setNotificationsEnabled,
 } from '../stores/settings';
 import type { CursorStyle } from '../stores/settings';
+import { isSupported, requestPermission } from '../lib/notifications';
+import { toast } from '../stores/toast';
 import { THEME_IDS, FONT_FAMILIES, themes } from '../lib/terminal-themes';
 import type { ThemeId, FontFamilyId } from '../lib/terminal-themes';
 
@@ -59,6 +62,20 @@ export default function SettingsPanel() {
   };
 
   onCleanup(() => document.removeEventListener('mousedown', handleClickOutside));
+
+  const handleNotificationsToggle = async () => {
+    if (terminalSettings().notificationsEnabled) {
+      setNotificationsEnabled(false);
+      return;
+    }
+    const permission = await requestPermission();
+    if (permission === 'granted') {
+      setNotificationsEnabled(true);
+    } else {
+      setNotificationsEnabled(false);
+      toast.warning(t('settings.notifications_denied' as any), { duration: 5000 });
+    }
+  };
 
   return (
     <div class="settings-anchor" ref={panelRef}>
@@ -172,6 +189,22 @@ export default function SettingsPanel() {
               <span class="toggle-knob" />
             </button>
           </div>
+
+          {/* Browser notifications */}
+          <Show when={isSupported()}>
+            <div class="settings-section settings-row">
+              <label class="settings-label">{t('settings.notifications' as any)}</label>
+              <button
+                type="button"
+                class="toggle-switch"
+                role="switch"
+                aria-checked={terminalSettings().notificationsEnabled}
+                onClick={handleNotificationsToggle}
+              >
+                <span class="toggle-knob" />
+              </button>
+            </div>
+          </Show>
 
           {/* Reset */}
           <button

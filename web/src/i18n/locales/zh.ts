@@ -472,6 +472,11 @@ export const zh: Dict = {
     cursor_blink: '光标闪烁',
     reset: '恢复默认',
     aria_open: '打开终端设置',
+    notifications: '浏览器通知',
+    notifications_denied: '通知已被阻止 — 请在浏览器设置中开启',
+  },
+  notifications: {
+    joined: '{{ name }} 加入了会话',
   },
   admin_nav: {
     dashboard: '仪表板',

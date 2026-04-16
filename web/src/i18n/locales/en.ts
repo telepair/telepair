@@ -497,6 +497,11 @@ export const en = {
     cursor_blink: 'Cursor Blink',
     reset: 'Reset to defaults',
     aria_open: 'Open terminal settings',
+    notifications: 'Browser Notifications',
+    notifications_denied: 'Notifications blocked — enable in your browser settings',
+  },
+  notifications: {
+    joined: '{{ name }} joined the session',
   },
   admin_nav: {
     dashboard: 'Dashboard',
