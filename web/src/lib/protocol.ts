@@ -227,6 +227,7 @@ export const AuditEventType = {
   AUTH_USER_DISABLED: 'auth.user_disabled',
   AUTH_SESSION_ACCESS_DENIED: 'auth.session_access_denied',
   AUTH_PASSWORD_CHANGED: 'auth.password_changed',
+  AUTH_ADMIN_USER_CREATED: 'auth.admin_user_created',
   PARTICIPANT_ROLE_CHANGED: 'participant.role_changed',
 } as const;
 export type AuditEventType = (typeof AuditEventType)[keyof typeof AuditEventType];
