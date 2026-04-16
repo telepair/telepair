@@ -1,6 +1,6 @@
 // web/src/components/SettingsPanel.tsx
 import { createSignal, onCleanup, Show, For } from 'solid-js';
-import { useI18n } from '../i18n';
+import { useI18n, type TranslationKey } from '../i18n';
 import {
   terminalSettings,
   setTheme,
@@ -17,7 +17,7 @@ import { toast } from '../stores/toast';
 import { THEME_IDS, FONT_FAMILIES, themes } from '../lib/terminal-themes';
 import type { ThemeId, FontFamilyId } from '../lib/terminal-themes';
 
-const THEME_LABEL_KEYS: Record<ThemeId, string> = {
+const THEME_LABEL_KEYS: Record<ThemeId, TranslationKey> = {
   'github-dark': 'settings.theme_github_dark',
   'github-light': 'settings.theme_github_light',
   dracula: 'settings.theme_dracula',
@@ -25,7 +25,7 @@ const THEME_LABEL_KEYS: Record<ThemeId, string> = {
   'solarized-dark': 'settings.theme_solarized_dark',
 };
 
-const FONT_LABEL_KEYS: Record<FontFamilyId, string> = {
+const FONT_LABEL_KEYS: Record<FontFamilyId, TranslationKey> = {
   'jetbrains-mono': 'settings.font_jetbrains_mono',
   'fira-code': 'settings.font_fira_code',
   'source-code-pro': 'settings.font_source_code_pro',
@@ -34,7 +34,7 @@ const FONT_LABEL_KEYS: Record<FontFamilyId, string> = {
 };
 
 const CURSOR_STYLES: CursorStyle[] = ['block', 'underline', 'bar'];
-const CURSOR_LABEL_KEYS: Record<CursorStyle, string> = {
+const CURSOR_LABEL_KEYS: Record<CursorStyle, TranslationKey> = {
   block: 'settings.cursor_block',
   underline: 'settings.cursor_underline',
   bar: 'settings.cursor_bar',
@@ -73,7 +73,7 @@ export default function SettingsPanel() {
       setNotificationsEnabled(true);
     } else {
       setNotificationsEnabled(false);
-      toast.warning(t('settings.notifications_denied' as any), { duration: 5000 });
+      toast.warning(t('settings.notifications_denied'), { duration: 5000 });
     }
   };
 
@@ -82,19 +82,19 @@ export default function SettingsPanel() {
       <button
         type="button"
         class="settings-gear"
-        aria-label={t('settings.aria_open' as any)}
+        aria-label={t('settings.aria_open')}
         aria-expanded={open()}
         onClick={toggle}
       >
         ⚙
       </button>
       <Show when={open()}>
-        <div class="settings-panel" role="dialog" aria-label={t('settings.title' as any)}>
-          <div class="settings-heading">{t('settings.title' as any)}</div>
+        <div class="settings-panel" role="dialog" aria-label={t('settings.title')}>
+          <div class="settings-heading">{t('settings.title')}</div>
 
           {/* Theme swatches */}
           <div class="settings-section">
-            <label class="settings-label">{t('settings.theme' as any)}</label>
+            <label class="settings-label">{t('settings.theme')}</label>
             <div class="theme-swatches">
               <For each={[...THEME_IDS]}>
                 {(id) => (
@@ -102,7 +102,7 @@ export default function SettingsPanel() {
                     type="button"
                     class="theme-swatch"
                     classList={{ active: terminalSettings().theme === id }}
-                    title={t(THEME_LABEL_KEYS[id] as any)}
+                    title={t(THEME_LABEL_KEYS[id])}
                     onClick={() => setTheme(id)}
                     style={{
                       background: themes[id].background,
@@ -119,7 +119,7 @@ export default function SettingsPanel() {
 
           {/* Font size */}
           <div class="settings-section">
-            <label class="settings-label">{t('settings.font_size' as any)}</label>
+            <label class="settings-label">{t('settings.font_size')}</label>
             <div class="font-size-stepper">
               <button
                 type="button"
@@ -143,7 +143,7 @@ export default function SettingsPanel() {
 
           {/* Font family */}
           <div class="settings-section">
-            <label class="settings-label">{t('settings.font_family' as any)}</label>
+            <label class="settings-label">{t('settings.font_family')}</label>
             <select
               class="settings-select"
               value={terminalSettings().fontFamily}
@@ -151,7 +151,7 @@ export default function SettingsPanel() {
             >
               <For each={[...FONT_FAMILIES]}>
                 {(f) => (
-                  <option value={f.id}>{t(FONT_LABEL_KEYS[f.id] as any)}</option>
+                  <option value={f.id}>{t(FONT_LABEL_KEYS[f.id])}</option>
                 )}
               </For>
             </select>
@@ -159,7 +159,7 @@ export default function SettingsPanel() {
 
           {/* Cursor style */}
           <div class="settings-section">
-            <label class="settings-label">{t('settings.cursor_style' as any)}</label>
+            <label class="settings-label">{t('settings.cursor_style')}</label>
             <div class="cursor-style-group">
               <For each={CURSOR_STYLES}>
                 {(style) => (
@@ -169,7 +169,7 @@ export default function SettingsPanel() {
                     classList={{ active: terminalSettings().cursorStyle === style }}
                     onClick={() => setCursorStyle(style)}
                   >
-                    {t(CURSOR_LABEL_KEYS[style] as any)}
+                    {t(CURSOR_LABEL_KEYS[style])}
                   </button>
                 )}
               </For>
@@ -178,7 +178,7 @@ export default function SettingsPanel() {
 
           {/* Cursor blink */}
           <div class="settings-section settings-row">
-            <label class="settings-label">{t('settings.cursor_blink' as any)}</label>
+            <label class="settings-label">{t('settings.cursor_blink')}</label>
             <button
               type="button"
               class="toggle-switch"
@@ -193,7 +193,7 @@ export default function SettingsPanel() {
           {/* Browser notifications */}
           <Show when={isSupported()}>
             <div class="settings-section settings-row">
-              <label class="settings-label">{t('settings.notifications' as any)}</label>
+              <label class="settings-label">{t('settings.notifications')}</label>
               <button
                 type="button"
                 class="toggle-switch"
@@ -212,7 +212,7 @@ export default function SettingsPanel() {
             class="settings-reset"
             onClick={resetSettings}
           >
-            {t('settings.reset' as any)}
+            {t('settings.reset')}
           </button>
         </div>
       </Show>

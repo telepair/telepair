@@ -2,6 +2,7 @@
 import { createSignal } from 'solid-js';
 import type { ThemeId, FontFamilyId } from '../lib/terminal-themes';
 import { DEFAULT_THEME, DEFAULT_FONT_FAMILY } from '../lib/terminal-themes';
+import { safeGet, safeSet, safeRemove } from '../lib/storage';
 
 export const SETTINGS_KEY = 'telepair_terminal_settings';
 
@@ -24,30 +25,6 @@ const DEFAULTS: TerminalSettings = {
   cursorBlink: true,
   notificationsEnabled: false,
 };
-
-function safeGet(key: string): string | null {
-  try {
-    return typeof localStorage === 'undefined' ? null : localStorage.getItem(key);
-  } catch {
-    return null;
-  }
-}
-
-function safeSet(key: string, value: string): void {
-  try {
-    if (typeof localStorage !== 'undefined') localStorage.setItem(key, value);
-  } catch {
-    // quota / private mode
-  }
-}
-
-function safeRemove(key: string): void {
-  try {
-    if (typeof localStorage !== 'undefined') localStorage.removeItem(key);
-  } catch {
-    // ignore
-  }
-}
 
 export function loadSettings(): TerminalSettings {
   const raw = safeGet(SETTINGS_KEY);

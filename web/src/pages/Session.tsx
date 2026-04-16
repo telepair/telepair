@@ -28,6 +28,14 @@ import {
 
 const MAX_CHAT_HISTORY = 500;
 
+function shouldNotify(senderId: string): boolean {
+  return (
+    terminalSettings().notificationsEnabled &&
+    document.visibilityState !== 'visible' &&
+    senderId !== auth.currentUserId()
+  );
+}
+
 export default function SessionPage() {
   const { t } = useI18n();
   const params = useParams<{ id: string }>();
@@ -185,12 +193,8 @@ export default function SessionPage() {
           `peer-joined:${msg.user_id}`,
           t('chat.system_joined', { name: msg.name }),
         );
-        if (
-          terminalSettings().notificationsEnabled &&
-          document.visibilityState !== 'visible' &&
-          msg.user_id !== auth.currentUserId()
-        ) {
-          notify('telepair', t('notifications.joined' as any, { name: msg.name }));
+        if (shouldNotify(msg.user_id)) {
+          notify('telepair', t('notifications.joined', { name: msg.name }));
         }
         break;
       }
@@ -235,11 +239,7 @@ export default function SessionPage() {
           ...prev.slice(-(MAX_CHAT_HISTORY - 1)),
           { user_id: msg.user_id, name: msg.name, text: msg.text, ts: msg.ts },
         ]);
-        if (
-          terminalSettings().notificationsEnabled &&
-          document.visibilityState !== 'visible' &&
-          msg.user_id !== auth.currentUserId()
-        ) {
+        if (shouldNotify(msg.user_id)) {
           notify('telepair', `${msg.name}: ${msg.text}`);
         }
         break;

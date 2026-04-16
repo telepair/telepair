@@ -21,4 +21,5 @@ export function notify(title: string, body: string): void {
     window.focus();
     n.close();
   };
+  setTimeout(() => n.close(), 8000);
 }

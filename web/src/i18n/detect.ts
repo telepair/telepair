@@ -13,26 +13,7 @@
 // going rather than crashing the app.
 
 import { FALLBACK_LOCALE, STORAGE_KEY, type Locale } from './types';
-
-function safeGet(key: string): string | null {
-  try {
-    return typeof localStorage === 'undefined'
-      ? null
-      : localStorage.getItem(key);
-  } catch {
-    return null;
-  }
-}
-
-function safeSet(key: string, value: string): void {
-  try {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(key, value);
-    }
-  } catch {
-    // ignore — quota / private mode / sandboxed iframe
-  }
-}
+import { safeGet, safeSet } from '../lib/storage';
 
 function isLocale(value: unknown): value is Locale {
   return value === 'en' || value === 'zh';

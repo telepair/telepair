@@ -156,24 +156,29 @@ export default function Terminal(props: TerminalProps) {
     });
 
     term.focus();
+  });
 
-    // Reactively apply settings changes at runtime without recreating
-    // the xterm instance. Each property assignment triggers xterm's
-    // internal renderer update.
-    createEffect(() => {
-      if (!term || !fitAddon) return;
-      const s = terminalSettings();
-      term.options.theme = themes[s.theme];
-      term.options.fontSize = s.fontSize;
-      term.options.fontFamily = fontCss(s.fontFamily);
-      term.options.cursorStyle = s.cursorStyle;
-      // Only set cursorBlink when the terminal is NOT in read-only mode,
-      // because setReadOnly() disables blinking as a visual cue.
-      if (!readOnly) {
-        term.options.cursorBlink = s.cursorBlink;
-      }
-      fitAddon.fit();
-    });
+  // Reactively apply settings changes at runtime without recreating
+  // the xterm instance. Each property assignment triggers xterm's
+  // internal renderer update. Hoisted to component scope (not nested
+  // in onMount) per SolidJS convention; the `term` / `fitAddon` guard
+  // handles the pre-mount window. The `mounted` flag skips the first
+  // run because onMount already initialised the terminal with the
+  // current settings — a redundant fit() would send a duplicate resize
+  // frame to the server PTY.
+  let mounted = false;
+  createEffect(() => {
+    const s = terminalSettings();
+    if (!term || !fitAddon) return;
+    if (!mounted) { mounted = true; return; }
+    term.options.theme = themes[s.theme];
+    term.options.fontSize = s.fontSize;
+    term.options.fontFamily = fontCss(s.fontFamily);
+    term.options.cursorStyle = s.cursorStyle;
+    if (!readOnly) {
+      term.options.cursorBlink = s.cursorBlink;
+    }
+    fitAddon.fit();
   });
 
   onCleanup(() => {
