@@ -305,6 +305,7 @@ export const en = {
     event_auth_user_disabled: 'User disabled',
     event_auth_session_access_denied: 'Session access denied',
     event_auth_password_changed: 'Password changed',
+    event_auth_admin_user_created: 'Admin created user',
     event_participant_role_changed: 'Role changed',
   },
   chat: {
