@@ -289,6 +289,7 @@ export const zh: Dict = {
     event_auth_user_disabled: '用户已禁用',
     event_auth_session_access_denied: '会话访问被拒绝',
     event_auth_password_changed: '密码已更改',
+    event_auth_admin_user_created: '管理员创建用户',
     event_participant_role_changed: '角色已更改',
   },
   chat: {
