@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-04-16
+
+Patch release focused on **change-password API contract correctness** and
+**cross-account session safety**. Wrong-password errors are now 400 (not
+401), preventing the frontend from misinterpreting a typo as session
+expiry. Password changes evict stale WebSocket connections and clear
+client-side session state on token rotation, closing a cross-account
+data leak when switching users in the same tab. The audit subsystem
+gains a new event type and the export endpoint replaces a panic-prone
+`unwrap()` with proper error handling.
+
+No schema migration required. No wire-format changes. Drop-in upgrade
+from 0.1.5.
+
+### Fixed — Change-password API contract
+
+- `POST /api/auth/change-password` now returns **400** when the current
+  password is wrong, reserving **401** for invalid/missing bearer tokens.
+  Previously both cases returned 401, causing the frontend's 401
+  interceptor to treat a simple password typo as a session expiry and
+  redirect to the login page.
+- The frontend API client distinguishes the two status codes: 400
+  surfaces an inline "wrong password" error; 401 triggers the existing
+  session-expiry redirect.
+
+### Fixed — Cross-account session leak
+
+- Changing a password now evicts all WebSocket connections still carrying
+  the old bearer token, so a stale tab cannot continue operating under
+  the previous credential after a password rotation.
+- The frontend auth store clears `sessionStore` on token change,
+  preventing a same-tab account switch from leaking the previous user's
+  session list into the new user's dashboard view.
+- Dashboard re-fetches sessions after detecting a token change instead
+  of rendering stale data from the previous account.
+
+### Fixed — Audit consistency & robustness
+
+- Frontend adds `AUTH_ADMIN_USER_CREATED` to the audit event type enum
+  and label map so admin-created-user events render with a human-readable
+  label instead of falling through as a raw string.
+- `GET /api/admin/audit/export` replaces an `unwrap()` on the format
+  query parameter with proper error handling, returning 500 instead of
+  panicking on unexpected input.
+
+### Testing
+
+- Cargo test count: **341 → 372** (all green). New coverage:
+  `change_password_evicts_ws_test` (password change triggers WS
+  disconnect for old-token connections).
+- Vitest count: **148 → 159** (all green). New coverage for API client
+  400/401 branching, auth store token-change session clearing, and
+  session store cross-account isolation.
+- Playwright count: **44** (unchanged).
+
 ## [0.1.5] - 2026-04-15
 
 Patch release focused on **security and resilience**: privileged actions
@@ -1077,7 +1132,9 @@ role-based permissions, invite links, and real-time chat.
 - GitHub Actions CI pipeline and release workflow.
 - MIT license across the workspace.
 
-[Unreleased]: https://github.com/telepair/telepair/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/telepair/telepair/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/telepair/telepair/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/telepair/telepair/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/telepair/telepair/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/telepair/telepair/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/telepair/telepair/compare/v0.1.1...v0.1.2
