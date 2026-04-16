@@ -137,6 +137,28 @@ const currentUserSessionEnabled = () => currentUser()?.sessionEnabled ?? null;
 // failure so the next caller starts fresh.
 let identityInFlight: Promise<void> | null = null;
 
+// Subscribers notified whenever the token *value* actually changes
+// (login, logout, account swap in the same tab). Module-level stores
+// that cache per-identity data (sessionStore holding targets + session
+// history) register here to drop their state on credential change — a
+// logged-out user A must not leak targets/sessions to user B on the
+// next Dashboard mount. Listeners fire AFTER the new token is written
+// so any refetch they trigger uses the new credential.
+type TokenChangeListener = (prev: string, next: string) => void;
+const tokenChangeListeners = new Set<TokenChangeListener>();
+
+/**
+ * Subscribe to token changes. Returns an unsubscribe function.
+ * Intended for module-level stores — not for components (components
+ * should use Solid's reactive `token()` signal directly).
+ */
+export function onTokenChange(cb: TokenChangeListener): () => void {
+  tokenChangeListeners.add(cb);
+  return () => {
+    tokenChangeListeners.delete(cb);
+  };
+}
+
 // Flips to `true` when the FIRST `loadIdentity()` call settles —
 // either the whoami succeeded and `currentUser` was populated, or
 // it failed and `currentUser` stays null. AdminGuard watches this
@@ -194,6 +216,18 @@ function setToken(value: string, options: SetTokenOptions = {}) {
   }
   setTokenSignal(value);
   setErrorKey(null);
+  // Fire change notifications last, so listeners that read `auth.token()`
+  // or call back into this module see fully-settled state. One listener's
+  // throw must not starve the others.
+  if (value !== previous) {
+    for (const cb of tokenChangeListeners) {
+      try {
+        cb(previous, value);
+      } catch (e) {
+        console.error('tokenChange listener failed:', e);
+      }
+    }
+  }
 }
 
 /**

@@ -10,7 +10,7 @@ vi.stubGlobal('localStorage', {
   removeItem: (key: string) => { delete store[key]; },
 });
 
-const { sessionStore } = await import('./session');
+const { sessionStore, AuthChangedError } = await import('./session');
 
 function jsonResponse(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -237,6 +237,30 @@ describe('sessionStore.createSession', () => {
     expect(ids).not.toContain('sess-2');
   });
 
+  it('rejects with AuthChangedError if a token swap races the create', async () => {
+    // Regression for the Codex-reported cross-account navigation leak:
+    // if `api.createSession` is in flight when `reset()` fires (guest
+    // redeem / change-password in the same tab), returning the Session
+    // would let Dashboard.handleConfirmLaunch navigate the NEW identity
+    // into a session created by the OLD one. The fix throws
+    // `AuthChangedError` so the caller aborts the navigate.
+    mockFetch.mockResolvedValueOnce(jsonResponse([]));
+    await sessionStore.fetchSessions();
+
+    let resolveCreate: (v: Response) => void;
+    const pendingCreate = new Promise<Response>((r) => { resolveCreate = r; });
+    mockFetch.mockReturnValueOnce(pendingCreate);
+
+    const p = sessionStore.createSession(globalTarget('local-shell'));
+    // Token swap mid-flight before the server responds.
+    sessionStore.reset();
+    resolveCreate!(jsonResponse(fakeSession, 201));
+
+    await expect(p).rejects.toBeInstanceOf(AuthChangedError);
+    // And the stale session must NOT leak into the post-reset store.
+    expect(sessionStore.sessions()).toEqual([]);
+  });
+
   it('addresses user-owned targets by target_id, not target_name', async () => {
     // Regression guard for Fix #2 collision-shadowing: a user-owned
     // target with the same `name` as a global one MUST round-trip
@@ -278,5 +302,92 @@ describe('sessionStore.refresh', () => {
     expect(sessionStore.targets()).toEqual(fakeTargets);
     expect(sessionStore.sessions()).toEqual([fakeSession]);
     expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('sessionStore cross-account isolation', () => {
+  // Regression for the Codex-reported cross-account data leak:
+  // module-level signals survived token swaps, so user B would
+  // briefly see user A's targets and sessions between the token
+  // change and the next refetch landing. The fix wires a listener
+  // via `onTokenChange` that calls `sessionStore.reset()` synchronously.
+  it('reset() clears targets, sessions, and filter state', async () => {
+    mockFetch
+      .mockResolvedValueOnce(jsonResponse(fakeTargets))
+      .mockResolvedValueOnce(jsonResponse([fakeSession]));
+    await sessionStore.refresh();
+    expect(sessionStore.targets()).toEqual(fakeTargets);
+    expect(sessionStore.sessions()).toEqual([fakeSession]);
+
+    sessionStore.reset();
+
+    expect(sessionStore.targets()).toEqual([]);
+    expect(sessionStore.sessions()).toEqual([]);
+    expect(sessionStore.currentFilter()).toBe('active');
+    expect(sessionStore.currentTargetFilter()).toBe('');
+    expect(sessionStore.hasMoreSessions()).toBe(true);
+    expect(sessionStore.loading()).toBe(false);
+    expect(sessionStore.loadingMore()).toBe(false);
+  });
+
+  it('reset() invalidates in-flight fetchSessions so a late response does not leak', async () => {
+    // Simulate: user A triggered a session fetch, then swapped token
+    // (logout + user B login) before the response landed. The fetch
+    // was issued with A's bearer and would return A's rows — those
+    // rows must not land into the store after reset.
+    let resolveA: (v: Response) => void;
+    const pendingA = new Promise<Response>((r) => { resolveA = r; });
+    mockFetch.mockReturnValueOnce(pendingA);
+
+    const p = sessionStore.fetchSessions('active');
+
+    // Token swap mid-flight — reset bumps the generation counter so
+    // the in-flight apply is discarded on settlement.
+    sessionStore.reset();
+
+    resolveA!(jsonResponse([fakeSession]));
+    await p;
+
+    expect(sessionStore.sessions()).toEqual([]);
+  });
+
+  it('reset() invalidates in-flight fetchTargets the same way', async () => {
+    let resolveA: (v: Response) => void;
+    const pendingA = new Promise<Response>((r) => { resolveA = r; });
+    mockFetch.mockReturnValueOnce(pendingA);
+
+    const p = sessionStore.fetchTargets();
+    sessionStore.reset();
+    resolveA!(jsonResponse(fakeTargets));
+    await p;
+
+    expect(sessionStore.targets()).toEqual([]);
+  });
+
+  it('reset() fires automatically when auth token changes', async () => {
+    // End-to-end behaviour guard: the store subscribes to
+    // `onTokenChange` at module init, so a logout from auth.ts —
+    // without any explicit reset() call — must still drop the cache.
+    // Closes the gap that caused the cross-account leak in the first
+    // place.
+    const { auth } = await import('./auth');
+    // Ensure a known starting token so the eventual setToken('')
+    // actually represents a value change. (jsdom in this file only
+    // stubs localStorage, so the initial auth.token() can be '' and
+    // setToken('') would be a no-op for listeners without this.)
+    auth.setToken('user-a-token');
+    mockFetch
+      .mockResolvedValueOnce(jsonResponse(fakeTargets))
+      .mockResolvedValueOnce(jsonResponse([fakeSession]));
+    await sessionStore.refresh();
+    expect(sessionStore.targets()).toEqual(fakeTargets);
+    expect(sessionStore.sessions()).toEqual([fakeSession]);
+
+    // Simulate logout — auth.setToken('') → onTokenChange fires →
+    // session.ts subscriber runs reset().
+    auth.setToken('');
+
+    expect(sessionStore.targets()).toEqual([]);
+    expect(sessionStore.sessions()).toEqual([]);
   });
 });
