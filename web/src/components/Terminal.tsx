@@ -65,12 +65,21 @@ export default function Terminal(props: TerminalProps) {
     // rebuild its texture atlas once the bundled Nerd Font finishes
     // loading — otherwise the first paint uses fallback-font glyph
     // metrics and prompts render with shifted Nerd Font icons.
+    //
+    // Recording tooling sets `window.__DISABLE_WEBGL = true` via
+    // addInitScript to force the canvas renderer: the WebGL path has a
+    // stuck-row-offset bug after a client-side `term.reset()` that
+    // renders content ~row 11 (mid-pane) instead of row 0, and no public
+    // API clears it. The canvas renderer has no equivalent cache and
+    // repaints cleanly after reset.
     let webglAddon: WebglAddon | undefined;
-    try {
-      webglAddon = new WebglAddon();
-      term.loadAddon(webglAddon);
-    } catch {
-      // WebGL not available, fall back to canvas
+    if (!(window as unknown as { __DISABLE_WEBGL?: boolean }).__DISABLE_WEBGL) {
+      try {
+        webglAddon = new WebglAddon();
+        term.loadAddon(webglAddon);
+      } catch {
+        // WebGL not available, fall back to canvas
+      }
     }
 
     // When the async webfont lands, purge cached glyph textures and
