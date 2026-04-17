@@ -138,31 +138,41 @@ export class PlaybackEngine {
   }
 
   /**
-   * Seek to `timeSeconds`. Replays all output events up to that point
-   * synchronously (terminal state machine), then positions the engine
-   * ready to continue from there. If currently playing, playback
-   * resumes from the new position.
+   * Seek to `timeSeconds`. Replays every event up to and including the
+   * target so the terminal state machine, the recorded resize history,
+   * AND the collab sidebar (participants + chat) are all consistent
+   * with what the viewer would have seen by playing from time 0 to
+   * the target. If currently playing, playback resumes from the new
+   * position.
+   *
+   * Why every type, not just `o`/`r`: the sidebar is rebuilt from
+   * `j`/`l`/`c` events, and the player clears its participant + chat
+   * state before calling `seek()` (so a backward seek does not double
+   * up). Without replaying `j`/`l`/`c` here, every seek would empty
+   * the sidebar even though the underlying recording carries the
+   * data needed to reconstruct it. Each event is dispatched with
+   * `currentTime` set to its own recorded time so that downstream
+   * handlers (e.g. chat-message timestamps) receive the original
+   * value rather than the seek target.
    */
   seek(timeSeconds: number): void {
     const wasPlaying = this.state === 'playing';
     this.clearTimers();
     this.stopTicker();
 
-    this.currentTime = Math.max(0, Math.min(timeSeconds, this.duration));
+    const target = Math.max(0, Math.min(timeSeconds, this.duration));
+    this.currentTime = 0;
     this.nextIndex = 0;
 
-    // Replay all output ('o') events up to and including the target time.
     for (const event of this.events) {
-      if (event.time > this.currentTime) break;
+      if (event.time > target) break;
       this.nextIndex++;
-      if (event.type === 'o') {
-        this.onOutput?.(event.data);
-      }
-      // Emit resize so the terminal dimensions are correct at the seek point.
-      if (event.type === 'r') {
-        this.applyResize(event.data);
-      }
+      this.currentTime = event.time;
+      this.dispatch(event);
     }
+    // Pin currentTime to the seek target so the UI shows the requested
+    // position rather than the time of the last replayed event.
+    this.currentTime = target;
 
     if (wasPlaying) {
       this.state = 'paused'; // will be overridden by play()
