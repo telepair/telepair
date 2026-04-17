@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-04-17
+
+Minor release centred on **session recording and playback**. Live
+sessions can be captured as asciicast v2 `.cast` files on demand,
+replayed in the browser with play / pause / seek / speed controls, and
+shared via public signed links with configurable expiry and use
+quotas. The subsystem ships with a streaming writer (1 s timer /
+64 KiB threshold flush), a TTL background cleaner, full REST +
+WebSocket + CLI surfaces, and a collaboration-aware playback UI that
+replays participants and chat timelines in step with PTY output.
+
+The release also lands a focused **security pass** on the auth and
+share-link paths — per-IP throttling now covers `/api/auth/login` and
+`/api/auth/verify` (previously only `/api/auth/register`), share-link
+revocation URLs carry the SHA-256 digest instead of the raw token,
+and share-token validation runs as a single atomic
+`UPDATE … RETURNING` closing a TOCTOU race on `max_uses`.
+
+Two new tables (`recordings`, `recording_shares`) are applied
+idempotently at boot. Two new additive `ServerMessage` variants
+(`RecordingStarted`, `RecordingStopped`) and two new audit event
+types (`recording.started`, `recording.stopped`) land on the wire;
+no existing message, column, or response shape changes. Drop-in
+upgrade from 0.1.7.
+
 ### Added — Session recording
 
 - New session recording subsystem: opt-in `.cast` (asciicast v2)
@@ -77,6 +102,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   across the `.send().await` to the writer — under back-pressure
   the previous code blocked every concurrent write-lock acquirer
   for the duration of the flush handshake.
+
+### Testing
+
+- Cargo test count: **372 → 409** (all green). New coverage:
+  `recording_test` (asciicast v2 encode/decode round-trip,
+  `Recording` lifecycle, share-token hashing), `recording_storage_test`
+  (atomic `UPDATE … RETURNING` consumption, TTL cleaner row+file
+  parity, cross-recording token quota isolation), and gateway-level
+  REST coverage for the recording endpoints and access-control gates.
+- Vitest count: **185 → 194** (all green). New coverage:
+  `playback.test.ts` for the PlaybackEngine asciicast v2 parser and
+  play/pause/seek/speed state machine.
+- Playwright count: **44 → 51** (all green). New spec
+  `recording.spec.ts` exercises the owner start/stop flow, the live
+  indicator broadcast to peers, the share-link dialog, and the
+  anonymous `?token=` playback path outside `AuthGuard`.
 
 ## [0.1.7] - 2026-04-16
 
@@ -1266,7 +1307,8 @@ role-based permissions, invite links, and real-time chat.
 - GitHub Actions CI pipeline and release workflow.
 - MIT license across the workspace.
 
-[Unreleased]: https://github.com/telepair/telepair/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/telepair/telepair/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/telepair/telepair/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/telepair/telepair/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/telepair/telepair/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/telepair/telepair/compare/v0.1.4...v0.1.5
