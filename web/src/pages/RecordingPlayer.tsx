@@ -2,7 +2,6 @@
 import { createSignal, onMount, onCleanup, Show } from 'solid-js';
 import { useParams, useSearchParams, useNavigate } from '@solidjs/router';
 import { Terminal as XTerm } from '@xterm/xterm';
-import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import { api, errorMessage } from '../lib/api';
 import { formatBytes, formatDate } from '../lib/format';
@@ -39,7 +38,6 @@ export default function RecordingPlayer() {
   let terminalContainer: HTMLDivElement | undefined;
   let playerContainer: HTMLDivElement | undefined;
   let term: XTerm | undefined;
-  let fitAddon: FitAddon | undefined;
   let engine: PlaybackEngine | undefined;
 
   onMount(async () => {
@@ -83,6 +81,20 @@ export default function RecordingPlayer() {
         castContent = await blob.text();
       }
 
+      // ── Parse the cast first ─────────────────────────────────────────────
+      // Parsing the asciicast header gives us the authoritative
+      // recorded dimensions even on the anonymous share path (where
+      // the metadata endpoint 403s) — the asciicast v2 spec requires
+      // `width`/`height` in the header line, and `RecordingService`
+      // populates them from the live PTY size. Driving xterm from
+      // these dimensions keeps every replay byte-identical to the
+      // original session: the recorded output stream embeds cursor
+      // positioning escapes that depend on those exact dimensions, so
+      // a mismatch (e.g. fitting the terminal to the container)
+      // smears wraps and miscounts cursor moves.
+      engine = new PlaybackEngine();
+      engine.load(castContent);
+
       // Reveal the player layout *before* we reach for the terminal
       // container ref. The container lives inside `<Show when={!loading() && !error()}>`,
       // so its ref callback only fires once `loading()` flips to false —
@@ -96,8 +108,13 @@ export default function RecordingPlayer() {
       // ── Initialise xterm ────────────────────────────────────────────────
       if (!terminalContainer) throw new Error('Terminal container missing');
 
-      const initialWidth = rec?.width ?? 80;
-      const initialHeight = rec?.height ?? 24;
+      // Header dims are authoritative; rec metadata is a fallback for
+      // the unlikely case of a header that lacks them; 80×24 is the
+      // last-resort default. Never call `fit()` — it would resize the
+      // terminal grid to the container and corrupt cursor math during
+      // replay.
+      const initialWidth = engine.header.width || rec?.width || 80;
+      const initialHeight = engine.header.height || rec?.height || 24;
 
       term = new XTerm({
         disableStdin: true,
@@ -111,23 +128,16 @@ export default function RecordingPlayer() {
           cursor: '#c9d1d9',
         },
       });
-      fitAddon = new FitAddon();
-      term.loadAddon(fitAddon);
       term.open(terminalContainer);
-      fitAddon.fit();
-
-      // ── Initialise PlaybackEngine ────────────────────────────────────────
-      engine = new PlaybackEngine();
-      engine.load(castContent);
 
       setDuration(engine.duration);
 
       engine.onOutput = (data) => term?.write(data);
+      // A recorded resize event must move the terminal grid to the new
+      // logical size — fitting to the container would override that
+      // and break cursor math for every byte that follows.
       engine.onResize = (cols, rows) => {
-        if (term) {
-          term.resize(cols, rows);
-          fitAddon?.fit();
-        }
+        term?.resize(cols, rows);
       };
       engine.onTimeUpdate = (t) => setCurrentTime(t);
       engine.onComplete = () => {
