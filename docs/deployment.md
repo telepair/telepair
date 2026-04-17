@@ -177,21 +177,60 @@ telepair serves a same-origin frontend in production, so when the browser fetche
 
 ### Environment Variables
 
+Every env var below has a matching CLI flag (`--data-dir`, `--smtp-host`, etc.); flags win when both are set.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RUST_LOG` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
+| `TELEPAIR_DATA_DIR` | `~/.telepair` | Override the data directory (DB, admin token, targets.yaml, recordings). |
+| `TELEPAIR_TRUST_FORWARDED_HEADERS` | `false` | Trust `X-Forwarded-For` / `X-Real-IP` when keying the per-IP register rate limiter. Enable **only** behind a reverse proxy that rewrites those headers on every request — with this on in a direct-exposure setup, any client can forge the header and bypass throttling. |
+| `TELEPAIR_SMTP_HOST` | *(unset)* | SMTP server hostname. Required to enable email registration; unset disables the OTP path. |
+| `TELEPAIR_SMTP_PORT` | `587` | SMTP port (STARTTLS). |
+| `TELEPAIR_SMTP_USER` | *(unset)* | SMTP username. |
+| `TELEPAIR_SMTP_PASS` | *(unset)* | SMTP password. |
+| `TELEPAIR_SMTP_FROM` | *(unset)* | SMTP sender address, e.g. `"Telepair <noreply@example.com>"`. |
+| `TELEPAIR_RECORDING_ENABLED` | `false` | Master switch for session recording. When false, no session is ever recorded. |
+| `TELEPAIR_RECORDING_TTL_DAYS` | `30` | Retention in days. `0` means permanent (no TTL sweep). |
+| `TELEPAIR_RECORDING_DIR` | `<data-dir>/recordings` | Directory for `.cast` files. |
 
 ### Data Directory
 
-telepair stores all persistent data in `~/.telepair/`:
+telepair stores all persistent data in `~/.telepair/` (override with `--data-dir` / `TELEPAIR_DATA_DIR`):
 
-| File | Purpose |
+| Path | Purpose |
 |------|---------|
-| `telepair.db` | SQLite database (users, sessions, participants, invites) |
+| `telepair.db` | SQLite database (users, sessions, participants, invites, audit events, recordings, recording shares) |
 | `admin_token` | Admin bearer token (created on first run, mode 0600) |
 | `targets.yaml` | Virtual target definitions (optional) |
+| `recordings/` | `.cast` files for session recordings, one per recording id; created on first recording. Override with `--recording-dir` / `TELEPAIR_RECORDING_DIR`. |
 
-Back up `telepair.db` to preserve user accounts and session history.
+Back up `telepair.db` (and `recordings/` when recording is enabled) to preserve user accounts, session history, and playback.
+
+## Session recording
+
+Session recording is **off by default** and must be explicitly opted in. Enable with `--recording-enabled` (or `TELEPAIR_RECORDING_ENABLED=true`):
+
+```bash
+./telepair --web-dir web/dist \
+           --recording-enabled \
+           --recording-ttl-days 30
+```
+
+What you get when it's on:
+
+- Session owners can **start / stop** recordings from the in-session Recording panel (`POST /api/sessions/{id}/recording/{start,stop}`). Only one recording can be active on a session at a time.
+- Owners and admins can **list / play / delete** their own recordings; admins can list everyone's via `GET /api/admin/recordings`.
+- Owners can mint **signed share links** (TTL + max-uses) via `POST /api/recordings/{id}/shares`. Anonymous viewers hitting `/recordings/{id}/play?token=...` bypass `AuthGuard` and hit `/api/recordings/{id}/data?token=...` directly — the token is validated atomically against the recording id, remaining uses, and expiry in a single `UPDATE … RETURNING`.
+- A background **cleaner** scans `expires_at` every few minutes and deletes expired rows. Active recordings (`status = 'recording'`) are always excluded from the candidate set as defence-in-depth. `expires_at IS NULL` means "keep forever".
+
+Storage notes:
+
+- Recordings live as asciicast v2 `.cast` files in `--recording-dir` (default `<data-dir>/recordings/`), named by recording id.
+- Metadata (`file_size`, `duration_ms`, `event_count`, `status`, `expires_at`) goes into the `recordings` table; share tokens into `recording_shares`. Both are on `ON DELETE CASCADE` from their parent rows.
+- A recording whose writer dropped events under back-pressure is finalized as `status = 'failed'` (not `completed`) so "completed" always means "gapless asciicast".
+- Enabling recording costs disk — rough order of magnitude is a few KB/s per active session of PTY output plus chat/participant events. Size the volume or lower `TELEPAIR_RECORDING_TTL_DAYS` accordingly.
+
+When recording is **disabled**, the Recording panel is hidden in the UI, `POST /api/sessions/{id}/recording/start` returns `403 Forbidden` ("session recording is disabled on this server"), and no new writer task is spawned. Read endpoints (`GET /api/recordings`, `GET /api/recordings/{id}/data`, shares, etc.) keep working so previously-created recordings remain playable after an operator flips the switch off.
 
 ## Security Considerations
 

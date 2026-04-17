@@ -1052,3 +1052,199 @@ into the box.
 **Errors**
 - `401 Unauthorized` — missing or invalid token
 - `403 Forbidden` — caller is authenticated but not an admin
+
+## Recording
+
+All recording endpoints require the server to be started with `--recording-enabled` (or `TELEPAIR_RECORDING_ENABLED=true`). When disabled, only `POST /api/sessions/{id}/recording/start` returns `403 Forbidden` — read endpoints keep working so previously-created recordings remain playable after an operator flips the switch off.
+
+The `Recording` object shape (serialized `RecordingRow`) is:
+
+```json
+{
+  "id": "e4a5b2c1-...",
+  "session_id": "550e8400-...",
+  "status": "recording",
+  "file_path": "/home/admin/.telepair/recordings/e4a5b2c1-....cast",
+  "file_size": 0,
+  "duration_ms": null,
+  "width": 120,
+  "height": 40,
+  "event_count": 0,
+  "started_at": "2026-04-04T12:02:00Z",
+  "completed_at": null,
+  "expires_at": "2026-05-04T12:02:00Z",
+  "created_by": "..."
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Recording id — reused as DB PK, `.cast` filename, and asciicast header id. |
+| `status` | string | `"recording"`, `"completed"`, or `"failed"`. `"failed"` means the writer dropped events under back-pressure — the `.cast` file still exists but has gaps. |
+| `file_size` | integer | Bytes written to the `.cast` file. Updated on final flush. |
+| `duration_ms` | integer \| null | Wall-clock length of the recording. `null` while `status = "recording"`. |
+| `expires_at` | string \| null | ISO 8601 UTC timestamp after which the TTL cleaner will delete this recording. `null` means permanent. |
+
+### POST /api/sessions/{session_id}/recording/start
+
+Start recording on a session. Owner-only. Creates the DB row, spawns the writer task, attaches it to `SessionHub`, and broadcasts `RecordingStarted` to every participant.
+
+**Response** `201 Created` — body is the created `Recording` object (status `"recording"`).
+
+**Errors**
+- `401 Unauthorized` — missing or invalid token
+- `403 Forbidden` — caller is not the session owner, or `--recording-enabled` is false
+- `404 Not Found` — unknown `session_id`
+- `409 Conflict` — a recording is already active on this session, or the writer failed to attach to the hub
+- `410 Gone` — session is closed
+
+### POST /api/sessions/{session_id}/recording/stop
+
+Stop the active recording on a session. Owner-only. Detaches from the hub, broadcasts `RecordingStopped`, and the writer task flushes + finalizes the DB row asynchronously.
+
+**Response** `204 No Content`.
+
+**Errors**
+- `401 Unauthorized` / `403 Forbidden` — as above
+- `404 Not Found` — no active recording on this session
+- `409 Conflict` — hub rejected the detach (rare; usually a race with session close)
+
+### GET /api/recordings
+
+List recordings created by the authenticated user. Admins see only their own here — use `GET /api/admin/recordings` for the global view.
+
+**Response** `200 OK` — JSON array of `Recording` objects, newest-first.
+
+### GET /api/recordings/{recording_id}
+
+Get a single recording's metadata. Owner or admin.
+
+**Response** `200 OK` — `Recording` object.
+
+**Errors**
+- `401 Unauthorized` / `403 Forbidden` — caller is neither the owner nor an admin
+- `404 Not Found` — unknown recording id
+
+### GET /api/recordings/{recording_id}/data
+
+Download the asciicast v2 `.cast` file. Two access modes:
+
+1. **Bearer token** (owner or admin): standard `Authorization: Bearer <token>`.
+2. **Share token** (anonymous): append `?token=<raw_share_token>`. The server validates the token atomically (recording-id match + expiry + remaining uses + used_count++) in a single `UPDATE … RETURNING` — TOCTOU-safe.
+
+**Query**
+| Param | Description |
+|-------|-------------|
+| `token` | Raw share token from `POST /api/recordings/{id}/shares`. When present, the auth header is ignored. |
+
+**Response** `200 OK`
+- `Content-Type: application/x-asciicast`
+- `Content-Disposition: attachment; filename="<recording_id>.cast"`
+
+**Errors**
+- `401 Unauthorized` — neither a valid bearer token nor a valid share token
+- `403 Forbidden` — authenticated but not the owner / admin
+- `404 Not Found` — unknown recording id, or the `.cast` file is missing on disk
+- `410 Gone` — share token expired or used up
+
+### DELETE /api/recordings/{recording_id}
+
+Delete a recording. Owner or admin. Removes the `.cast` file first, then the DB row (and all `recording_shares` rows via `ON DELETE CASCADE`).
+
+**Response** `204 No Content`.
+
+**Errors**
+- `401 Unauthorized` / `403 Forbidden` — as above
+- `404 Not Found` — unknown recording id
+- `409 Conflict` — recording is still active (`status = 'recording'`); stop it first
+
+### POST /api/recordings/{recording_id}/keep
+
+Mark a recording as permanent by clearing its `expires_at`. Owner or admin. Returns the updated `Recording` so the UI can refresh without a re-fetch.
+
+**Response** `200 OK` — updated `Recording` with `"expires_at": null`.
+
+**Errors**
+- `401` / `403` / `404` — as above
+
+### POST /api/recordings/{recording_id}/expire
+
+Restore TTL on a recording. Sets `expires_at` to now + `--recording-ttl-days`. Owner or admin.
+
+**Response** `200 OK` — updated `Recording` with a fresh `expires_at`.
+
+**Errors**
+- `401` / `403` / `404` — as above
+
+### POST /api/recordings/{recording_id}/shares
+
+Mint a signed share link. **Owner only** — admins who are not the owner are rejected (share creation is owner-exclusive so one admin can't generate long-lived anonymous access against another user's recording).
+
+**Request**
+```json
+{
+  "max_uses": 10,
+  "expires_at": "2026-04-20T00:00:00Z"
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_uses` | integer \| null | `0` (unlimited) | Maximum redemptions. `0` means no cap. |
+| `expires_at` | string \| null | `null` (no TTL) | ISO 8601 UTC expiry timestamp. |
+
+**Response** `201 Created`
+```json
+{
+  "token": "raw-share-token-returned-once",
+  "share": {
+    "token_sha256": "...",
+    "recording_id": "e4a5b2c1-...",
+    "max_uses": 10,
+    "used_count": 0,
+    "expires_at": "2026-04-20T00:00:00Z",
+    "created_at": "2026-04-04T12:10:00Z"
+  }
+}
+```
+
+The raw `token` is returned **exactly once** — only its SHA-256 is persisted in `recording_shares.token_sha256`. Hand the raw value to the viewer as `?token=...`.
+
+**Errors**
+- `401` / `403` / `404` — as above
+
+### GET /api/recordings/{recording_id}/shares
+
+List shares for a recording. **Owner only**. Raw tokens are never returned — only digests, usage counts, and expiry.
+
+**Response** `200 OK` — JSON array of share objects (shape matches the `share` object returned from `POST`).
+
+### DELETE /api/recordings/{recording_id}/shares/{token_sha256}
+
+Revoke a share link. **Owner only**. The path parameter is the SHA-256 digest (from `GET …/shares`), not the raw token — putting the raw secret in a URL would leak it into access logs. The delete is scoped to `(recording_id, token_sha256)` at the storage layer so one owner cannot revoke another owner's share by hashing a leaked URL and passing their own `recording_id`.
+
+**Response** `204 No Content`.
+
+**Errors**
+- `401` / `403` — as above
+- `404 Not Found` — unknown digest, or digest belongs to a different recording (indistinguishable on purpose)
+
+### GET /api/admin/recordings
+
+Admin-only. List every recording in the system, newest-first.
+
+**Response** `200 OK` — JSON array of `Recording` objects.
+
+**Errors**
+- `401 Unauthorized` / `403 Forbidden` — non-admin caller
+
+### DELETE /api/admin/recordings/{recording_id}
+
+Admin-only force-delete. Bypasses the owner check but still blocks while `status = 'recording'` (stop the session first).
+
+**Response** `204 No Content`.
+
+**Errors**
+- `401` / `403` — as above
+- `404 Not Found` — unknown recording id
+- `409 Conflict` — recording is still active

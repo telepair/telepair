@@ -27,6 +27,7 @@ telepair-cli
 | `protocol.rs` | `ClientMessage` / `ServerMessage` 枚举(JSON,`#[serde(tag = "type")]`);PTY 输出作为原始二进制 WS 帧发送 |
 | `storage.rs` | 异步 `Storage` trait —— users、sessions、participants、invite tokens、audit events 的 CRUD |
 | `storage/sqlite.rs` | 基于 sqlx 的 `SqliteStorage` 实现,启动时通过 `run_migrations()` 幂等追加新列 / 新表 |
+| `recording.rs` | `RecordingRow`、`RecordingConfig`、asciicast v2 header/event 编码、share-token 哈希 —— 录制子系统的纯数据层 |
 | `auth.rs` | `TokenAuthProvider` —— token 使用 SHA-256 哈希校验(原始 token 在创建时返回一次,之后不再持久化) |
 | `target.rs` | `Target` 和 `TargetKind` 定义 |
 | `audit.rs` | `AuditEvent`、`AuditEventType`、`AuditSink` trait —— 只追加的事件日志,支撑 `telepair admin audit` 和应用内会话时间线 |
@@ -52,6 +53,7 @@ telepair-cli
 | `auth_service.rs` | `AuthService` —— 基于邮箱的注册（含 OTP 验证）、密码登录（Argon2 哈希）、密码修改（原子化 token 轮换）、管理员用户管理（`list_accounts`、`set_session_access`）。负责 SMTP 发送 OTP（通过 lettre）、登录限流（5 次错误后锁定 15 分钟）、服务端密码长度校验、以及防枚举的统一错误折叠。发出 `auth.register_rejected` / `auth.register_completed` / `auth.verify_failed` / `auth.login_failed` / `auth.password_changed` / `auth.user_enabled` / `auth.user_disabled` 审计事件。 |
 | `user_target_service.rs` | `UserTargetService` —— 用户自有目标的 CRUD（`create`、`update`、`delete`、`get`、`list`、`resolve_by_id`）。每次变更都校验所有权,在活跃会话引用该目标时阻止修改 / 删除（通过 `Conflict` 错误实现引用完整性），resolve 时故意不做 `${VAR}` 展开以防止用户提交的命令字符串泄露进程环境变量。 |
 | `target_service.rs` | `TargetService` —— 包装 `TargetEngine`,提供目标列表和解析能力。 |
+| `recording_service.rs` | `RecordingService` —— 持有 `RecordingConfig`,强制"每会话只能有一个活跃录制"不变量,铸造 recording id(同时复用为 DB 主键 + `.cast` 文件名 + asciicast header id),用单条原子化的 `UPDATE … RETURNING` 校验 share token（一次语句同时检查过期、剩余次数和 recording-id,TOCTOU 安全）,并把 share 删除限定到 `(recording_id, token_sha256)` 以阻止跨所有者撤销。`status = 'recording'` 时 `delete_recording` 会返回 `Conflict`。 |
 
 ### telepair-gateway
 
@@ -63,7 +65,9 @@ telepair-cli
 | `state.rs` | `AppState` —— 共享应用状态:storage、auth、`SessionService`、`InviteService`、`AuthService`、`UserTargetService`、`Arc<ArcSwap<TargetEngine>>`(用于原子化的目标热重载)、`Arc<dyn AuditSink>`、以及 `SessionHub` |
 | `http.rs` | REST handler：health、targets、sessions、参与者角色变更、invites（list / revoke）、会话历史、会话审计、whoami、修改密码、admin targets（list + reload）、admin users、admin audit。所有 handler 都走 service —— 生产代码不再直接访问 `.storage()`。 |
 | `ws.rs` | WebSocket handler —— 认证、角色校验、消息分发、PTY I/O 桥接,`participant.joined` / `participant.left` 审计事件发射 |
-| `session_hub.rs` | `SessionHub` —— 单会话状态:PTY 进程、已连接参与者、广播通道。持有 `Arc<SessionService>`(而非裸 Storage),所以空闲清理的关闭也会和所有者主动关闭走同一条审计路径,带 `CloseReason::Reaper`。 |
+| `session_hub.rs` | `SessionHub` —— 单会话状态:PTY 进程、已连接参与者、广播通道。持有 `Arc<SessionService>`(而非裸 Storage),所以空闲清理的关闭也会和所有者主动关闭走同一条审计路径,带 `CloseReason::Reaper`。录制活跃时会挂载一个 `RecordingSlot`(mpsc sender + 共享的 `AtomicU64` 丢帧计数器)—— PTY 与 collab tap 通过 `try_send` 投递事件,背压时递增计数器而不是阻塞。 |
+| `recording_writer.rs` | `spawn_recording_writer` —— 持有 `.cast` 文件句柄,从 `RecordingSlot` 通道消费事件,每 1 s 或 64 KiB 刷一次盘,`Stop` 时最终化 DB 行。丢帧计数非零时把 status 从 `completed` 翻成 `failed`;任何 IO 失败都会触发 hub 的 cleanup 回调以释放 slot。 |
+| `recording_cleaner.rs` | `spawn_recording_cleaner` —— 后台 TTL 清理任务,每隔数分钟扫描 `expires_at`。排除 `status = 'recording'` 行(对坏 expiry 写入的防御性兜底),先删 `.cast` 文件再删 DB 行。 |
 
 ### telepair-cli
 
@@ -160,11 +164,16 @@ pending_registrations (email, display_name, password_hash, otp_code,
                        attempts_remaining, expires_at, created_at)
 user_targets          (id, user_id, name, display, command, args, env, tags,
                        created_at, updated_at)
+recordings            (id, session_id, status, file_path, file_size,
+                       duration_ms, width, height, event_count,
+                       started_at, completed_at, expires_at, created_by)
+recording_shares      (token_sha256, recording_id, max_uses, used_count,
+                       expires_at, created_at)
 ```
 
 所有 ID 都是存为 TEXT 的 UUID。时间戳是 ISO 8601 TEXT。`Storage` trait 是异步且与具体实现无关的 —— v1 的后端是 SQLite。
 
-**Schema 演进（0.1.x）。** 迁移状态保存在单一的 `migrations/001_initial.sql` 中，每次启动都会整份加载。`telepair-core/src/storage/sqlite.rs` 里的 `run_migrations()` 会先执行完整 SQL 文件，再通过 `pragma_table_info` 做列存在性检查，以幂等方式给旧库补上新列 —— 如 `sessions.closed_reason`、`sessions.user_target_id`、`users` 表的邮箱认证字段（`email`、`password_hash`、`session_enabled`、`login_failed_count`、`login_locked_until`），以及 v0.1.4 新增的 `users.approval_state`。`approval_state` 的回填(backfill)会在该列首次添加时**仅执行一次**,把 v0.1.4 之前的待审批账号(`verified=TRUE AND session_enabled=FALSE`)重新分类为 `approval_state='pending'`,这样新的拆分不会把它们悄悄提升为 `approved`。新表（`audit_events`、`pending_registrations`、`user_targets`）用 `CREATE TABLE IF NOT EXISTS` 达成同样的效果。这让 0.1.x 范围内的原地升级保持可用，而不必引入正式的迁移框架；真正出现 schema 冲突时，pre-1.0 的"删库重建"兜底仍然适用。正式迁移框架留给后续 minor 版本。
+**Schema 演进（0.1.x）。** 迁移状态保存在 `migrations/` 目录下编号的 SQL 文件中,每次启动都会整份加载 —— 目前是 `001_initial.sql`(核心表)和 `002_recordings.sql`(v0.1.8 引入的 `recordings` / `recording_shares` 表,session 和 recording 外键都带 `ON DELETE CASCADE`,这样关闭会话或删除录制时相关行会原子地级联清理)。`telepair-core/src/storage/sqlite.rs` 里的 `run_migrations()` 会先执行完整 SQL 文件，再通过 `pragma_table_info` 做列存在性检查，以幂等方式给旧库补上新列 —— 如 `sessions.closed_reason`、`sessions.user_target_id`、`users` 表的邮箱认证字段（`email`、`password_hash`、`session_enabled`、`login_failed_count`、`login_locked_until`），以及 v0.1.4 新增的 `users.approval_state`。`approval_state` 的回填(backfill)会在该列首次添加时**仅执行一次**,把 v0.1.4 之前的待审批账号(`verified=TRUE AND session_enabled=FALSE`)重新分类为 `approval_state='pending'`,这样新的拆分不会把它们悄悄提升为 `approved`。新表（`audit_events`、`pending_registrations`、`user_targets`）用 `CREATE TABLE IF NOT EXISTS` 达成同样的效果。这让 0.1.x 范围内的原地升级保持可用，而不必引入正式的迁移框架；真正出现 schema 冲突时，pre-1.0 的"删库重建"兜底仍然适用。正式迁移框架留给后续 minor 版本。
 
 ### 审计事件
 
@@ -180,7 +189,17 @@ user_targets          (id, user_id, name, display, command, args, env, tags,
 | `session_id` | 建立索引 —— 支撑每会话时间线视图以及 `telepair admin audit --session <id>` 过滤 |
 | `detail` | 事件专属字段的 JSON blob:`reason`、`duration_s`、`role`、`max_uses`、`expires_at` 等 |
 
-四个索引覆盖四种查询形态:时间范围(`idx_audit_ts`)、单会话时间线(`idx_audit_session`)、单 actor 历史(`idx_audit_actor`)、按类型扫描(`idx_audit_type`)。写入端有 `SessionService`、`InviteService`、`AuthService` 登录路径、以及 admin targets reload handler;读取端有 `GET /api/sessions/{id}/audit` 和 `telepair admin audit` CLI。
+四个索引覆盖四种查询形态:时间范围(`idx_audit_ts`)、单会话时间线(`idx_audit_session`)、单 actor 历史(`idx_audit_actor`)、按类型扫描(`idx_audit_type`)。写入端有 `SessionService`、`InviteService`、`AuthService` 登录路径、录制开始 / 停止 handler,以及 admin targets reload handler;读取端有 `GET /api/sessions/{id}/audit` 和 `telepair admin audit` CLI。
+
+### 会话录制
+
+会话录制是一个三件套子系统,整体都由服务端的 `--recording-enabled` 标志(默认 OFF)门控:
+
+1. **Writer(`recording_writer.rs`)。** 持有 `.cast` 文件,从 hub 的录制通道消费事件,每 1 s 或 64 KiB 刷盘一次。hub 的 tap 用 `try_send` 投递事件,失败时会递增一个共享的 `AtomicU64` 丢帧计数器;writer 在最终化时读取该计数器,若非零就把行状态从 `completed` 翻成 `failed` —— "已完成"的录制里出现静默的缺口是正确性 bug,不是无伤大雅的噪声。
+2. **Service(`recording_service.rs`)。** 强制"每会话只能有一个活跃录制"不变量;铸造 recording id 并让 DB 主键 / `.cast` 文件名 / asciicast header id 共用这一个值(pre-v0.1.8 把三者拆开后出现过文件与数据库行漂移);用单条原子化的 `UPDATE recording_shares SET used_count = used_count + 1 … RETURNING` 校验 share token —— 同一条语句里检查过期、剩余次数和 recording-id;share 删除限定到 `(recording_id, token_sha256)`,这样一个所有者无法通过对一个泄露的 URL 做哈希来撤销别的所有者的 share。
+3. **Cleaner(`recording_cleaner.rs`)。** 循环扫描 `expires_at` 的后台任务。从候选集里排除 `status = 'recording'` 行,作为对坏 `expires_at` 写入或 wall-clock 跳变的防御性兜底;永远先删 `.cast` 文件,再删 DB 行,这样两步之间崩溃也不会残留孤儿文件。
+
+播放时 `.cast` 文件直接通过 `/api/recordings/{id}/data` 读取,既可用 bearer token(所有者 / 管理员),也可用 `?token=<share_token>`(匿名)。`/recordings/{id}/play` 路由处在 `AuthGuard` 外,所以持有分享链接的匿名观看者不会被弹回 `/login`。
 
 ## 安全模型
 

@@ -113,9 +113,27 @@ Sent immediately after successful `SessionJoin`.
   "participants": [
     { "user_id": "...", "name": "alice", "role": "owner", "color": "#58a6ff" }
   ],
-  "your_role": "owner"
+  "your_role": "owner",
+  "your_user_id": "...",
+  "chat_history": [
+    {
+      "user_id": "...",
+      "name": "alice",
+      "text": "hi team",
+      "ts": "2026-04-04T12:04:12.001Z"
+    }
+  ],
+  "recording": {
+    "recording_id": "e4a5b2c1-...",
+    "started_at": "2026-04-04T12:02:00Z"
+  }
 }
 ```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `chat_history` | array | Bounded replay of the in-session chat backlog (oldest-first, ephemeral — dies with the session). Each entry mirrors `PeerChat` 1:1 so the same renderer handles replay and live. |
+| `recording` | object \| null | `{ recording_id, started_at }` when a recording is active at join time; absent (or `null`) otherwise, so late joiners see the indicator without extra REST round-trips. |
 
 #### PeerJoined
 
@@ -189,6 +207,28 @@ re-evaluate input permissions without a reconnect.
 |-------|------|-------------|
 | `user_id` | string | UUID of the participant whose role changed |
 | `new_role` | string | New role: `"operator"` or `"viewer"` |
+
+#### RecordingStarted
+
+Broadcast to every participant when a recording starts on this session. Clients use this to flip the in-session "● REC" indicator without polling the REST endpoint. Requires the server to be started with `--recording-enabled`.
+
+```json
+{
+  "type": "RecordingStarted",
+  "recording_id": "e4a5b2c1-..."
+}
+```
+
+#### RecordingStopped
+
+Broadcast to every participant when the active recording stops (either explicitly via `POST /api/sessions/{id}/recording/stop` or implicitly when the session closes). Clients hide the recording indicator and invalidate any cached active-recording state.
+
+```json
+{
+  "type": "RecordingStopped",
+  "recording_id": "e4a5b2c1-..."
+}
+```
 
 #### Error
 

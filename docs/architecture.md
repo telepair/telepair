@@ -27,6 +27,7 @@ The foundation crate. Contains no business logic — only shared abstractions.
 | `protocol.rs` | `ClientMessage`/`ServerMessage` enums (JSON, `#[serde(tag = "type")]`); PTY output is sent as raw binary WS frames |
 | `storage.rs` | Async `Storage` trait — CRUD for users, sessions, participants, invite tokens, audit events |
 | `storage/sqlite.rs` | `SqliteStorage` implementation using sqlx, with boot-time `run_migrations()` that handles idempotent column / table additions |
+| `recording.rs` | `RecordingRow`, `RecordingConfig`, asciicast v2 header/event encoding, share-token hashing — the pure data layer backing the recording subsystem |
 | `auth.rs` | `TokenAuthProvider` — SHA-256 hashed token validation (raw token returned once at creation, never persisted) |
 | `target.rs` | `Target` and `TargetKind` definitions |
 | `audit.rs` | `AuditEvent`, `AuditEventType`, and `AuditSink` trait — append-only event log backing `telepair admin audit` and the in-app session timeline |
@@ -52,6 +53,7 @@ Business logic services that coordinate core abstractions. As of 0.1.1 this is t
 | `auth_service.rs` | `AuthService` — email-based registration with OTP verification, password login with Argon2 hashing, password change with atomic token rotation, and admin user management (`list_accounts`, `set_session_access`). Handles SMTP transport for OTP delivery (via lettre), login throttling (5-strike lockout with 15-minute window), server-side password-length validation, and enumeration-safe error collapsing. Emits `auth.register_rejected` / `auth.register_completed` / `auth.verify_failed` / `auth.login_failed` / `auth.password_changed` / `auth.user_enabled` / `auth.user_disabled` audit events. |
 | `user_target_service.rs` | `UserTargetService` — CRUD for user-owned targets (`create`, `update`, `delete`, `get`, `list`, `resolve_by_id`). Enforces ownership on every mutation, blocks update/delete while an active session references the target (referential integrity via `Conflict` error), and deliberately skips `${VAR}` expansion on resolve to prevent process-env leakage through user-supplied command strings. |
 | `target_service.rs` | `TargetService` — wraps `TargetEngine`, provides target listing and resolution. |
+| `recording_service.rs` | `RecordingService` — owns `RecordingConfig`, enforces the one-active-recording-per-session invariant, mints recording ids (reused as DB PK + `.cast` filename + asciicast header id), validates share tokens via a single atomic `UPDATE … RETURNING` (TOCTOU-safe quota + expiry + recording-id check), and scopes share deletion to `(recording_id, token_sha256)` to block cross-owner revoke. Blocks `delete_recording` with `Conflict` while `status = 'recording'`. |
 
 ### telepair-gateway
 
@@ -63,7 +65,9 @@ The client-facing layer. Runs the HTTP server, WebSocket upgrade, and serves the
 | `state.rs` | `AppState` — shared application state: storage, auth, `SessionService`, `InviteService`, `AuthService`, `UserTargetService`, `Arc<ArcSwap<TargetEngine>>` (for atomic target hot-reload), `Arc<dyn AuditSink>`, and the `SessionHub` |
 | `http.rs` | REST handlers: health, targets, sessions, participant role change, invites (list / revoke), session history, session audit, whoami, change password, admin targets (list + reload), admin users, admin audit. All handlers go through services — no `.storage()` access in production code. |
 | `ws.rs` | WebSocket handler — auth, role enforcement, message routing, PTY I/O bridge, `participant.joined` / `participant.left` audit emits |
-| `session_hub.rs` | `SessionHub` — per-session state: PTY process, connected participants, broadcast channels. Holds `Arc<SessionService>` (not raw Storage) so the reaper closure emits `CloseReason::Reaper` through the same audit path as owner-initiated closes. |
+| `session_hub.rs` | `SessionHub` — per-session state: PTY process, connected participants, broadcast channels. Holds `Arc<SessionService>` (not raw Storage) so the reaper closure emits `CloseReason::Reaper` through the same audit path as owner-initiated closes. A `RecordingSlot` (mpsc sender + shared `AtomicU64` drop counter) is installed when a recording is active — PTY and collab taps `try_send` into it and bump the counter on back-pressure. |
+| `recording_writer.rs` | `spawn_recording_writer` — owns the `.cast` file handle, drains the `RecordingSlot` channel, flushes on a 1 s timer or 64 KiB threshold, and finalizes the DB row on `Stop`. A non-zero drop count flips the status to `failed` instead of `completed`, and any IO failure triggers the hub's cleanup callback so the slot is released. |
+| `recording_cleaner.rs` | `spawn_recording_cleaner` — TTL background task that scans `expires_at` every few minutes. Excludes `status = 'recording'` rows (defence-in-depth against a bad expiry write), deletes the `.cast` file first, then the DB row. |
 
 ### telepair-cli
 
@@ -160,11 +164,16 @@ pending_registrations (email, display_name, password_hash, otp_code,
                        attempts_remaining, expires_at, created_at)
 user_targets          (id, user_id, name, display, command, args, env, tags,
                        created_at, updated_at)
+recordings            (id, session_id, status, file_path, file_size,
+                       duration_ms, width, height, event_count,
+                       started_at, completed_at, expires_at, created_by)
+recording_shares      (token_sha256, recording_id, max_uses, used_count,
+                       expires_at, created_at)
 ```
 
 All IDs are UUIDs stored as TEXT. Timestamps are ISO 8601 TEXT. The `Storage` trait is async and implementation-agnostic — SQLite is the v1 backend.
 
-**Schema evolution (0.1.x).** Migration state is kept in a single `migrations/001_initial.sql` file that is loaded on every boot. The loader (`run_migrations()` in `telepair-core/src/storage/sqlite.rs`) applies the full file, then performs column-existence checks (`pragma_table_info`) to idempotently add new columns on upgraded databases — e.g. `sessions.closed_reason`, `sessions.user_target_id`, the `users` columns for email auth (`email`, `password_hash`, `session_enabled`, `login_failed_count`, `login_locked_until`), and `users.approval_state` added in v0.1.4. The `approval_state` backfill is run exactly once at the moment the column is added, reclassifying pre-v0.1.4 pending signups (`verified=TRUE AND session_enabled=FALSE`) as `approval_state='pending'` so the new split does not silently promote them to `approved` on first read. New tables (`audit_events`, `pending_registrations`, `user_targets`) use `CREATE TABLE IF NOT EXISTS` for the same reason. This keeps in-place upgrades working within the 0.1.x line without introducing a formal migration framework; the pre-1.0 "delete the DB" fallback still applies on genuine schema conflicts. A proper migration framework is planned for a later minor bump.
+**Schema evolution (0.1.x).** Migration state is kept in numbered files under `migrations/` that are loaded on every boot — currently `001_initial.sql` (the core tables) and `002_recordings.sql` (the `recordings` / `recording_shares` tables added in v0.1.8, with `ON DELETE CASCADE` on the session and recording foreign keys so closing a session or deleting a recording cleans up its dependents atomically). The loader (`run_migrations()` in `telepair-core/src/storage/sqlite.rs`) applies the full file, then performs column-existence checks (`pragma_table_info`) to idempotently add new columns on upgraded databases — e.g. `sessions.closed_reason`, `sessions.user_target_id`, the `users` columns for email auth (`email`, `password_hash`, `session_enabled`, `login_failed_count`, `login_locked_until`), and `users.approval_state` added in v0.1.4. The `approval_state` backfill is run exactly once at the moment the column is added, reclassifying pre-v0.1.4 pending signups (`verified=TRUE AND session_enabled=FALSE`) as `approval_state='pending'` so the new split does not silently promote them to `approved` on first read. New tables (`audit_events`, `pending_registrations`, `user_targets`) use `CREATE TABLE IF NOT EXISTS` for the same reason. This keeps in-place upgrades working within the 0.1.x line without introducing a formal migration framework; the pre-1.0 "delete the DB" fallback still applies on genuine schema conflicts. A proper migration framework is planned for a later minor bump.
 
 ### Audit events
 
@@ -180,7 +189,17 @@ The `audit_events` table is append-only. Every row is a single immutable record 
 | `session_id` | Indexed — supports the per-session timeline view and the `telepair admin audit --session <id>` filter |
 | `detail` | JSON blob with event-specific fields: `reason`, `duration_s`, `role`, `max_uses`, `expires_at`, etc. |
 
-Four indexes cover the four query shapes: time-range (`idx_audit_ts`), per-session timeline (`idx_audit_session`), per-actor history (`idx_audit_actor`), and type-filtered scans (`idx_audit_type`). The table is written to from `SessionService`, `InviteService`, the login path in `AuthService`, and the admin targets reload handler; reads happen from `GET /api/sessions/{id}/audit` and the `telepair admin audit` CLI.
+Four indexes cover the four query shapes: time-range (`idx_audit_ts`), per-session timeline (`idx_audit_session`), per-actor history (`idx_audit_actor`), and type-filtered scans (`idx_audit_type`). The table is written to from `SessionService`, `InviteService`, the login path in `AuthService`, the recording start/stop handlers, and the admin targets reload handler; reads happen from `GET /api/sessions/{id}/audit` and the `telepair admin audit` CLI.
+
+### Session recording
+
+Session recording is a three-piece subsystem, all gated behind the server-wide `--recording-enabled` flag (default OFF):
+
+1. **Writer (`recording_writer.rs`).** Owns a `.cast` file, drains the hub's recording channel, and flushes on a 1 s timer or 64 KiB threshold. `try_send` failures from the hub's taps bump a shared `AtomicU64` drop counter; the writer reads it at finalisation and flips the row to `status = 'failed'` (vs `completed`) if any events were dropped — silent gaps in a "completed" recording are a correctness bug, not cosmetic noise.
+2. **Service (`recording_service.rs`).** Enforces one-active-recording-per-session, mints recording ids reused as DB PK + `.cast` filename + asciicast header id (decoupling the three caused file-vs-row drift in pre-v0.1.8 builds), validates share tokens via a single atomic `UPDATE recording_shares SET used_count = used_count + 1 … RETURNING` that checks expiry + remaining uses + recording-id in one statement, and scopes share deletion to `(recording_id, token_sha256)` so one owner cannot revoke another owner's share by hashing a leaked URL.
+3. **Cleaner (`recording_cleaner.rs`).** Background task that scans `expires_at` on a loop. Excludes `status = 'recording'` rows from the candidate set as defence-in-depth against a bad `expires_at` write or wall-clock jump; always deletes the `.cast` file first, then the DB row, so a crash between the two never strands an orphan file.
+
+Playback reads `.cast` files directly from `/api/recordings/{id}/data`, either via bearer token (owner / admin) or via `?token=<share_token>` (anonymous). The `/recordings/{id}/play` route sits outside `AuthGuard` so anonymous viewers with a share link are not bounced to `/login`.
 
 ## Security Model
 
