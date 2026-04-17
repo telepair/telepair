@@ -130,32 +130,55 @@ impl SessionService {
         Ok(())
     }
 
-    /// Owner-initiated close, atomic with the ownership check. The
-    /// HTTP `DELETE /api/sessions/:id` handler used to inline the
-    /// "fetch session, compare owner_id, then close" sequence — which
-    /// duplicated the policy already encoded in [`Self::require_owner`]
-    /// and silently drifted the moment any other call site needed the
-    /// same shape. Routing the handler through this wrapper means
-    /// "who can close a session" lives in exactly one place; if the
-    /// rule ever widens (e.g. admins can yank other users' sessions)
-    /// the change happens here, not scattered across the gateway.
+    /// User-initiated close over `DELETE /api/sessions/:id`. The HTTP
+    /// handler used to inline the "fetch session, compare owner_id,
+    /// then close" sequence — which duplicated the policy already
+    /// encoded in [`Self::require_owner`] and silently drifted the
+    /// moment any other call site needed the same shape. Routing the
+    /// handler through this wrapper means "who can close a session"
+    /// lives in exactly one place.
     ///
-    /// Always uses `CloseReason::Owner` and passes the actor through
-    /// to the audit emit so the timeline reads "alice ended session
-    /// X" instead of an actorless `session.closed`. Reaper / startup
-    /// callers stay on the bare [`Self::close_session`] entry point
-    /// because they have no actor and stamp their own reason.
-    pub async fn close_session_as_owner(&self, user: &User, session_id: &str) -> Result<()> {
-        // `require_owner` already returns the right error variants:
-        // missing → SessionNotFound (404), wrong owner → PermissionDenied
-        // (403). We discard the returned `Session` because the inner
-        // `close_session` re-fetches it for the audit `duration_s`
-        // calculation; doing one extra read costs nothing meaningful
-        // on a path that fires once per session lifetime, and avoids
-        // a parallel mutable-borrow detour through the storage layer.
-        self.require_owner(user, session_id).await?;
-        self.close_session(session_id, CloseReason::Owner, Some(user))
-            .await
+    /// Policy:
+    ///   - Session missing → `SessionNotFound` (→ 404).
+    ///   - Caller is neither owner nor admin → `PermissionDenied` (→ 403).
+    ///   - Session already closed → idempotent success. A second
+    ///     DELETE (UI double-click, retry after a timeout) must not
+    ///     surface a confusing 404 — the caller's intent ("session
+    ///     should not be active") is already satisfied.
+    ///   - Otherwise close with `CloseReason::Owner` when the caller
+    ///     owns the session, or `CloseReason::Admin` when an admin
+    ///     force-closes someone else's session (so the history row
+    ///     doesn't misattribute the action to the owner).
+    ///
+    /// Reaper / startup callers stay on the bare [`Self::close_session`]
+    /// entry point because they have no actor and stamp their own reason.
+    pub async fn close_session_by_user(&self, user: &User, session_id: &str) -> Result<()> {
+        let session = self.get_session_required(session_id).await?;
+        let is_owner = session.owner_id == user.id;
+        if !is_owner && !user.is_admin {
+            return Err(Error::PermissionDenied(format!(
+                "user {} does not own session {session_id}",
+                user.id
+            )));
+        }
+        if session.status != SessionStatus::Active {
+            return Ok(());
+        }
+        let reason = if is_owner {
+            CloseReason::Owner
+        } else {
+            CloseReason::Admin
+        };
+        match self.close_session(session_id, reason, Some(user)).await {
+            Ok(()) => Ok(()),
+            // A concurrent close (reaper racing with owner, two admin
+            // tabs double-clicking) beat us to the UPDATE. The row is
+            // now closed, which is the state we were trying to reach —
+            // treat it as success so the second caller doesn't see a
+            // spurious 404.
+            Err(Error::SessionNotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Bulk-close every still-active session, used by the boot-time

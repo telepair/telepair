@@ -845,23 +845,21 @@ pub async fn close_session(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // The "owner can close their own session" policy lives entirely
-    // inside `SessionService::close_session_as_owner`, which combines
-    // the existence check, ownership check, and audit-stamped close
-    // into one call. Previously this handler hand-rolled all three —
-    // duplicating the rule already encoded in `require_owner` and
-    // making it possible to drift one site without the other. The
-    // earlier version also overlapped auth and the session fetch
-    // with `tokio::join!` to save one round-trip; that micro-opt was
-    // not worth keeping a second copy of the policy in the gateway,
-    // since DELETE fires once per session lifetime.
+    // The "who can close a session" policy lives entirely inside
+    // `SessionService::close_session_by_user`, which combines the
+    // existence check, owner/admin check, idempotent already-closed
+    // handling, and audit-stamped close into one call. Previously
+    // this handler hand-rolled those — duplicating the rule already
+    // encoded in `require_owner` and making it possible to drift one
+    // site without the other.
     let user = extract_user(&state, &headers).await?;
     // A disabled owner must not be able to ride their still-valid
     // bearer token to close (and tear down for everyone else) a
     // session that outlived the disable event. Mirrors the gate on
     // POST /api/sessions so "disabled" consistently means "no
     // session-level mutations". Admins bypass for the same reason as
-    // everywhere else: bootstrap must not be able to lock itself out.
+    // everywhere else: bootstrap must not be able to lock itself out,
+    // and operators need force-close available after disabling a user.
     require_session_enabled(
         &state,
         &user,
@@ -871,7 +869,7 @@ pub async fn close_session(
     .await?;
     state
         .sessions
-        .close_session_as_owner(&user, &session_id)
+        .close_session_by_user(&user, &session_id)
         .await?;
     state.hub.stop_session(&session_id).await;
     Ok(StatusCode::NO_CONTENT)

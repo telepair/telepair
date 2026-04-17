@@ -290,7 +290,7 @@ async fn list_sessions_visible_to_admin_honours_filter() {
 }
 
 #[tokio::test]
-async fn close_session_as_owner_happy_path_marks_session_closed() {
+async fn close_session_by_user_happy_path_marks_session_closed() {
     // The HTTP `DELETE /api/sessions/:id` handler used to inline a
     // `get_session + owner check + close_session` triple, which made
     // it possible for a future contributor to add a code path that
@@ -304,7 +304,7 @@ async fn close_session_as_owner_happy_path_marks_session_closed() {
         .await
         .unwrap();
 
-    svc.close_session_as_owner(&owner, &session.id)
+    svc.close_session_by_user(&owner, &session.id)
         .await
         .unwrap();
 
@@ -314,7 +314,7 @@ async fn close_session_as_owner_happy_path_marks_session_closed() {
 }
 
 #[tokio::test]
-async fn close_session_as_owner_rejects_non_owner_and_missing() {
+async fn close_session_by_user_rejects_non_owner_non_admin_and_missing() {
     // Both error variants must round-trip to the same HTTP statuses
     // the inline check produced (404 / 403). The gateway lifts these
     // through `Error::http_status` and the assertions below pin
@@ -329,10 +329,10 @@ async fn close_session_as_owner_rejects_non_owner_and_missing() {
         .await
         .unwrap();
 
-    // Wrong user → PermissionDenied → 403, and the session must NOT
-    // have been closed as a side effect.
+    // Wrong user (non-admin) → PermissionDenied → 403, and the
+    // session must NOT have been closed as a side effect.
     let err = svc
-        .close_session_as_owner(&stranger, &session.id)
+        .close_session_by_user(&stranger, &session.id)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -344,11 +344,68 @@ async fn close_session_as_owner_rejects_non_owner_and_missing() {
 
     // Nonexistent session → SessionNotFound → 404.
     let err = svc
-        .close_session_as_owner(&owner, "no-such-session")
+        .close_session_by_user(&owner, "no-such-session")
         .await
         .unwrap_err();
     assert!(matches!(
         err,
         telepair_core::error::Error::SessionNotFound(_)
     ));
+}
+
+#[tokio::test]
+async fn close_session_by_user_is_idempotent_on_already_closed() {
+    // Regression for F3: the UI's Close button is debounced but a
+    // double-click within the ack window used to surface a confusing
+    // "session not found" toast because the storage-layer UPDATE
+    // filters on `status = 'active'` and a second call matched zero
+    // rows. Verify that the second close returns Ok and the session
+    // stays in its post-first-close state.
+    let (svc, store, auth) = setup().await;
+    let owner = seed_user(&store, &auth, "owner").await;
+    let session = svc
+        .create_session(&owner, "shell", InputMode::Serialized)
+        .await
+        .unwrap();
+
+    svc.close_session_by_user(&owner, &session.id)
+        .await
+        .unwrap();
+    // Second call is a no-op — not a 404. Anything else would mean
+    // the UI has to special-case "already closed" on every retry.
+    svc.close_session_by_user(&owner, &session.id)
+        .await
+        .unwrap();
+
+    let after = svc.get_session_required(&session.id).await.unwrap();
+    assert_eq!(after.status, SessionStatus::Closed);
+    // Reason must still be the original `Owner`, not overwritten by
+    // the second (no-op) call.
+    assert_eq!(after.closed_reason, Some(CloseReason::Owner));
+}
+
+#[tokio::test]
+async fn close_session_by_user_lets_admin_force_close_foreign_session() {
+    // Regression for F4: after an admin disables a user, that user's
+    // still-active session used to sit around until the idle reaper
+    // hit — `DELETE /api/sessions/:id` returned 403 because the
+    // admin wasn't the owner. Admins must be able to clean up.
+    // The close reason stamps as `Admin`, not `Owner`, so the
+    // history view doesn't misattribute the action.
+    let (svc, store, auth) = setup().await;
+    let owner = seed_user(&store, &auth, "owner").await;
+    let mut admin = seed_user(&store, &auth, "admin").await;
+    admin.is_admin = true;
+    let session = svc
+        .create_session(&owner, "shell", InputMode::Serialized)
+        .await
+        .unwrap();
+
+    svc.close_session_by_user(&admin, &session.id)
+        .await
+        .unwrap();
+
+    let after = svc.get_session_required(&session.id).await.unwrap();
+    assert_eq!(after.status, SessionStatus::Closed);
+    assert_eq!(after.closed_reason, Some(CloseReason::Admin));
 }

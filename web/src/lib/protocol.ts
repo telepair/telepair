@@ -64,11 +64,12 @@ export type SessionStatus = 'active' | 'closed';
  * it as `Unknown`.
  *
  * - `owner`   – the owner clicked Close in the session page.
+ * - `admin`   – an admin force-closed someone else's session (e.g. post-disable cleanup).
  * - `reaper`  – the idle reaper closed it after no participants were left.
  * - `startup` – server restart cleaned up an orphaned active row.
  * - `error`   – WS-phase launch failure (target vanished, PTY spawn failed, etc.).
  */
-export type CloseReason = 'owner' | 'reaper' | 'startup' | 'error';
+export type CloseReason = 'owner' | 'admin' | 'reaper' | 'startup' | 'error';
 
 export interface Session {
   id: string;

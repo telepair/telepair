@@ -232,10 +232,11 @@ export default function SessionPage() {
         // password rotation for an admin action:
         //   - `account_disabled` → "was removed by an admin"
         //   - `token_rotated`    → "re-authenticated" (neutral)
-        // For the evicted user themselves, the server follows this
-        // frame with `Close(CLOSE_CODE_TERMINAL)`, so the chat entry
-        // is mostly for anyone who captured the frame before
-        // teardown — consistent behavior is cheaper than a self-check.
+        // The server follows this frame with `Close(CLOSE_CODE_TERMINAL)`,
+        // but that close only flips `status` to 'error' — it never
+        // navigates. When the evicted user is US, route proactively
+        // so the tab doesn't linger with a stale OWNER badge and a
+        // dead terminal (surface-map §6 item 15 split).
         {
           const leaving = participants().find((p) => p.user_id === msg.user_id);
           const leavingName = leaving?.name ?? msg.user_id;
@@ -245,6 +246,23 @@ export default function SessionPage() {
               ? 'chat.system_reauth_required'
               : 'chat.system_evicted';
           appendSystemChat(`peer-evicted:${msg.user_id}`, t(chatKey, { name: leavingName }));
+          if (msg.user_id === auth.currentUserId()) {
+            if (msg.reason === 'token_rotated') {
+              toast.info(t('session.toast_evicted_token_rotated'), { duration: 4000 });
+              auth.logoutAndRedirect();
+            } else {
+              // `account_disabled` (and any future reason we haven't named
+              // yet): keep the credential — the user is still logged in,
+              // just no longer session-enabled — and route home so the
+              // Dashboard's pending-approval banner is the landing UI.
+              // `refreshIdentity` fires in the background so the banner
+              // reflects the freshly-disabled `session_enabled=false`
+              // instead of the stale cached value.
+              toast.info(t('session.toast_evicted_account_disabled'), { duration: 4000 });
+              void auth.refreshIdentity();
+              navigate('/');
+            }
+          }
         }
         break;
       case 'PeerChat':
