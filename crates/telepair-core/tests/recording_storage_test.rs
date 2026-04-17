@@ -1,3 +1,4 @@
+use telepair_core::error::Error;
 use telepair_core::recording::RecordingStatus;
 use telepair_core::session::InputMode;
 use telepair_core::storage::{SqliteStorage, Storage};
@@ -105,6 +106,11 @@ async fn recording_storage_list_recordings_for_user() {
         .create_recording("rec_a", &session_id, user_id, 80, 24, "/tmp/a.cast", None)
         .await
         .unwrap();
+    // Complete rec_a before creating rec_b so the
+    // `idx_recordings_one_active_per_session` partial unique index
+    // (migration 003) is satisfied — the test wants two recording
+    // rows per user, not two simultaneously-active ones.
+    store.complete_recording("rec_a", 100, 1, 64).await.unwrap();
     store
         .create_recording("rec_b", &session_id, user_id, 80, 24, "/tmp/b.cast", None)
         .await
@@ -256,6 +262,14 @@ async fn recording_storage_delete_share_is_scoped_to_recording_id() {
             "/tmp/scope_a.cast",
             None,
         )
+        .await
+        .unwrap();
+    // Complete rec_a before creating rec_b — see
+    // `idx_recordings_one_active_per_session` (migration 003). The
+    // scoping invariant under test only needs two distinct recording
+    // ids; their concurrent activity is incidental.
+    store
+        .complete_recording(&rec_a.id, 100, 1, 64)
         .await
         .unwrap();
     let rec_b = store
@@ -528,4 +542,63 @@ async fn recording_storage_set_recording_permanent() {
         .unwrap();
     let fetched2 = store.get_recording(&rec.id).await.unwrap().unwrap();
     assert_eq!(fetched2.expires_at, Some(new_expiry.to_string()));
+}
+
+/// The partial unique index added in migration 003 must reject a
+/// second `status='recording'` row for the same session — that is the
+/// safety net that closes the start-recording race even if the
+/// service-layer fast path was bypassed (e.g. by two concurrent
+/// callers passing the `find_active_recording` check together).
+/// Storage must surface the violation as `Error::Conflict`, not a raw
+/// SQL error, so HTTP returns 409 instead of 500.
+#[tokio::test]
+async fn recording_storage_duplicate_active_returns_conflict() {
+    let store = setup().await;
+    let (user_id, session_id) = seed(&store).await;
+
+    store
+        .create_recording(
+            "rec_dup_a",
+            &session_id,
+            user_id,
+            80,
+            24,
+            "/tmp/dup_a.cast",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let err = store
+        .create_recording(
+            "rec_dup_b",
+            &session_id,
+            user_id,
+            80,
+            24,
+            "/tmp/dup_b.cast",
+            None,
+        )
+        .await
+        .expect_err("second active recording for the same session must conflict");
+    assert!(
+        matches!(err, Error::Conflict(_)),
+        "expected Error::Conflict, got {err:?}"
+    );
+
+    // Failing the first one must free up the session — a fresh recording
+    // with a new id should then succeed without violating the index.
+    store.fail_recording("rec_dup_a").await.unwrap();
+    store
+        .create_recording(
+            "rec_dup_c",
+            &session_id,
+            user_id,
+            80,
+            24,
+            "/tmp/dup_c.cast",
+            None,
+        )
+        .await
+        .expect("post-fail recreate must succeed once the prior row is no longer 'recording'");
 }

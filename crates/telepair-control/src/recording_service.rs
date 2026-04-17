@@ -82,9 +82,19 @@ impl RecordingService {
     }
 
     /// Create a new recording for a session. Enforces the "at most one
-    /// active recording per session" invariant by checking for an
-    /// existing `status = 'recording'` row first. Returns
-    /// `Error::Conflict` if one already exists.
+    /// active recording per session" invariant.
+    ///
+    /// Defence is layered: a fast-path `find_active_recording` check
+    /// here returns a friendly `Error::Conflict` carrying the existing
+    /// recording id when the caller is single-threaded, and the
+    /// `idx_recordings_one_active_per_session` partial unique index
+    /// (migration 003) is the safety net that catches concurrent
+    /// callers who both pass this check together — the storage layer
+    /// translates the `SQLITE_CONSTRAINT_UNIQUE` back into
+    /// `Error::Conflict` so HTTP returns 409 either way. Without the
+    /// index, two concurrent `POST /recording/start` requests both
+    /// inserted rows; the loser was force-failed by the HTTP handler
+    /// and left an orphan `.cast` file behind.
     pub async fn create_recording(
         &self,
         session_id: &str,
@@ -92,7 +102,8 @@ impl RecordingService {
         width: i64,
         height: i64,
     ) -> Result<RecordingRow> {
-        // Conflict check: one active recording per session.
+        // Fast path: friendlier error message that names the existing
+        // recording. The DB index below is the source of truth.
         if let Some(existing) = self.storage.find_active_recording(session_id).await? {
             return Err(Error::Conflict(format!(
                 "session {session_id} already has an active recording: {}",
