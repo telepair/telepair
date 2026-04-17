@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use telepair_core::auth::token_sha256;
@@ -203,19 +203,49 @@ impl RecordingService {
     }
 
     /// Set or update `expires_at` to a specific RFC3339 timestamp.
+    /// The cleaner's `expires_at` comparison is a lexicographic string
+    /// compare against `now_rfc3339()`, so a non-RFC3339 value would
+    /// produce unpredictable behaviour — reject early. A past
+    /// timestamp is allowed: it means "this recording is overdue,
+    /// pick it up on the next cleaner pass", which is a meaningful
+    /// caller intent (e.g. the `expire_recording` endpoint when the
+    /// global TTL is 0).
     pub async fn set_expiry(&self, id: &str, expires_at: &str) -> Result<()> {
+        validate_rfc3339(expires_at)?;
         self.storage.set_recording_expiry(id, expires_at).await
     }
 
     /// Create a share token for a recording. Returns `(raw_token,
     /// RecordingShareRow)` — the raw token is only visible at mint
     /// time; the DB stores its SHA-256 digest.
+    ///
+    /// Validates inputs before touching the DB:
+    ///
+    /// * `max_uses` must be ≥ 0. The consume SQL evaluates
+    ///   `max_uses = 0 OR used_count < max_uses`, so a negative value
+    ///   makes the share unredeemable from the moment it is minted —
+    ///   the caller almost certainly did not mean that.
+    /// * `expires_at`, if `Some`, must parse as RFC3339 AND be in the
+    ///   future. The consume query lexicographically compares
+    ///   `expires_at > now_rfc3339()`, so a value that is not in the
+    ///   same format produces nonsensical orderings, and a value that
+    ///   is already in the past mints a share that nobody can ever
+    ///   redeem.
     pub async fn create_share(
         &self,
         recording_id: &str,
         max_uses: i64,
         expires_at: Option<&str>,
     ) -> Result<(String, RecordingShareRow)> {
+        if max_uses < 0 {
+            return Err(Error::InvalidInput(format!(
+                "max_uses must be >= 0 (0 = unlimited), got {max_uses}"
+            )));
+        }
+        if let Some(raw) = expires_at {
+            validate_future_rfc3339(raw)?;
+        }
+
         // Verify the recording exists.
         self.storage
             .get_recording(recording_id)
@@ -282,6 +312,37 @@ impl RecordingService {
             .delete_recording_share(recording_id, token_sha256)
             .await
     }
+}
+
+/// Parse-only check for RFC3339. Both `expires_at` columns are
+/// queried with lexicographic string compares against `now_rfc3339()`,
+/// so a non-RFC3339 value silently produces unpredictable orderings.
+/// Reject at the API boundary so bad input never reaches storage.
+fn validate_rfc3339(raw: &str) -> Result<DateTime<Utc>> {
+    let parsed = DateTime::parse_from_rfc3339(raw).map_err(|e| {
+        Error::InvalidInput(format!(
+            "expires_at must be an RFC3339 timestamp (e.g. 2026-12-31T23:59:59Z): {e}"
+        ))
+    })?;
+    Ok(parsed.with_timezone(&Utc))
+}
+
+/// Stricter check used at share-mint time: RFC3339 *and* in the
+/// future. A share whose `expires_at` is already past is dead on
+/// arrival — almost always a caller mistake (e.g. wrong timezone
+/// math). Quietly accepting it produces a "share that worked
+/// yesterday silently does not work today" UX bug that is painful to
+/// diagnose. `set_expiry` does NOT use this check because a past
+/// timestamp on a recording is a legitimate "expire ASAP" signal for
+/// the cleaner.
+fn validate_future_rfc3339(raw: &str) -> Result<()> {
+    let parsed = validate_rfc3339(raw)?;
+    if parsed <= Utc::now() {
+        return Err(Error::InvalidInput(format!(
+            "expires_at must be in the future, got {raw}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -753,5 +814,178 @@ mod tests {
             .await
             .expect_err("nonexistent recording must error");
         assert!(matches!(err, Error::InvalidInput(_)));
+    }
+
+    /// `max_uses < 0` would mint an unredeemable share — the consume
+    /// SQL `max_uses = 0 OR used_count < max_uses` is false on the
+    /// first use. Reject at the API boundary so callers get a clear
+    /// 400 instead of a "share token does not work" mystery.
+    #[tokio::test]
+    async fn create_share_rejects_negative_max_uses() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+        let svc = RecordingService::new(storage.clone(), test_config(dir.path()));
+
+        let (user, _) = storage.create_user("tester", false).await.unwrap();
+        let session = storage
+            .create_session_with_owner(
+                user.id,
+                "local-shell",
+                telepair_core::session::InputMode::Serialized,
+                None,
+            )
+            .await
+            .unwrap();
+        let rec = svc
+            .create_recording(&session.id, user.id, 80, 24)
+            .await
+            .unwrap();
+
+        let err = svc
+            .create_share(&rec.id, -1, None)
+            .await
+            .expect_err("negative max_uses must be rejected");
+        assert!(matches!(err, Error::InvalidInput(_)));
+    }
+
+    /// Non-RFC3339 `expires_at` would slip into the DB and produce
+    /// nonsensical lexicographic comparisons in the consume query.
+    /// Reject early.
+    #[tokio::test]
+    async fn create_share_rejects_malformed_expires_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+        let svc = RecordingService::new(storage.clone(), test_config(dir.path()));
+
+        let (user, _) = storage.create_user("tester", false).await.unwrap();
+        let session = storage
+            .create_session_with_owner(
+                user.id,
+                "local-shell",
+                telepair_core::session::InputMode::Serialized,
+                None,
+            )
+            .await
+            .unwrap();
+        let rec = svc
+            .create_recording(&session.id, user.id, 80, 24)
+            .await
+            .unwrap();
+
+        let err = svc
+            .create_share(&rec.id, 0, Some("tomorrow at 5pm"))
+            .await
+            .expect_err("malformed expires_at must be rejected");
+        assert!(matches!(err, Error::InvalidInput(_)));
+    }
+
+    /// An `expires_at` already in the past mints a share that nobody
+    /// can ever redeem — almost always a caller mistake (e.g. wrong
+    /// timezone math). Reject so the failure mode is loud rather than
+    /// "share that worked yesterday silently does not work today".
+    #[tokio::test]
+    async fn create_share_rejects_past_expires_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+        let svc = RecordingService::new(storage.clone(), test_config(dir.path()));
+
+        let (user, _) = storage.create_user("tester", false).await.unwrap();
+        let session = storage
+            .create_session_with_owner(
+                user.id,
+                "local-shell",
+                telepair_core::session::InputMode::Serialized,
+                None,
+            )
+            .await
+            .unwrap();
+        let rec = svc
+            .create_recording(&session.id, user.id, 80, 24)
+            .await
+            .unwrap();
+
+        let err = svc
+            .create_share(&rec.id, 0, Some("2000-01-01T00:00:00Z"))
+            .await
+            .expect_err("past expires_at must be rejected");
+        assert!(matches!(err, Error::InvalidInput(_)));
+    }
+
+    /// A well-formed future `expires_at` round-trips to the storage
+    /// layer unchanged.
+    #[tokio::test]
+    async fn create_share_accepts_well_formed_future_expires_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+        let svc = RecordingService::new(storage.clone(), test_config(dir.path()));
+
+        let (user, _) = storage.create_user("tester", false).await.unwrap();
+        let session = storage
+            .create_session_with_owner(
+                user.id,
+                "local-shell",
+                telepair_core::session::InputMode::Serialized,
+                None,
+            )
+            .await
+            .unwrap();
+        let rec = svc
+            .create_recording(&session.id, user.id, 80, 24)
+            .await
+            .unwrap();
+
+        let future = (Utc::now() + chrono::Duration::days(7)).to_rfc3339();
+        let (_raw, share) = svc
+            .create_share(&rec.id, 5, Some(&future))
+            .await
+            .expect("future expires_at must be accepted");
+        assert_eq!(share.max_uses, 5);
+        assert_eq!(share.expires_at.as_deref(), Some(future.as_str()));
+    }
+
+    /// `set_expiry` rejects non-RFC3339 input (the cleaner's lex
+    /// compare cannot reason about it safely) but ALLOWS past
+    /// timestamps — `expire_recording` legitimately uses
+    /// `set_expiry(now)` to push a recording into the cleaner's
+    /// next-pass candidate set.
+    #[tokio::test]
+    async fn set_expiry_rejects_malformed_but_allows_past_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+        let svc = RecordingService::new(storage.clone(), test_config(dir.path()));
+
+        let (user, _) = storage.create_user("tester", false).await.unwrap();
+        let session = storage
+            .create_session_with_owner(
+                user.id,
+                "local-shell",
+                telepair_core::session::InputMode::Serialized,
+                None,
+            )
+            .await
+            .unwrap();
+        let rec = svc
+            .create_recording(&session.id, user.id, 80, 24)
+            .await
+            .unwrap();
+
+        // Malformed → reject (would corrupt cleaner's lex comparison).
+        assert!(matches!(
+            svc.set_expiry(&rec.id, "not a timestamp").await,
+            Err(Error::InvalidInput(_))
+        ));
+
+        // Past timestamp → accept ("expire on next cleaner pass" is a
+        // legitimate caller intent, used by the `expire_recording`
+        // endpoint when the global TTL is 0).
+        svc.set_expiry(&rec.id, "2000-01-01T00:00:00Z")
+            .await
+            .expect("past RFC3339 must be accepted by set_expiry");
+
+        // Future timestamp → accept.
+        let future = (Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        svc.set_expiry(&rec.id, &future)
+            .await
+            .expect("future expires_at must be accepted");
     }
 }
