@@ -1,8 +1,19 @@
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
+
 use crate::error::{Error, Result};
 use crate::session::User;
 use crate::storage::{SqliteStorage, Storage};
+
+/// SHA-256 hex digest of a raw token. The DB stores only this digest,
+/// so callers minting or looking up a token go through here — keeps
+/// the hashing convention (algorithm, encoding) in one place across
+/// invites, recording shares, and any future token-backed surface.
+pub fn token_sha256(raw: &str) -> String {
+    let hash = Sha256::digest(raw.as_bytes());
+    hex::encode(hash)
+}
 
 /// Max attempts when generating a unique guest name before giving up.
 /// `users.name` is UNIQUE; with 8 chars of nanoid entropy (~47 bits)

@@ -15,9 +15,11 @@ use tokio::sync::{mpsc, oneshot};
 
 use telepair_core::permission::Role;
 use telepair_core::protocol::{
-    ChatEntry, ClientMessage, ServerMessage, close_code_for, error_codes, input_denied,
+    ChatEntry, ClientMessage, RecordingStatusInfo, ServerMessage, close_code_for, error_codes,
+    input_denied,
 };
 use telepair_core::session::{CloseReason, InputMode};
+use telepair_core::storage::Storage;
 
 use crate::session_hub::{PtyCommand, PtyLaunch, SessionAttachment};
 use crate::state::AppState;
@@ -445,12 +447,21 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
             Vec::new()
         });
 
+    let recording_status = match state.storage.find_active_recording(&session_id).await {
+        Ok(Some(rec)) => Some(RecordingStatusInfo {
+            recording_id: rec.id,
+            started_at: rec.started_at,
+        }),
+        _ => None,
+    };
+
     let state_msg = ServerMessage::SessionState {
         session: session.clone(),
         participants,
         your_role: my_role,
         your_user_id: user.id,
         chat_history,
+        recording: recording_status,
     };
     match serde_json::to_string(&state_msg) {
         Ok(json) => {

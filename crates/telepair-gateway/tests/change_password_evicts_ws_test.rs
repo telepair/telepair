@@ -29,6 +29,7 @@ use tower::ServiceExt;
 use telepair_agent::virtual_target::TargetEngine;
 use telepair_core::permission::Role;
 use telepair_core::protocol::ServerMessage;
+use telepair_core::recording::RecordingConfig;
 use telepair_core::session::InputMode;
 use telepair_core::storage::{SqliteStorage, Storage};
 use telepair_gateway::build_router;
@@ -42,6 +43,7 @@ async fn start_server() -> (String, axum::Router, AppState, Arc<SqliteStorage>) 
         None,
         None,
         std::path::PathBuf::from("/tmp/telepair-test-change-pw"),
+        RecordingConfig::default(),
     )
     .await;
     let router = build_router(state.clone());

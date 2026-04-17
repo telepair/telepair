@@ -2,6 +2,8 @@
 
 pub mod http;
 pub mod rate_limit;
+pub mod recording_cleaner;
+pub mod recording_writer;
 pub mod session_hub;
 pub mod state;
 pub mod ws;
@@ -144,6 +146,43 @@ pub fn build_router_with_options(
             delete(http::revoke_session_invite),
         )
         .route("/api/invite/redeem", post(http::redeem_invite))
+        // Recording control (owner-only)
+        .route(
+            "/api/sessions/{session_id}/recording/start",
+            post(http::start_recording),
+        )
+        .route(
+            "/api/sessions/{session_id}/recording/stop",
+            post(http::stop_recording),
+        )
+        // Recording CRUD
+        .route("/api/recordings", get(http::list_recordings))
+        .route(
+            "/api/recordings/{recording_id}",
+            get(http::get_recording).delete(http::delete_recording),
+        )
+        .route(
+            "/api/recordings/{recording_id}/data",
+            get(http::get_recording_data),
+        )
+        // Share management (owner-only)
+        .route(
+            "/api/recordings/{recording_id}/shares",
+            post(http::create_recording_share).get(http::list_recording_shares),
+        )
+        .route(
+            "/api/recordings/{recording_id}/shares/{token}",
+            delete(http::revoke_recording_share),
+        )
+        // Recording lifecycle (owner + admin)
+        .route(
+            "/api/recordings/{recording_id}/keep",
+            post(http::keep_recording),
+        )
+        .route(
+            "/api/recordings/{recording_id}/expire",
+            post(http::expire_recording),
+        )
         // Admin-only target management. Both handlers gate on
         // `is_admin` after `extract_user`, so unauthenticated callers
         // still get 401 from the shared extractor and non-admin
@@ -156,6 +195,11 @@ pub fn build_router_with_options(
         .route("/api/admin/audit", get(http::list_admin_audit))
         .route("/api/admin/audit/export", get(http::export_audit))
         .route("/api/admin/system", get(http::system_info))
+        .route("/api/admin/recordings", get(http::list_admin_recordings))
+        .route(
+            "/api/admin/recordings/{recording_id}",
+            delete(http::delete_admin_recording),
+        )
         .route("/api/admin/users", get(http::list_admin_users))
         .route(
             "/api/admin/users/{id}/enable",

@@ -310,6 +310,11 @@ export default function Dashboard() {
               {t('dashboard.change_password_link')}
             </a>
           </Show>
+          <Show when={!auth.currentUserIsGuest()}>
+            <a class="admin-link" href="/recordings" data-testid="recordings-link">
+              Recordings
+            </a>
+          </Show>
           <button
             class="refresh-btn"
             onClick={handleRefresh}

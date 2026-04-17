@@ -16,6 +16,8 @@ import type {
   SystemInfo,
   ValidateTargetsResult,
   AdminUsersResponse,
+  Recording,
+  RecordingShare,
 } from './protocol';
 
 /**
@@ -583,6 +585,118 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ role }),
     });
+  },
+
+  // ── Recordings ──────────────────────────────────────────────────────────────
+
+  /**
+   * Owner-only. Start recording the given session. Returns the new
+   * `Recording` row on success; 409 if a recording is already active.
+   */
+  startRecording(sessionId: string): Promise<Recording> {
+    return request(`/sessions/${sessionId}/recording/start`, { method: 'POST' });
+  },
+
+  /**
+   * Owner-only. Stop an active recording for the given session. The
+   * writer finalizes asynchronously, so the server returns 204 — the UI
+   * should react to the `RecordingStopped` WS broadcast for updated state.
+   */
+  stopRecording(sessionId: string): Promise<void> {
+    return request(`/sessions/${sessionId}/recording/stop`, { method: 'POST' });
+  },
+
+  /**
+   * List recordings visible to the authenticated user. Regular users
+   * see recordings they own; admins see all.
+   */
+  listRecordings(): Promise<Recording[]> {
+    return request('/recordings');
+  },
+
+  /**
+   * Fetch a single recording by its nanoid. Returns 404 if not found
+   * or the caller lacks access.
+   */
+  getRecording(id: string): Promise<Recording> {
+    return request(`/recordings/${id}`);
+  },
+
+  /**
+   * Delete a recording and its on-disk file. Returns 204 on success.
+   * Only the owner (or an admin) may delete.
+   */
+  deleteRecording(id: string): Promise<void> {
+    return request(`/recordings/${id}`, { method: 'DELETE' });
+  },
+
+  /**
+   * Build the URL for streaming a recording's asciicast data. NOT async
+   * — callers embed this in a `<video src>` or pass it to `fetch()`.
+   * An optional share token can be appended for unauthenticated access.
+   */
+  getRecordingDataUrl(id: string, token?: string): string {
+    const base = `${BASE}/recordings/${id}/data`;
+    return token ? `${base}?token=${encodeURIComponent(token)}` : base;
+  },
+
+  /**
+   * Create a share link for a recording. `maxUses` defaults to 1 on the
+   * server; `expiresAt` is an ISO-8601 string or omitted for no TTL.
+   * Returns the share row — the plaintext token is only present here,
+   * not in subsequent list calls.
+   */
+  createRecordingShare(
+    recordingId: string,
+    maxUses?: number,
+    expiresAt?: string,
+  ): Promise<RecordingShare & { token: string }> {
+    return request(`/recordings/${recordingId}/shares`, {
+      method: 'POST',
+      body: JSON.stringify({
+        ...(maxUses != null && { max_uses: maxUses }),
+        ...(expiresAt != null && { expires_at: expiresAt }),
+      }),
+    });
+  },
+
+  /** List all share links for a recording (owner-only). */
+  listRecordingShares(recordingId: string): Promise<RecordingShare[]> {
+    return request(`/recordings/${recordingId}/shares`);
+  },
+
+  /**
+   * Revoke a share link by its SHA-256 digest. Returns 204 on success.
+   */
+  deleteRecordingShare(recordingId: string, tokenSha256: string): Promise<void> {
+    return request(`/recordings/${recordingId}/shares/${tokenSha256}`, {
+      method: 'DELETE',
+    });
+  },
+
+  /**
+   * Mark a recording as "kept" — clears `expires_at` so the TTL reaper
+   * will not purge it. Returns the updated `Recording` row.
+   */
+  keepRecording(id: string): Promise<Recording> {
+    return request(`/recordings/${id}/keep`, { method: 'POST' });
+  },
+
+  /**
+   * Immediately schedule a recording for expiry by setting `expires_at`
+   * to now. Returns the updated `Recording` row.
+   */
+  expireRecording(id: string): Promise<Recording> {
+    return request(`/recordings/${id}/expire`, { method: 'POST' });
+  },
+
+  /**
+   * Admin-only. List all recordings across every user. Returns the same
+   * `Recording[]` shape as `listRecordings()` but with no ownership
+   * filter.
+   */
+  adminListRecordings(): Promise<Recording[]> {
+    return request('/admin/recordings');
   },
 };
 

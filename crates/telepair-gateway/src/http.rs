@@ -15,8 +15,9 @@ use telepair_control::invite_service::CreateInviteParams;
 use telepair_control::user_target_service::{CreateTargetParams, UpdateTargetParams};
 use telepair_core::error::Error;
 use telepair_core::permission::Role;
+use telepair_core::protocol::ServerMessage;
 use telepair_core::session::{InputMode, SessionListFilter, SessionStatus, User};
-use telepair_core::storage::{AccountFilter, AccountStatus};
+use telepair_core::storage::{AccountFilter, AccountStatus, Storage};
 use telepair_core::target::TargetKind;
 
 use uuid::Uuid;
@@ -275,38 +276,7 @@ pub async fn register(
     body: Result<Json<RegisterRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Json(body) = body?;
-
-    // Only enforce the IP throttle when we actually know the caller's
-    // address. If either piece is missing we skip the gate rather than
-    // reject the request — a production deployment that forgot to wire
-    // ConnectInfo would lock out every signup, and the per-email
-    // limiter inside `AuthService::register` still covers the most
-    // common "same user, mashing the button" shape.
-    //
-    // When `trust_forwarded_headers` is on, the key IP is pulled from
-    // `X-Forwarded-For` / `X-Real-IP` instead of the socket peer —
-    // otherwise the recommended "nginx in front of telepair" shape
-    // collapses every caller onto 127.0.0.1 and the whole fleet shares
-    // one bucket (see `resolve_client_ip`).
-    let client_ip = resolve_client_ip(&state, &headers, client_addr);
-    if let (Some(limiter), Some(ip)) = (state.register_rl.as_ref(), client_ip) {
-        use crate::rate_limit::RateLimitDecision;
-        if let RateLimitDecision::Throttled { retry_after } = limiter.check(ip) {
-            // Round up to the next 10-second bucket instead of leaking
-            // exact seconds. The precise remainder lets an attacker
-            // infer how recent their last probe was (a low-resolution
-            // timing oracle); 10s granularity is fine for the UX — a
-            // human retrying a form doesn't need second-accurate
-            // feedback — and clamped to at least 10 so the bucket is
-            // always meaningful.
-            let raw = retry_after.as_secs().max(1);
-            let secs = raw.div_ceil(10) * 10;
-            return Err(ApiError::with_message(
-                StatusCode::TOO_MANY_REQUESTS,
-                format!("Too many registrations from this address. Try again in {secs}s."),
-            ));
-        }
-    }
+    enforce_auth_rate_limit(&state, &headers, client_addr, "registrations")?;
 
     state
         .auth_service
@@ -318,6 +288,44 @@ pub async fn register(
     ))
 }
 
+/// Per-IP throttle for unauthenticated auth endpoints. Used by
+/// `register`, `login`, and `verify_otp` so a single host cannot
+/// brute-force OTP codes or run credential stuffing against many
+/// accounts. Skips silently when ConnectInfo is missing (test
+/// harnesses) or no limiter is configured — the per-email/per-user
+/// limits inside AuthService still cover the most common shapes,
+/// and rejecting everything in those cases would lock out every
+/// signup behind a misconfigured proxy.
+fn enforce_auth_rate_limit(
+    state: &AppState,
+    headers: &HeaderMap,
+    client_addr: Option<std::net::SocketAddr>,
+    surface: &'static str,
+) -> Result<(), ApiError> {
+    // Skip header parsing entirely when no limiter is configured —
+    // every test fixture and the default single-node config land
+    // here, and `resolve_client_ip` parses headers + a SocketAddr.
+    let Some(limiter) = state.auth_rl.as_ref() else {
+        return Ok(());
+    };
+    let Some(ip) = resolve_client_ip(state, headers, client_addr) else {
+        return Ok(());
+    };
+    use crate::rate_limit::RateLimitDecision;
+    if let RateLimitDecision::Throttled { retry_after } = limiter.check(ip) {
+        // Round up to the next 10-second bucket instead of leaking
+        // exact seconds — the precise remainder is a low-resolution
+        // timing oracle, and the user only needs ballpark feedback.
+        let raw = retry_after.as_secs().max(1);
+        let secs = raw.div_ceil(10) * 10;
+        return Err(ApiError::with_message(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("Too many {surface} from this address. Try again in {secs}s."),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 pub struct VerifyOtpRequest {
     pub email: String,
@@ -327,9 +335,16 @@ pub struct VerifyOtpRequest {
 /// `POST /api/auth/verify` — submit OTP code; returns bearer token on success.
 pub async fn verify_otp(
     State(state): State<AppState>,
+    OptionalClientAddr(client_addr): OptionalClientAddr,
+    headers: HeaderMap,
     body: Result<Json<VerifyOtpRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Json(body) = body?;
+    // Per-IP throttle so a 6-digit OTP (10⁶ space) cannot be
+    // exhausted in minutes by parallel attempts from the same host
+    // for a known email — the per-email AuthService rate limit only
+    // covers "same email mashing the button".
+    enforce_auth_rate_limit(&state, &headers, client_addr, "verification attempts")?;
     let token = state
         .auth_service
         .verify_otp(&body.email, &body.code)
@@ -348,9 +363,15 @@ pub struct LoginRequest {
 
 pub async fn login(
     State(state): State<AppState>,
+    OptionalClientAddr(client_addr): OptionalClientAddr,
+    headers: HeaderMap,
     body: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Json(body) = body?;
+    // Per-IP throttle so credential stuffing across many distinct
+    // accounts from the same host does not slip past the per-user
+    // 5-strike lockout that lives inside AuthService::login.
+    enforce_auth_rate_limit(&state, &headers, client_addr, "login attempts")?;
     let token = if let Some(t) = body.token {
         // Validate existing bearer token (admin / guest path).
         state.auth.validate(&t).await?;
@@ -2120,6 +2141,444 @@ pub async fn export_audit(
 }
 
 // --- Admin system info ---
+
+// ── Recording endpoints ──────────────────────────────────────────────────────
+
+/// Fetch a recording by id and enforce access. Returns the row on
+/// success; 404 if missing, 403 if the caller is neither the owner nor
+/// (when `admin_allowed`) an admin.
+async fn require_recording_access(
+    state: &AppState,
+    recording_id: &str,
+    user: &User,
+    admin_allowed: bool,
+) -> Result<telepair_core::recording::RecordingRow, ApiError> {
+    let recording = state
+        .recording
+        .get_recording(recording_id)
+        .await?
+        .ok_or(ApiError::bare(StatusCode::NOT_FOUND))?;
+    let is_owner = recording.created_by == user.id.to_string();
+    let is_admin = admin_allowed && user.is_admin;
+    if !is_owner && !is_admin {
+        return Err(ApiError::bare(StatusCode::FORBIDDEN));
+    }
+    Ok(recording)
+}
+
+/// `POST /api/sessions/{session_id}/recording/start`
+///
+/// Owner-only. Starts recording for an active session. Creates a DB
+/// row, builds the asciicast header, spawns the writer task, and
+/// attaches the recording channel to the hub's PTY tap. Broadcasts
+/// `RecordingStarted` to all connected participants.
+pub async fn start_recording(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    // Owner + active gate — mirrors `require_active_owned`.
+    state
+        .sessions
+        .require_active_owned(&user, &session_id)
+        .await?;
+
+    // Honour the server-wide `--recording-enabled` flag. Without this
+    // gate the CLI option silently does nothing and operators who
+    // disabled recording would still see new `.cast` files appear.
+    if !state.recording.should_record(None) {
+        return Err(ApiError::with_message(
+            StatusCode::FORBIDDEN,
+            "session recording is disabled on this server",
+        ));
+    }
+
+    // Use the live PTY size so the asciicast header and DB row match
+    // the actual terminal — playback viewports key off these values.
+    let (cols, rows) = state.hub.pty_size(&session_id).await.unwrap_or((80, 24));
+
+    // Create the recording row (enforces one-active-per-session inside
+    // RecordingService::create_recording).
+    let recording = state
+        .recording
+        .create_recording(&session_id, user.id, i64::from(cols), i64::from(rows))
+        .await?;
+
+    let header = state
+        .recording
+        .build_header(&session_id, &recording.id, cols, rows);
+    let file_path = state.recording.recording_file_path(&recording.id);
+
+    // If the writer aborts (file create / write / flush failure) it
+    // calls this cleanup so the hub releases its sender slot,
+    // letting the owner start a new recording without restarting
+    // the session. Without it the slot stays bound to a dead writer
+    // and every subsequent start/stop returns CONFLICT/NOT_FOUND.
+    let hub_for_cleanup = state.hub.clone();
+    let session_id_for_cleanup = session_id.clone();
+    let on_failure: crate::recording_writer::OnFailure = Box::new(move || {
+        tokio::spawn(async move {
+            hub_for_cleanup
+                .clear_recording_slot(&session_id_for_cleanup)
+                .await;
+        });
+    });
+    let recording_tx = crate::recording_writer::spawn_recording_writer(
+        recording.id.clone(),
+        file_path,
+        header,
+        state.storage.clone(),
+        on_failure,
+    );
+
+    // Attach to the hub so the PTY I/O loop starts forwarding events.
+    if let Err(reason) = state.hub.start_recording(&session_id, recording_tx).await {
+        tracing::warn!(
+            session_id,
+            recording_id = %recording.id,
+            reason,
+            "failed to attach recording to hub, rolling back"
+        );
+        let _ = state.storage.fail_recording(&recording.id).await;
+        return Err(ApiError::with_message(
+            StatusCode::CONFLICT,
+            reason.to_string(),
+        ));
+    }
+
+    // Broadcast to all participants so UIs show the recording indicator.
+    state
+        .hub
+        .broadcast_collab(
+            &session_id,
+            ServerMessage::RecordingStarted {
+                recording_id: recording.id.clone(),
+            },
+        )
+        .await;
+
+    // Audit.
+    state
+        .audit
+        .record(
+            telepair_core::audit::AuditEvent::new(
+                telepair_core::audit::AuditEventType::RecordingStarted,
+            )
+            .with_actor(user.id, user.name.clone())
+            .with_session(session_id)
+            .with_detail(serde_json::json!({
+                "recording_id": recording.id,
+            })),
+        )
+        .await;
+
+    Ok((StatusCode::CREATED, Json(recording)))
+}
+
+/// `POST /api/sessions/{session_id}/recording/stop`
+///
+/// Owner-only. Stops the active recording for a session. Detaches from
+/// the hub, broadcasts `RecordingStopped`, and the writer task flushes
+/// and finalizes the DB row asynchronously.
+pub async fn stop_recording(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    state
+        .sessions
+        .require_active_owned(&user, &session_id)
+        .await?;
+
+    // Find the active recording so we can broadcast its id.
+    let recording = state
+        .storage
+        .find_active_recording(&session_id)
+        .await?
+        .ok_or(ApiError::with_message(
+            StatusCode::NOT_FOUND,
+            "no active recording for this session",
+        ))?;
+
+    // Detach from the hub — sends RecordingEvent::Stop to the writer.
+    if let Err(reason) = state.hub.stop_recording(&session_id).await {
+        tracing::warn!(
+            session_id,
+            recording_id = %recording.id,
+            reason,
+            "failed to detach recording from hub"
+        );
+        return Err(ApiError::with_message(
+            StatusCode::CONFLICT,
+            reason.to_string(),
+        ));
+    }
+
+    // Broadcast to all participants.
+    state
+        .hub
+        .broadcast_collab(
+            &session_id,
+            ServerMessage::RecordingStopped {
+                recording_id: recording.id.clone(),
+            },
+        )
+        .await;
+
+    // Audit.
+    state
+        .audit
+        .record(
+            telepair_core::audit::AuditEvent::new(
+                telepair_core::audit::AuditEventType::RecordingStopped,
+            )
+            .with_actor(user.id, user.name.clone())
+            .with_session(session_id)
+            .with_detail(serde_json::json!({
+                "recording_id": recording.id,
+            })),
+        )
+        .await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/recordings` — list recordings created by the authenticated user.
+pub async fn list_recordings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    let rows = state.recording.list_for_user(user.id).await?;
+    Ok(Json(rows))
+}
+
+/// `GET /api/recordings/{id}` — get recording metadata. Owner or admin.
+pub async fn get_recording(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(recording_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    let recording = require_recording_access(&state, &recording_id, &user, true).await?;
+    Ok(Json(recording))
+}
+
+/// `DELETE /api/recordings/{id}` — delete a recording. Owner or admin.
+pub async fn delete_recording(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(recording_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    require_recording_access(&state, &recording_id, &user, true).await?;
+    state.recording.delete_recording(&recording_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Query parameter for `GET /api/recordings/{id}/data`.
+#[derive(Deserialize, Default)]
+pub struct RecordingDataQuery {
+    /// Share token — when present, no auth header is needed.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// `GET /api/recordings/{id}/data` — download the .cast file.
+///
+/// Supports two access modes:
+/// 1. Auth header: owner or admin can download directly.
+/// 2. `?token=<share_token>`: validates the share token (expiry +
+///    usage) without requiring auth. This powers share links.
+pub async fn get_recording_data(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(recording_id): Path<String>,
+    Query(query): Query<RecordingDataQuery>,
+) -> Result<Response, ApiError> {
+    // Try share-token path first (no auth required). The recording
+    // id is passed to `validate_share_token` so the
+    // recording-mismatch check happens *inside* the same atomic
+    // UPDATE that consumes a use — without this, an attacker holding
+    // a valid token for recording A could burn its quota by hitting
+    // recording B's URL.
+    if let Some(ref raw_token) = query.token {
+        state
+            .recording
+            .validate_share_token(raw_token, &recording_id)
+            .await?;
+    } else {
+        // Auth-header path: owner or admin.
+        let user = extract_user(&state, &headers).await?;
+        require_recording_access(&state, &recording_id, &user, true).await?;
+    }
+
+    let file_path = state.recording.recording_file_path(&recording_id);
+    let data = tokio::fs::read(&file_path).await.map_err(|e| {
+        tracing::warn!(
+            recording_id,
+            path = %file_path.display(),
+            error = %e,
+            "failed to read recording file"
+        );
+        ApiError::bare(StatusCode::NOT_FOUND)
+    })?;
+
+    axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-asciicast")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{recording_id}.cast\""),
+        )
+        .body(axum::body::Body::from(data))
+        .map_err(|_| ApiError::bare(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+/// Request body for `POST /api/recordings/{id}/shares`.
+#[derive(Deserialize)]
+pub struct CreateShareRequest {
+    #[serde(default)]
+    pub max_uses: Option<i64>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+/// `POST /api/recordings/{id}/shares` — create a share link. Owner only.
+pub async fn create_recording_share(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(recording_id): Path<String>,
+    body: Result<Json<CreateShareRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    require_recording_access(&state, &recording_id, &user, false).await?;
+
+    let Json(body) = body?;
+    let max_uses = body.max_uses.unwrap_or(0); // 0 = unlimited
+    let (raw_token, share) = state
+        .recording
+        .create_share(&recording_id, max_uses, body.expires_at.as_deref())
+        .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "token": raw_token,
+            "share": share,
+        })),
+    ))
+}
+
+/// `GET /api/recordings/{id}/shares` — list share links. Owner only.
+pub async fn list_recording_shares(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(recording_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    require_recording_access(&state, &recording_id, &user, false).await?;
+    let shares = state.recording.list_shares(&recording_id).await?;
+    Ok(Json(shares))
+}
+
+/// `DELETE /api/recordings/{id}/shares/{token_sha256}` — revoke a
+/// share link. Owner only. The path parameter is the SHA-256 digest
+/// (as returned by `list_recording_shares`), not the raw token —
+/// putting the raw secret in a URL would leak it into access logs.
+pub async fn revoke_recording_share(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((recording_id, token_sha256)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    require_recording_access(&state, &recording_id, &user, false).await?;
+    state
+        .recording
+        .delete_share_by_sha256(&token_sha256)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/recordings/{id}/keep` — mark a recording as permanent
+/// (clear `expires_at`). Owner or admin. Returns the updated row so
+/// the UI can refresh without a round-trip re-fetch.
+pub async fn keep_recording(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(recording_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    require_recording_access(&state, &recording_id, &user, true).await?;
+
+    state.recording.set_permanent(&recording_id).await?;
+    let updated = state
+        .recording
+        .get_recording(&recording_id)
+        .await?
+        .ok_or(ApiError::bare(StatusCode::NOT_FOUND))?;
+    Ok(Json(updated))
+}
+
+/// `POST /api/recordings/{id}/expire` — restore TTL on a recording.
+/// Sets `expires_at` to now + configured TTL. Owner or admin. Returns
+/// the updated row.
+pub async fn expire_recording(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(recording_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    require_recording_access(&state, &recording_id, &user, true).await?;
+
+    let expires_at = state
+        .recording
+        .compute_expires_at()
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    state
+        .recording
+        .set_expiry(&recording_id, &expires_at)
+        .await?;
+    let updated = state
+        .recording
+        .get_recording(&recording_id)
+        .await?
+        .ok_or(ApiError::bare(StatusCode::NOT_FOUND))?;
+    Ok(Json(updated))
+}
+
+/// `GET /api/admin/recordings` — admin-only. Lists every recording in the system.
+pub async fn list_admin_recordings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    require_admin(&user)?;
+    let rows = state.recording.list_all().await?;
+    Ok(Json(rows))
+}
+
+/// `DELETE /api/admin/recordings/{id}` — admin-only force-delete.
+pub async fn delete_admin_recording(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(recording_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = extract_user(&state, &headers).await?;
+    require_admin(&user)?;
+
+    // Verify recording exists so we don't silently 204 on a typo.
+    state
+        .recording
+        .get_recording(&recording_id)
+        .await?
+        .ok_or(ApiError::bare(StatusCode::NOT_FOUND))?;
+
+    state.recording.delete_recording(&recording_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
 
 /// `GET /api/admin/system` — admin-only. Returns a snapshot of
 /// server-level diagnostics: version, filesystem paths, SMTP status,

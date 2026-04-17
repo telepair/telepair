@@ -2,7 +2,7 @@
 //!
 //! These tests build a router directly (tower `oneshot`), inject a
 //! `ConnectInfo<SocketAddr>` extension into each request, and install
-//! a short rate-limit window on `AppState.register_rl` so the throttle
+//! a short rate-limit window on `AppState.auth_rl` so the throttle
 //! fires within test time. We deliberately do *not* exercise the
 //! production `AppState::new` path here — that starts a sqlite DB and
 //! a reaper task, which would slow the test without adding coverage
@@ -25,7 +25,7 @@ use tower::ServiceExt;
 /// requests without losing the shared limiter state.
 async fn setup_with_limiter(min_interval: Duration) -> axum::Router {
     let mut state = AppState::new_test().await;
-    state.register_rl = Some(Arc::new(RegisterRateLimiter::new(min_interval)));
+    state.auth_rl = Some(Arc::new(RegisterRateLimiter::new(min_interval)));
     build_router(state)
 }
 
@@ -98,7 +98,7 @@ async fn register_from_different_ip_is_not_throttled() {
 /// Build a router with the trust-forwarded-headers flag on.
 async fn setup_trusting_proxy(min_interval: Duration) -> axum::Router {
     let mut state = AppState::new_test().await;
-    state.register_rl = Some(Arc::new(RegisterRateLimiter::new(min_interval)));
+    state.auth_rl = Some(Arc::new(RegisterRateLimiter::new(min_interval)));
     state.trust_forwarded_headers = true;
     build_router(state)
 }

@@ -19,7 +19,9 @@ hex = { workspace = true }
 argon2 = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
+bytes = { workspace = true }

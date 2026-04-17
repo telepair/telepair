@@ -2,14 +2,15 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
-use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteRow};
 use sqlx::{Pool, Row, Sqlite, SqlitePool};
 use uuid::Uuid;
 
 use crate::audit::{AuditEvent, AuditEventType, AuditFilter};
+use crate::auth::token_sha256;
 use crate::error::{Error, Result};
 use crate::permission::Role;
+use crate::recording::{RecordingRow, RecordingShareRow, RecordingStatus};
 use crate::session::{
     ApprovalState, CloseReason, CreateUserTargetParams, InputMode, InviteToken,
     LoginFailureOutcome, Participant, PendingVerifyResult, RedeemIdentity, RedeemOutcome, Session,
@@ -55,6 +56,10 @@ impl SqliteStorage {
         // `CREATE TABLE/INDEX IF NOT EXISTS` so re-running it against
         // a populated DB is a no-op.
         sqlx::raw_sql(include_str!("../../../../migrations/001_initial.sql"))
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::raw_sql(include_str!("../../../../migrations/002_recordings.sql"))
             .execute(&self.pool)
             .await?;
 
@@ -460,6 +465,35 @@ fn row_to_user_target(r: &SqliteRow) -> Result<UserTarget> {
     })
 }
 
+fn row_to_recording(r: &SqliteRow) -> RecordingRow {
+    RecordingRow {
+        id: r.get("id"),
+        session_id: r.get("session_id"),
+        status: r.get("status"),
+        file_path: r.get("file_path"),
+        file_size: r.get("file_size"),
+        duration_ms: r.get("duration_ms"),
+        width: r.get("width"),
+        height: r.get("height"),
+        event_count: r.get("event_count"),
+        started_at: r.get("started_at"),
+        completed_at: r.get("completed_at"),
+        expires_at: r.get("expires_at"),
+        created_by: r.get("created_by"),
+    }
+}
+
+fn row_to_recording_share(r: &SqliteRow) -> RecordingShareRow {
+    RecordingShareRow {
+        token_sha256: r.get("token_sha256"),
+        recording_id: r.get("recording_id"),
+        max_uses: r.get("max_uses"),
+        used_count: r.get("used_count"),
+        expires_at: r.get("expires_at"),
+        created_at: r.get("created_at"),
+    }
+}
+
 fn row_to_audit_event(r: &SqliteRow) -> Result<AuditEvent> {
     // `detail` is stored as JSON text and round-trips through
     // `serde_json`. SQL NULL maps back to `Value::Null` — the
@@ -489,12 +523,6 @@ fn row_to_audit_event(r: &SqliteRow) -> Result<AuditEvent> {
         session_id: r.get("session_id"),
         detail,
     })
-}
-
-/// Compute SHA-256 hex digest of a raw token for O(1) indexed lookup.
-fn token_sha256(raw: &str) -> String {
-    let hash = Sha256::digest(raw.as_bytes());
-    hex::encode(hash)
 }
 
 /// Generate a new token, returning (raw, sha256_hex). The sha256 digest
@@ -2138,6 +2166,258 @@ impl Storage for SqliteStorage {
         .fetch_optional(&self.pool)
         .await?;
         row.map(|r| row_to_user_target(&r)).transpose()
+    }
+
+    // ── Recordings ────────────────────────────────────────────────────
+
+    async fn create_recording(
+        &self,
+        id: &str,
+        session_id: &str,
+        created_by: Uuid,
+        width: i64,
+        height: i64,
+        file_path: &str,
+        expires_at: Option<&str>,
+    ) -> Result<RecordingRow> {
+        let now_str = now_rfc3339();
+
+        sqlx::query(
+            "INSERT INTO recordings \
+               (id, session_id, status, file_path, file_size, width, height, \
+                event_count, started_at, expires_at, created_by) \
+             VALUES (?, ?, ?, ?, 0, ?, ?, 0, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(session_id)
+        .bind(RecordingStatus::Recording.as_str())
+        .bind(file_path)
+        .bind(width)
+        .bind(height)
+        .bind(&now_str)
+        .bind(expires_at)
+        .bind(created_by.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(RecordingRow {
+            id: id.to_string(),
+            session_id: session_id.to_string(),
+            status: RecordingStatus::Recording.as_str().to_string(),
+            file_path: Some(file_path.to_string()),
+            file_size: 0,
+            duration_ms: None,
+            width,
+            height,
+            event_count: 0,
+            started_at: now_str,
+            completed_at: None,
+            expires_at: expires_at.map(|s| s.to_string()),
+            created_by: created_by.to_string(),
+        })
+    }
+
+    async fn get_recording(&self, id: &str) -> Result<Option<RecordingRow>> {
+        let row = sqlx::query("SELECT * FROM recordings WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| row_to_recording(&r)))
+    }
+
+    async fn complete_recording(
+        &self,
+        id: &str,
+        duration_ms: i64,
+        event_count: i64,
+        file_size: i64,
+    ) -> Result<()> {
+        let now_str = now_rfc3339();
+        let result = sqlx::query(
+            "UPDATE recordings \
+             SET status = ?, duration_ms = ?, event_count = ?, \
+                 file_size = ?, completed_at = ? \
+             WHERE id = ?",
+        )
+        .bind(RecordingStatus::Completed.as_str())
+        .bind(duration_ms)
+        .bind(event_count)
+        .bind(file_size)
+        .bind(&now_str)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(Error::InvalidInput(format!("recording {id} not found")));
+        }
+        Ok(())
+    }
+
+    async fn fail_recording(&self, id: &str) -> Result<()> {
+        let now_str = now_rfc3339();
+        let result = sqlx::query("UPDATE recordings SET status = ?, completed_at = ? WHERE id = ?")
+            .bind(RecordingStatus::Failed.as_str())
+            .bind(&now_str)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(Error::InvalidInput(format!("recording {id} not found")));
+        }
+        Ok(())
+    }
+
+    async fn find_active_recording(&self, session_id: &str) -> Result<Option<RecordingRow>> {
+        let row =
+            sqlx::query("SELECT * FROM recordings WHERE session_id = ? AND status = ? LIMIT 1")
+                .bind(session_id)
+                .bind(RecordingStatus::Recording.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|r| row_to_recording(&r)))
+    }
+
+    async fn list_recordings_for_user(&self, user_id: Uuid) -> Result<Vec<RecordingRow>> {
+        let rows =
+            sqlx::query("SELECT * FROM recordings WHERE created_by = ? ORDER BY started_at DESC")
+                .bind(user_id.to_string())
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.iter().map(row_to_recording).collect())
+    }
+
+    async fn list_all_recordings(&self) -> Result<Vec<RecordingRow>> {
+        let rows = sqlx::query("SELECT * FROM recordings ORDER BY started_at DESC")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(row_to_recording).collect())
+    }
+
+    async fn list_expired_recordings(&self, limit: i64) -> Result<Vec<RecordingRow>> {
+        let now_str = now_rfc3339();
+        let rows = sqlx::query(
+            "SELECT * FROM recordings \
+             WHERE expires_at IS NOT NULL AND expires_at < ? \
+             ORDER BY expires_at ASC LIMIT ?",
+        )
+        .bind(&now_str)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_recording).collect())
+    }
+
+    async fn delete_recording(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM recordings WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_recording_permanent(&self, id: &str) -> Result<()> {
+        let result = sqlx::query("UPDATE recordings SET expires_at = NULL WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(Error::InvalidInput(format!("recording {id} not found")));
+        }
+        Ok(())
+    }
+
+    async fn set_recording_expiry(&self, id: &str, expires_at: &str) -> Result<()> {
+        let result = sqlx::query("UPDATE recordings SET expires_at = ? WHERE id = ?")
+            .bind(expires_at)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(Error::InvalidInput(format!("recording {id} not found")));
+        }
+        Ok(())
+    }
+
+    // ── Recording shares ──────────────────────────────────────────────
+
+    async fn create_recording_share(
+        &self,
+        recording_id: &str,
+        token_sha256: &str,
+        max_uses: i64,
+        expires_at: Option<&str>,
+    ) -> Result<RecordingShareRow> {
+        let now_str = now_rfc3339();
+
+        sqlx::query(
+            "INSERT INTO recording_shares \
+               (token_sha256, recording_id, max_uses, used_count, expires_at, created_at) \
+             VALUES (?, ?, ?, 0, ?, ?)",
+        )
+        .bind(token_sha256)
+        .bind(recording_id)
+        .bind(max_uses)
+        .bind(expires_at)
+        .bind(&now_str)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(RecordingShareRow {
+            token_sha256: token_sha256.to_string(),
+            recording_id: recording_id.to_string(),
+            max_uses,
+            used_count: 0,
+            expires_at: expires_at.map(|s| s.to_string()),
+            created_at: now_str,
+        })
+    }
+
+    async fn consume_recording_share(
+        &self,
+        token_sha256: &str,
+        expected_recording_id: &str,
+    ) -> Result<Option<RecordingShareRow>> {
+        // Single statement: validation + increment + RETURNING in one
+        // shot. SQLite serialises writes per connection so this is
+        // atomic; sqlx ≥ 0.7 + SQLite ≥ 3.35 supports RETURNING.
+        // The `expires_at` comparison uses RFC3339 strings, which
+        // sort lexicographically the same as the underlying instants
+        // (UTC, fixed offset) — matching how `list_expired_recordings`
+        // already orders rows.
+        let row = sqlx::query(
+            "UPDATE recording_shares \
+             SET used_count = used_count + 1 \
+             WHERE token_sha256 = ? \
+               AND recording_id = ? \
+               AND (max_uses = 0 OR used_count < max_uses) \
+               AND (expires_at IS NULL OR expires_at > ?) \
+             RETURNING *",
+        )
+        .bind(token_sha256)
+        .bind(expected_recording_id)
+        .bind(now_rfc3339())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| row_to_recording_share(&r)))
+    }
+
+    async fn list_recording_shares(&self, recording_id: &str) -> Result<Vec<RecordingShareRow>> {
+        let rows = sqlx::query(
+            "SELECT * FROM recording_shares \
+             WHERE recording_id = ? ORDER BY created_at DESC",
+        )
+        .bind(recording_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_recording_share).collect())
+    }
+
+    async fn delete_recording_share(&self, token_sha256: &str) -> Result<()> {
+        sqlx::query("DELETE FROM recording_shares WHERE token_sha256 = ?")
+            .bind(token_sha256)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 

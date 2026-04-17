@@ -5,10 +5,12 @@ use arc_swap::ArcSwap;
 use telepair_agent::virtual_target::TargetEngine;
 use telepair_control::auth_service::{AuthService, SmtpConfig};
 use telepair_control::invite_service::InviteService;
+use telepair_control::recording_service::RecordingService;
 use telepair_control::session_service::SessionService;
 use telepair_control::user_target_service::UserTargetService;
 use telepair_core::audit::AuditSink;
 use telepair_core::auth::TokenAuthProvider;
+use telepair_core::recording::RecordingConfig;
 use telepair_core::storage::{SqliteStorage, Storage};
 
 use crate::rate_limit::{DEFAULT_REGISTER_MIN_INTERVAL, RegisterRateLimiter};
@@ -54,20 +56,23 @@ pub struct AppState {
     pub auth_service: Arc<AuthService>,
     /// Per-user virtual target CRUD and PTY resolution.
     pub user_targets: Arc<UserTargetService>,
+    /// Session recording business logic (create, share, TTL).
+    pub recording: Arc<RecordingService>,
     /// Records the instant the server started, for uptime reporting.
     pub startup: std::time::Instant,
     /// Resolved data directory path (e.g. `~/.telepair`).
     pub data_dir: PathBuf,
     /// Whether SMTP was configured at startup.
     pub smtp_configured: bool,
-    /// Per-IP rate limiter for `POST /api/auth/register`. `None` in
-    /// test fixtures (so unit tests that fire many requests back to
-    /// back aren't throttled) and in any wiring that cannot see the
+    /// Per-IP rate limiter shared by the unauthenticated auth surface:
+    /// `POST /api/auth/{register,login,verify}`. `None` in test
+    /// fixtures (so unit tests that fire many requests back to back
+    /// aren't throttled) and in any wiring that cannot see the
     /// caller's `SocketAddr` (tower oneshot, reverse proxies that
     /// don't forward ConnectInfo). Production sets this via
     /// [`AppState::new`].
-    pub register_rl: Option<Arc<RegisterRateLimiter>>,
-    /// When `true`, the rate-limit gate on `POST /api/auth/register`
+    pub auth_rl: Option<Arc<RegisterRateLimiter>>,
+    /// When `true`, the rate-limit gate on the auth endpoints
     /// reads the caller's real IP from `X-Real-IP` (preferred; set by
     /// nginx from `$remote_addr`, non-forgeable in the documented
     /// single-hop deployment) or the rightmost `X-Forwarded-For`
@@ -90,6 +95,7 @@ impl AppState {
         targets_path: Option<PathBuf>,
         smtp: Option<Arc<SmtpConfig>>,
         data_dir: PathBuf,
+        recording_config: RecordingConfig,
     ) -> Self {
         let smtp_configured = smtp.is_some();
         let auth = Arc::new(TokenAuthProvider::new(storage.clone()));
@@ -104,6 +110,7 @@ impl AppState {
         let hub = Arc::new(SessionHub::new(sessions.clone()));
         let auth_service = Arc::new(AuthService::new(storage.clone(), smtp, audit.clone()));
         let user_targets = Arc::new(UserTargetService::new(storage.clone()));
+        let recording = Arc::new(RecordingService::new(storage.clone(), recording_config));
         // Production: start the idle-session reaper so orphaned PTYs
         // don't leak when all clients disconnect. The JoinHandle is
         // intentionally detached — the task lives for the process
@@ -113,12 +120,12 @@ impl AppState {
         // `drop` (not `let _`) to silence clippy::let_underscore_future:
         // ignoring the handle detaches the task, which is what we want.
         std::mem::drop(hub.spawn_reaper(ReaperConfig::default()));
-        let register_rl = Arc::new(RegisterRateLimiter::new(DEFAULT_REGISTER_MIN_INTERVAL));
+        let auth_rl = Arc::new(RegisterRateLimiter::new(DEFAULT_REGISTER_MIN_INTERVAL));
         // Detached sweep — drops stale entries so the map can't grow
         // unbounded under signup churn. Cadence matches the throttle
         // window; `ReaperConfig`-style tunables aren't warranted for
         // a single-purpose limiter this small.
-        let sweep = Arc::clone(&register_rl);
+        let sweep = Arc::clone(&auth_rl);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(DEFAULT_REGISTER_MIN_INTERVAL);
             // First tick fires immediately; skip it so startup doesn't
@@ -140,10 +147,11 @@ impl AppState {
             storage,
             auth_service,
             user_targets,
+            recording,
             startup: std::time::Instant::now(),
             data_dir,
             smtp_configured,
-            register_rl: Some(register_rl),
+            auth_rl: Some(auth_rl),
             trust_forwarded_headers: false,
         }
     }
@@ -166,6 +174,13 @@ impl AppState {
         let hub = Arc::new(SessionHub::new(sessions.clone()));
         let auth_service = Arc::new(AuthService::new(storage.clone(), None, audit.clone()));
         let user_targets = Arc::new(UserTargetService::new(storage.clone()));
+        let recording = Arc::new(RecordingService::new(
+            storage.clone(),
+            RecordingConfig {
+                dir: PathBuf::from("/tmp/telepair-test/recordings"),
+                ..RecordingConfig::default()
+            },
+        ));
         Self {
             auth,
             sessions,
@@ -177,12 +192,13 @@ impl AppState {
             storage,
             auth_service,
             user_targets,
+            recording,
             startup: std::time::Instant::now(),
             data_dir: PathBuf::from("/tmp/telepair-test"),
             smtp_configured: false,
             // Tests that want to exercise the limiter opt-in by
             // swapping this to `Some(...)` on the returned AppState.
-            register_rl: None,
+            auth_rl: None,
             trust_forwarded_headers: false,
         }
     }

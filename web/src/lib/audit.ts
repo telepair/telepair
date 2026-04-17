@@ -24,6 +24,8 @@ export const AUDIT_EVENT_LABEL_KEYS: Record<AuditEventType, TranslationKey> = {
   [AuditEventType.AUTH_PASSWORD_CHANGED]: 'session_detail.event_auth_password_changed',
   [AuditEventType.AUTH_ADMIN_USER_CREATED]: 'session_detail.event_auth_admin_user_created',
   [AuditEventType.PARTICIPANT_ROLE_CHANGED]: 'session_detail.event_participant_role_changed',
+  [AuditEventType.RECORDING_STARTED]: 'session_detail.event_recording_started',
+  [AuditEventType.RECORDING_STOPPED]: 'session_detail.event_recording_stopped',
 };
 
 export function eventLabel(t: Translator, type: string): string {

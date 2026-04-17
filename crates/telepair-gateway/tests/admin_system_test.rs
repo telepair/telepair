@@ -9,6 +9,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use telepair_agent::virtual_target::TargetEngine;
+use telepair_core::recording::RecordingConfig;
 use telepair_core::storage::{SqliteStorage, Storage};
 use telepair_gateway::state::AppState;
 use telepair_gateway::{CorsMode, build_router_with_options};
@@ -23,6 +24,7 @@ async fn setup() -> (axum::Router, String, String) {
         None,
         None,
         PathBuf::from("/tmp/telepair-test"),
+        RecordingConfig::default(),
     )
     .await;
     let router = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();

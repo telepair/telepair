@@ -2312,11 +2312,15 @@ version = "0.1.7"
 dependencies = [
  "argon2",
  "chrono",
+ "hex",
  "lettre",
+ "nanoid",
  "serde",
  "serde_json",
+ "sha2",
  "telepair-agent",
  "telepair-core",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -2327,6 +2331,7 @@ name = "telepair-core"
 version = "0.1.7"
 dependencies = [
  "argon2",
+ "bytes",
  "chrono",
  "hex",
  "nanoid",

@@ -133,6 +133,14 @@ pub enum EvictReason {
     TokenRotated,
 }
 
+/// Recording status embedded in `SessionState` so late joiners know
+/// immediately whether a recording is active when they connect.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordingStatusInfo {
+    pub recording_id: String,
+    pub started_at: String,
+}
+
 // --- Server -> Client ---
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -146,6 +154,9 @@ pub enum ServerMessage {
         /// dies with the session; see `session_hub::CHAT_HISTORY_CAP`.
         #[serde(default)]
         chat_history: Vec<ChatEntry>,
+        /// Present when a recording is active at join time.
+        #[serde(default)]
+        recording: Option<RecordingStatusInfo>,
     },
     PeerJoined {
         user_id: Uuid,
@@ -209,6 +220,14 @@ pub enum ServerMessage {
     Error {
         code: String,
         message: String,
+    },
+    /// Broadcast to all participants when a recording starts on this session.
+    RecordingStarted {
+        recording_id: String,
+    },
+    /// Broadcast to all participants when a recording stops on this session.
+    RecordingStopped {
+        recording_id: String,
     },
 }
 
