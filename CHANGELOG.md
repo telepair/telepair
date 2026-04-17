@@ -78,6 +78,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the previous code blocked every concurrent write-lock acquirer
   for the duration of the flush handshake.
 
+## [0.1.7] - 2026-04-16
+
+Patch release focused on **terminal personalization and out-of-tab
+awareness**: the session page gains a settings panel for theme, font,
+and cursor style (all persisted in `localStorage`), and a browser-
+notification path surfaces chat messages and peer joins when the tab
+is hidden. Web-only change — no backend, schema, or wire-format impact.
+Drop-in upgrade from 0.1.6.
+
+### Added — Terminal settings panel
+
+- New `SettingsPanel` in the session topbar with a gear affordance,
+  click-outside dismissal, and full keyboard access.
+- Five bundled color themes (`github-dark`, `github-light`, `dracula`,
+  `monokai`, `solarized-dark`) rendered as live swatches so the preview
+  matches exactly what xterm.js will show.
+- Font size stepper (10–24 px) and font-family picker across five
+  bundled monospace families (`jetbrains-mono`, `fira-code`,
+  `source-code-pro`, `cascadia-code`, `system-mono`).
+- Cursor style selector (`block` / `underline` / `bar`) plus a blink
+  toggle, both applied to the live xterm instance without reconnect.
+- All settings persist in `localStorage` and restore on next page
+  load; stored values are validated against the allowed set so a
+  manually edited storage entry cannot poison the terminal with an
+  unknown theme or font id.
+- `settings` i18n namespace added to both `en.ts` and `zh.ts` with
+  parity enforced by the existing dict-symmetry test.
+
+### Added — Browser notifications
+
+- Opt-in browser notifications fire on **incoming chat messages** and
+  **peer-join** events while the tab is backgrounded (`document.hidden`),
+  so collaborators are not missed when the terminal is not focused.
+- Notifications are gated on user consent: the settings panel requests
+  `Notification.requestPermission()` on first toggle and surfaces a
+  `warning` toast when the browser denies the prompt, so the UI never
+  silently flips back to "disabled" without telling the user why.
+- No notifications are emitted while the tab has focus, and permission
+  state is re-checked on every toggle so revoking at the browser level
+  is picked up without a reload.
+
+### Fixed
+
+- The collaboration sidebar auto-closes on narrow viewports so the
+  terminal stays visible on phones and split-pane layouts instead of
+  being pushed off-screen by the participants / chat pane.
+- The persisted `cursorBlink` value is restored after a viewer→operator
+  unlock, closing a small regression where the cursor would stop
+  blinking even though the stored setting said it should.
+- Stored settings are validated against the allowed theme / font /
+  cursor-style enums before being applied, so a stale or manually
+  edited `localStorage` entry no longer leaves the terminal in an
+  undefined visual state.
+
+### Testing
+
+- Vitest count: **159 → 185** (all green). New coverage:
+  `notifications.test.ts` (permission flow, tab-hidden gating,
+  unsupported-browser fallback) and `stores/settings.test.ts`
+  (persistence, validation, cursor-style round-trip, reset).
+- Cargo test count: **372** (unchanged — web-only release).
+- Playwright count: **44** (unchanged).
+
 ## [0.1.6] - 2026-04-16
 
 Patch release focused on **change-password API contract correctness** and
@@ -1203,7 +1266,8 @@ role-based permissions, invite links, and real-time chat.
 - GitHub Actions CI pipeline and release workflow.
 - MIT license across the workspace.
 
-[Unreleased]: https://github.com/telepair/telepair/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/telepair/telepair/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/telepair/telepair/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/telepair/telepair/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/telepair/telepair/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/telepair/telepair/compare/v0.1.3...v0.1.4
