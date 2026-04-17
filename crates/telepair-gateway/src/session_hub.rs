@@ -8,6 +8,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
+use crate::recording_writer::RecordingSlot;
 use telepair_agent::pty::PtyManager;
 use telepair_control::session_service::SessionService;
 use telepair_core::error::Result;
@@ -273,15 +274,21 @@ struct LiveSession {
     /// every recording was stamped 80×24 regardless of the real
     /// session size and playback rendered at the wrong aspect.
     pty_size: Arc<Mutex<(u16, u16)>>,
-    /// Channel for sending recording events to the `RecordingWriter`
-    /// task. `None` when no recording is active. Wrapped in
-    /// `Arc<Mutex<_>>` so the PTY I/O loop (which captures a clone of
-    /// the Arc at spawn time) and the `start_recording` / `stop_recording`
-    /// public methods can both read/write it without holding the
-    /// sessions RwLock. The inner Mutex is std (not tokio) because the
-    /// critical section — `try_send` in the I/O loop, swap in
-    /// start/stop — is pure CPU and never `.await`s.
-    recording_tx: Arc<Mutex<Option<mpsc::Sender<RecordingEvent>>>>,
+    /// Handle to the active recording writer. `None` when no
+    /// recording is active. The slot bundles the mpsc sender *and*
+    /// a shared drop counter the writer reads at finalisation — the
+    /// two must not drift apart, otherwise a back-pressured
+    /// `try_send` could go unreported and the recording would be
+    /// marked `completed` with invisible gaps (the exact failure
+    /// mode the Codex adversarial review flagged). Wrapped in
+    /// `Arc<Mutex<_>>` so the PTY I/O loop (captures a clone of the
+    /// Arc at spawn time) and the `start_recording` /
+    /// `stop_recording` public methods can both read/write it
+    /// without holding the sessions RwLock. The inner Mutex is std
+    /// (not tokio) because the critical section — `try_send` in the
+    /// I/O loop, swap in start/stop — is pure CPU and never
+    /// `.await`s.
+    recording_tx: Arc<Mutex<Option<RecordingSlot>>>,
 }
 
 pub struct SessionHub {
@@ -384,8 +391,7 @@ impl SessionHub {
         let sessions_arc = self.sessions.clone();
         let session_service_clone = self.session_service.clone();
         let scrollback_for_pty = scrollback.clone();
-        let recording_tx_arc: Arc<Mutex<Option<mpsc::Sender<RecordingEvent>>>> =
-            Arc::new(Mutex::new(None));
+        let recording_tx_arc: Arc<Mutex<Option<RecordingSlot>>> = Arc::new(Mutex::new(None));
         let recording_tx_for_pty = recording_tx_arc.clone();
         let pty_size_arc: Arc<Mutex<(u16, u16)>> = Arc::new(Mutex::new((cols, rows)));
         let pty_size_for_pty = pty_size_arc.clone();
@@ -443,14 +449,20 @@ impl SessionHub {
                         let _ = output_tx_clone.send(bytes.clone());
                         drop(sb);
                         // Recording tap: non-blocking send so the I/O loop
-                        // never stalls on a slow writer. If the channel is
-                        // full or gone, the event is silently dropped —
-                        // acceptable for a best-effort recording stream.
-                        if let Some(ref tx) = *recording_tx_for_pty
+                        // never stalls on a slow writer. A full channel is
+                        // still dropped here — the terminal cannot stall
+                        // waiting on a slow disk — but `RecordingSlot::try_send`
+                        // bumps a shared counter on every drop, and the
+                        // writer reads that counter at finalisation time
+                        // to downgrade the recording's status from
+                        // `completed` to `failed`. That replaces the
+                        // previous "silent drop → lie to the viewer"
+                        // failure mode with an observable one.
+                        if let Some(ref slot) = *recording_tx_for_pty
                             .lock()
                             .expect("recording_tx mutex poisoned")
                         {
-                            let _ = tx.try_send(RecordingEvent::Output(bytes));
+                            slot.try_send(RecordingEvent::Output(bytes));
                         }
                     }
                     Action::Output(None) => {
@@ -477,11 +489,11 @@ impl SessionHub {
                                 *guard = (cols, rows);
                             }
                         }
-                        if let Some(ref tx) = *recording_tx_for_pty
+                        if let Some(ref slot) = *recording_tx_for_pty
                             .lock()
                             .expect("recording_tx mutex poisoned")
                         {
-                            let _ = tx.try_send(RecordingEvent::Resize { cols, rows });
+                            slot.try_send(RecordingEvent::Resize { cols, rows });
                         }
                     }
                     Action::Command(None) => {
@@ -495,14 +507,14 @@ impl SessionHub {
             // the session. Uses async `send` so the writer receives the
             // Stop before the channel drops — this gives it a chance to
             // flush remaining data and mark the recording as completed.
-            // Extract the sender under the mutex first, then drop the
+            // Extract the slot under the mutex first, then drop the
             // guard before the .await — std::sync::MutexGuard is !Send.
-            let recording_tx_owned = recording_tx_for_pty
+            let recording_slot_owned = recording_tx_for_pty
                 .lock()
                 .expect("recording_tx mutex poisoned")
                 .take();
-            if let Some(tx) = recording_tx_owned {
-                let _ = tx.send(RecordingEvent::Stop).await;
+            if let Some(slot) = recording_slot_owned {
+                let _ = slot.tx.send(RecordingEvent::Stop).await;
             }
 
             // Cleanup: remove from in-memory map and close in DB.
@@ -852,13 +864,15 @@ impl SessionHub {
                 color,
             });
 
-            // Recording tap: capture the join event.
-            if let Some(ref tx) = *live
+            // Recording tap: capture the join event. Any back-pressured
+            // drop is recorded in the slot's counter so finalisation
+            // marks the recording `failed`.
+            if let Some(ref slot) = *live
                 .recording_tx
                 .lock()
                 .expect("recording_tx mutex poisoned")
             {
-                let _ = tx.try_send(RecordingEvent::ParticipantJoin {
+                slot.try_send(RecordingEvent::ParticipantJoin {
                     user_id: user_id.to_string(),
                     name,
                     role: role.as_str().to_string(),
@@ -897,13 +911,14 @@ impl SessionHub {
         if live.participants.remove(&user_id).is_some() {
             let _ = live.collab_tx.send(ServerMessage::PeerLeft { user_id });
 
-            // Recording tap: capture the leave event.
-            if let Some(ref tx) = *live
+            // Recording tap: capture the leave event. Back-pressured
+            // drops are counted so finalisation can reflect the gap.
+            if let Some(ref slot) = *live
                 .recording_tx
                 .lock()
                 .expect("recording_tx mutex poisoned")
             {
-                let _ = tx.try_send(RecordingEvent::ParticipantLeave {
+                slot.try_send(RecordingEvent::ParticipantLeave {
                     user_id: user_id.to_string(),
                 });
             }
@@ -951,13 +966,14 @@ impl SessionHub {
         hist.push_back(entry.clone());
         let _ = live.collab_tx.send(entry.clone().into());
 
-        // Recording tap: capture the chat event.
-        if let Some(ref tx) = *live
+        // Recording tap: capture the chat event. Back-pressured
+        // drops are counted so finalisation can reflect the gap.
+        if let Some(ref slot) = *live
             .recording_tx
             .lock()
             .expect("recording_tx mutex poisoned")
         {
-            let _ = tx.try_send(RecordingEvent::Chat {
+            slot.try_send(RecordingEvent::Chat {
                 user_id: entry.user_id.to_string(),
                 name: entry.name,
                 text: entry.text,
@@ -965,16 +981,19 @@ impl SessionHub {
         }
     }
 
-    /// Activate recording on a live session by installing a sender
-    /// into the shared `recording_tx` slot. The PTY I/O loop and
-    /// collab methods will start forwarding events to this sender
-    /// immediately. Returns `Err` if the session is not live or if a
-    /// recording is already active (callers must stop the existing one
-    /// first).
+    /// Activate recording on a live session by installing a
+    /// [`RecordingSlot`] (sender + drop counter) into the shared
+    /// slot. The PTY I/O loop and collab methods will start
+    /// forwarding events through `slot.try_send` immediately, which
+    /// bumps `slot.dropped` on every back-pressured drop — the
+    /// writer task reads that counter at finalisation and downgrades
+    /// the recording's status if any events were lost. Returns
+    /// `Err` if the session is not live or if a recording is
+    /// already active (callers must stop the existing one first).
     pub async fn start_recording(
         &self,
         session_id: &str,
-        recording_tx: mpsc::Sender<RecordingEvent>,
+        slot: RecordingSlot,
     ) -> std::result::Result<(), &'static str> {
         let sessions = self.sessions.read().await;
         let Some(SessionEntry::Live(live)) = sessions.get(session_id) else {
@@ -987,7 +1006,7 @@ impl SessionHub {
         if guard.is_some() {
             return Err("recording already active");
         }
-        *guard = Some(recording_tx);
+        *guard = Some(slot);
         Ok(())
     }
 
@@ -1003,7 +1022,7 @@ impl SessionHub {
         // `add_participant_and_snapshot`, `update_participant_role`,
         // …) for the duration of the channel-send back-pressure —
         // which under a slow/hung writer can be seconds.
-        let tx = {
+        let slot = {
             let sessions = self.sessions.read().await;
             let Some(SessionEntry::Live(live)) = sessions.get(session_id) else {
                 return Err("session not found or not live");
@@ -1017,10 +1036,10 @@ impl SessionHub {
             // this block.
             taken
         };
-        let Some(tx) = tx else {
+        let Some(slot) = slot else {
             return Err("no recording active");
         };
-        let _ = tx.send(RecordingEvent::Stop).await;
+        let _ = slot.tx.send(RecordingEvent::Stop).await;
         Ok(())
     }
 

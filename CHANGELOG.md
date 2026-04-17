@@ -22,8 +22,11 @@ The release also lands a focused **security pass** on the auth and
 share-link paths — per-IP throttling now covers `/api/auth/login` and
 `/api/auth/verify` (previously only `/api/auth/register`), share-link
 revocation URLs carry the SHA-256 digest instead of the raw token,
-and share-token validation runs as a single atomic
-`UPDATE … RETURNING` closing a TOCTOU race on `max_uses`.
+share-token validation runs as a single atomic `UPDATE … RETURNING`
+closing a TOCTOU race on `max_uses`, and share revoke itself is now
+scoped by `(recording_id, token_sha256)` so one owner cannot revoke
+another owner's share links by computing their SHA-256 from the
+(non-secret) raw URL.
 
 Two new tables (`recordings`, `recording_shares`) are applied
 idempotently at boot. Two new additive `ServerMessage` variants
@@ -71,6 +74,15 @@ upgrade from 0.1.7.
   one statement. The previous read-then-update sequence had a TOCTOU
   race on `max_uses` and let any holder of one recording's token
   burn quota by hitting another recording's URL.
+- `DELETE /api/recordings/:id/shares/:token_sha256` now scopes the
+  delete to `(recording_id, token_sha256)` at the storage layer
+  instead of by digest alone. Before the fix, any owner who learned
+  a share link (the raw token is the link itself — not a secret)
+  could compute its SHA-256 and revoke it by hitting the endpoint
+  under their own `recording_id` in the URL, enabling cross-owner
+  share revocation. A mismatched `(recording_id, token_sha256)` pair
+  now returns 404, making cross-owner revoke indistinguishable from
+  a truly unknown digest.
 
 ### Fixed
 
@@ -102,14 +114,34 @@ upgrade from 0.1.7.
   across the `.send().await` to the writer — under back-pressure
   the previous code blocked every concurrent write-lock acquirer
   for the duration of the flush handshake.
+- `DELETE /api/recordings/:id` refuses (409) while the recording is
+  still being captured (`status = 'recording'`). The previous code
+  removed the file and DB row from under the live writer, leaving a
+  dangling file handle, wedging `stop_recording` into a 404, and
+  keeping the hub's recording slot occupied until the session ended.
+  File removal no longer proceeds when the status check fails, and
+  IO errors other than `NotFound` bubble up so the DB row survives
+  for a retry instead of leaving an orphan on disk.
+- The TTL background cleaner excludes `status = 'recording'` rows
+  from its expiry scan, belt-and-suspenders defence against a bad
+  `expires_at` write or wall-clock jump handing it an active row.
+- Recording writer marks the capture `failed` instead of `completed`
+  when any PTY / collab events were dropped under back-pressure.
+  Previously `try_send` failures were swallowed and the final status
+  was always `completed`, so viewers could load a capture with
+  invisible gaps. The hub's recording slot now bundles the mpsc
+  sender with a shared `AtomicU64` drop counter, and the writer
+  reads it at finalisation — a non-zero count flips the status and
+  logs the drop total at `error!` level.
 
 ### Testing
 
-- Cargo test count: **372 → 409** (all green). New coverage:
+- Cargo test count: **372 → 416** (all green). New coverage:
   `recording_test` (asciicast v2 encode/decode round-trip,
   `Recording` lifecycle, share-token hashing), `recording_storage_test`
   (atomic `UPDATE … RETURNING` consumption, TTL cleaner row+file
-  parity, cross-recording token quota isolation), and gateway-level
+  parity, cross-recording token quota isolation, cross-owner share-
+  revoke rejection, delete-while-active guard), and gateway-level
   REST coverage for the recording endpoints and access-control gates.
 - Vitest count: **185 → 194** (all green). New coverage:
   `playback.test.ts` for the PlaybackEngine asciicast v2 parser and

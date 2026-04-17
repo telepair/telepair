@@ -2224,7 +2224,13 @@ pub async fn start_recording(
                 .await;
         });
     });
-    let recording_tx = crate::recording_writer::spawn_recording_writer(
+    // `spawn_recording_writer` returns a `RecordingSlot` that bundles
+    // the mpsc sender with a shared drop counter. The hub's taps
+    // bump the counter on every back-pressured `try_send`, and the
+    // writer reads it at finalisation to downgrade the recording's
+    // status to `failed` when gaps were introduced — no more silent
+    // "completed" recordings that are missing output.
+    let recording_slot = crate::recording_writer::spawn_recording_writer(
         recording.id.clone(),
         file_path,
         header,
@@ -2233,7 +2239,7 @@ pub async fn start_recording(
     );
 
     // Attach to the hub so the PTY I/O loop starts forwarding events.
-    if let Err(reason) = state.hub.start_recording(&session_id, recording_tx).await {
+    if let Err(reason) = state.hub.start_recording(&session_id, recording_slot).await {
         tracing::warn!(
             session_id,
             recording_id = %recording.id,
@@ -2488,6 +2494,15 @@ pub async fn list_recording_shares(
 /// share link. Owner only. The path parameter is the SHA-256 digest
 /// (as returned by `list_recording_shares`), not the raw token —
 /// putting the raw secret in a URL would leak it into access logs.
+///
+/// The delete is scoped to `(recording_id, token_sha256)` at the
+/// storage layer: a caller can only revoke shares that belong to a
+/// recording they own. Without the scope, one owner could compute
+/// the SHA-256 of any leaked share link (the raw token is the link
+/// itself, not a secret) and revoke it by passing their own
+/// `recording_id` on the URL. A mismatched pair returns 404 so the
+/// cross-recording case is indistinguishable from a truly-unknown
+/// digest.
 pub async fn revoke_recording_share(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2495,10 +2510,13 @@ pub async fn revoke_recording_share(
 ) -> Result<impl IntoResponse, ApiError> {
     let user = extract_user(&state, &headers).await?;
     require_recording_access(&state, &recording_id, &user, false).await?;
-    state
+    let deleted = state
         .recording
-        .delete_share_by_sha256(&token_sha256)
+        .delete_share_by_sha256(&recording_id, &token_sha256)
         .await?;
+    if !deleted {
+        return Err(ApiError::bare(StatusCode::NOT_FOUND));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

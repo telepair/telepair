@@ -2,19 +2,62 @@
 /// asciicast v2 NDJSON to a file, flushing periodically and finalising
 /// the database row on completion or error.
 ///
-/// Callers obtain an `mpsc::Sender<RecordingEvent>` from
-/// [`spawn_recording_writer`] and feed events into it; the returned
-/// task is detached and runs until the channel closes or a
-/// [`RecordingEvent::Stop`] is received.
+/// Callers obtain a [`RecordingSlot`] (sender + shared drop counter)
+/// from [`spawn_recording_writer`] and feed events into it via
+/// `slot.tx`; the PTY tap increments `slot.dropped` on every
+/// back-pressured `try_send`. The returned task runs until the
+/// channel closes or a [`RecordingEvent::Stop`] is received. At
+/// finalisation it reads the drop counter — if any events were
+/// dropped, the recording is marked `failed` rather than
+/// `completed`, so the API/UI never silently serve a capture with
+/// gaps in it.
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use telepair_core::recording::{AsciicastHeader, RecordingEvent};
 use telepair_core::storage::{SqliteStorage, Storage};
 use tokio::sync::mpsc;
 use tracing::{error, warn};
+
+/// Sender + shared drop counter handed back to the hub so the PTY
+/// I/O loop (and any other tap) can report events it had to discard
+/// because the writer's channel was full. The writer task holds a
+/// clone of `dropped` via [`spawn_recording_writer`] and reads it
+/// at finalisation: a non-zero count flips the final status from
+/// `completed` to `failed`, matching the semantics of an I/O
+/// failure — either way the capture is incomplete and callers must
+/// not trust it. Pairing the sender and counter in one struct keeps
+/// the two from drifting out of sync; every tap that uses the `tx`
+/// is the same tap that must bump the counter on failure.
+pub struct RecordingSlot {
+    pub tx: mpsc::Sender<RecordingEvent>,
+    pub dropped: Arc<AtomicU64>,
+}
+
+impl RecordingSlot {
+    /// Non-blocking send that also records back-pressure. Every hub
+    /// tap uses this helper so no call site can forget to bump the
+    /// counter on failure — the previous `let _ = tx.try_send(...)`
+    /// pattern made a lost event indistinguishable from a delivered
+    /// one, and the writer then marked the recording as `completed`
+    /// even when gaps existed. Dropping an event is still safe for
+    /// the PTY I/O loop (the shell does not stall on a slow writer),
+    /// but the slot now remembers the drop so finalisation can
+    /// downgrade the status.
+    pub fn try_send(&self, event: RecordingEvent) {
+        if self.tx.try_send(event).is_err() {
+            // `Relaxed` is sufficient: we only read this counter at
+            // finalisation, under the writer's own mutable context,
+            // after the channel has been closed — no concurrent
+            // increment/read race exists that would benefit from a
+            // stronger ordering.
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 /// Flush when the unflushed buffer exceeds this many bytes, even if the
 /// 1-second timer has not fired yet.
@@ -31,23 +74,33 @@ pub type OnFailure = Box<dyn FnOnce() + Send + 'static>;
 
 /// Spawn the recording writer task.
 ///
-/// Returns an `mpsc::Sender` the caller should use to feed
-/// [`RecordingEvent`]s. The task ends when either:
+/// Returns a [`RecordingSlot`] carrying the sender callers use to
+/// feed [`RecordingEvent`]s AND a shared drop counter the hub's
+/// taps bump whenever back-pressure forces an event to be
+/// discarded. The writer task keeps its own clone of the counter so
+/// it can reflect any lost events into the final DB status. The
+/// task ends when either:
 /// - A [`RecordingEvent::Stop`] is received, or
 /// - The sender is dropped (channel closed).
 ///
-/// On normal completion the task calls
-/// [`SqliteStorage::complete_recording`]. On any I/O error it calls
-/// [`SqliteStorage::fail_recording`] **and** runs `on_failure` so
-/// the hub can release the recording slot for the owner to retry.
+/// On normal completion with zero drops the task calls
+/// [`SqliteStorage::complete_recording`]. If **any** drops were
+/// recorded during the run, the task instead calls
+/// [`SqliteStorage::fail_recording`] — a capture with gaps is not
+/// a "completed" capture, and the API/UI must show it as failed so
+/// the operator treats it with appropriate suspicion. On an I/O
+/// error the same `fail_recording` path runs **and** `on_failure`
+/// executes so the hub can release the recording slot for the
+/// owner to retry.
 pub fn spawn_recording_writer(
     recording_id: String,
     file_path: PathBuf,
     header: AsciicastHeader,
     storage: Arc<SqliteStorage>,
     on_failure: OnFailure,
-) -> mpsc::Sender<RecordingEvent> {
+) -> RecordingSlot {
     let (tx, rx) = mpsc::channel::<RecordingEvent>(1024);
+    let dropped = Arc::new(AtomicU64::new(0));
     tokio::spawn(run_writer(
         recording_id,
         file_path,
@@ -55,8 +108,9 @@ pub fn spawn_recording_writer(
         storage,
         rx,
         on_failure,
+        dropped.clone(),
     ));
-    tx
+    RecordingSlot { tx, dropped }
 }
 
 /// Open the file, write the header, then run the event loop.
@@ -70,6 +124,7 @@ async fn run_writer(
     storage: Arc<SqliteStorage>,
     mut rx: mpsc::Receiver<RecordingEvent>,
     on_failure: OnFailure,
+    dropped: Arc<AtomicU64>,
 ) {
     // Hold the cleanup callback in an Option so each failure branch
     // can `take()` and invoke it exactly once. `OnFailure` is a
@@ -195,6 +250,27 @@ async fn run_writer(
         .unwrap_or(bytes_written as i64);
     let duration_ms = start.elapsed().as_millis() as i64;
 
+    // A non-zero drop count means the PTY I/O loop had to discard
+    // events because this writer's channel was full. The file is
+    // still valid asciicast (we wrote everything we actually
+    // received) but it has gaps the viewer cannot recover. Mark
+    // the recording `failed` so the API/UI refuses to advertise it
+    // as a trustworthy capture — matching how an I/O failure is
+    // handled. Logging the count at `error!` level surfaces the
+    // problem in operator dashboards so repeated drops can drive a
+    // channel-size or writer-tuning response.
+    let dropped_events = dropped.load(Ordering::Relaxed);
+    if dropped_events > 0 {
+        error!(
+            recording_id = %recording_id,
+            dropped_events,
+            event_count,
+            "recording writer: events were dropped under back-pressure; marking recording as failed",
+        );
+        mark_failed(&storage, &recording_id).await;
+        return;
+    }
+
     if let Err(e) = storage
         .complete_recording(&recording_id, duration_ms, event_count, file_size)
         .await
@@ -286,7 +362,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tx = spawn_recording_writer(
+        let slot = spawn_recording_writer(
             recording.id.clone(),
             path.clone(),
             make_header(),
@@ -294,17 +370,19 @@ mod tests {
             Box::new(|| {}),
         );
 
-        tx.send(RecordingEvent::Output(Bytes::from_static(b"hello")))
+        slot.tx
+            .send(RecordingEvent::Output(Bytes::from_static(b"hello")))
             .await
             .unwrap();
-        tx.send(RecordingEvent::Resize {
-            cols: 100,
-            rows: 30,
-        })
-        .await
-        .unwrap();
-        tx.send(RecordingEvent::Stop).await.unwrap();
-        drop(tx);
+        slot.tx
+            .send(RecordingEvent::Resize {
+                cols: 100,
+                rows: 30,
+            })
+            .await
+            .unwrap();
+        slot.tx.send(RecordingEvent::Stop).await.unwrap();
+        drop(slot);
 
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
@@ -344,7 +422,7 @@ mod tests {
 
         let cleanup_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cleanup_flag = cleanup_called.clone();
-        let _tx = spawn_recording_writer(
+        let _slot = spawn_recording_writer(
             recording.id.clone(),
             bad_path,
             make_header(),
@@ -385,7 +463,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tx = spawn_recording_writer(
+        let slot = spawn_recording_writer(
             recording.id.clone(),
             path,
             make_header(),
@@ -394,11 +472,106 @@ mod tests {
         );
 
         // Drop the sender without Stop — channel close should trigger graceful completion.
-        drop(tx);
+        drop(slot);
 
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         let row = storage.get_recording(&recording.id).await.unwrap().unwrap();
         assert_eq!(row.status, "completed");
+    }
+
+    /// Regression for "recording output is silently dropped under
+    /// backpressure." Before the fix, every `try_send` failure in
+    /// the PTY I/O loop was swallowed and the writer still marked
+    /// the capture `completed`, so a viewer could load a recording
+    /// with gaps in it and never know. The slot now carries a drop
+    /// counter; at finalisation the writer downgrades the status
+    /// to `failed` if any events were lost. This test bumps the
+    /// counter directly (the easiest way to exercise the
+    /// finalisation branch without fabricating channel
+    /// back-pressure) and asserts the final status reflects the
+    /// drops.
+    #[tokio::test]
+    async fn writer_marks_failed_when_drops_occurred() {
+        let storage = make_storage().await;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+
+        let (user_id, session_id) = seed(&storage, "tester4").await;
+        let recording = storage
+            .create_recording(
+                "rec_writer_dropped",
+                &session_id,
+                user_id,
+                80,
+                24,
+                &path.to_string_lossy(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let slot = spawn_recording_writer(
+            recording.id.clone(),
+            path.clone(),
+            make_header(),
+            storage.clone(),
+            Box::new(|| {}),
+        );
+
+        // Send one real event so the file is well-formed asciicast,
+        // then simulate a drop. A partial capture is still a partial
+        // capture — the fix must flip to `failed` regardless of
+        // whether any bytes made it through.
+        slot.tx
+            .send(RecordingEvent::Output(Bytes::from_static(b"partial")))
+            .await
+            .unwrap();
+        slot.dropped
+            .fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+        slot.tx.send(RecordingEvent::Stop).await.unwrap();
+        drop(slot);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let row = storage.get_recording(&recording.id).await.unwrap().unwrap();
+        assert_eq!(
+            row.status, "failed",
+            "writer must mark recording as failed when any events were dropped; got {row:?}",
+        );
+    }
+
+    /// `RecordingSlot::try_send` is the single gate the hub taps
+    /// use to report back-pressure. Pin both sides of the
+    /// contract: a successful send does NOT bump the counter, and a
+    /// send into a full channel DOES. Without this test a future
+    /// refactor could silently strip the counter bump (the old
+    /// failure mode) or double-count on success.
+    #[tokio::test]
+    async fn try_send_bumps_counter_only_on_backpressure() {
+        // Tiny channel so we can fill it deterministically without
+        // racing the writer task. No writer is spawned here — we
+        // construct the slot by hand to exercise `try_send` in
+        // isolation.
+        let (tx, _rx) = mpsc::channel::<RecordingEvent>(1);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let slot = RecordingSlot {
+            tx,
+            dropped: dropped.clone(),
+        };
+
+        // First send fits in the buffer — counter stays at zero.
+        slot.try_send(RecordingEvent::Output(Bytes::from_static(b"a")));
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+
+        // Second send overflows the buffer (nothing drains because
+        // there's no receiver task reading).
+        slot.try_send(RecordingEvent::Output(Bytes::from_static(b"b")));
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            1,
+            "a full-channel try_send must increment the drop counter",
+        );
     }
 }
