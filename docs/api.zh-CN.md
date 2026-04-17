@@ -1008,3 +1008,199 @@ WebSocket 连接时,会在 `session_enabled` 关卡处被拒绝。
 **错误**
 - `401 Unauthorized` —— token 缺失或无效
 - `403 Forbidden` —— 调用方已认证但不是管理员
+
+## 录制(Recording)
+
+所有录制端点都需要服务端以 `--recording-enabled`(或 `TELEPAIR_RECORDING_ENABLED=true`)启动。关闭时只有 `POST /api/sessions/{id}/recording/start` 返回 `403 Forbidden` —— 读路径照常工作,这样在运维把开关关掉之后,已有的录制依然可回放。
+
+`Recording` 对象的形状(`RecordingRow` 序列化结果):
+
+```json
+{
+  "id": "e4a5b2c1-...",
+  "session_id": "550e8400-...",
+  "status": "recording",
+  "file_path": "/home/admin/.telepair/recordings/e4a5b2c1-....cast",
+  "file_size": 0,
+  "duration_ms": null,
+  "width": 120,
+  "height": 40,
+  "event_count": 0,
+  "started_at": "2026-04-04T12:02:00Z",
+  "completed_at": null,
+  "expires_at": "2026-05-04T12:02:00Z",
+  "created_by": "..."
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | string | Recording id —— 同时作为 DB 主键、`.cast` 文件名和 asciicast header id 复用。 |
+| `status` | string | `"recording"`、`"completed"` 或 `"failed"`。`"failed"` 表示 writer 在背压下丢过事件 —— `.cast` 文件仍在但有缺口。 |
+| `file_size` | integer | 已写入 `.cast` 文件的字节数,在最终 flush 时更新。 |
+| `duration_ms` | integer \| null | 录制的 wall-clock 时长。`status = "recording"` 期间为 `null`。 |
+| `expires_at` | string \| null | ISO 8601 UTC 过期时间 —— 到期后 TTL cleaner 会删除此录制。`null` 表示永久保留。 |
+
+### POST /api/sessions/{session_id}/recording/start
+
+开始录制当前会话。仅 owner。创建 DB 行、拉起 writer 任务、挂载到 `SessionHub`,并向所有参与者广播 `RecordingStarted`。
+
+**响应** `201 Created` —— 返回刚创建的 `Recording`(`status` 为 `"recording"`)。
+
+**错误**
+- `401 Unauthorized` —— token 缺失或无效
+- `403 Forbidden` —— 调用方不是会话 owner,或 `--recording-enabled` 为 false
+- `404 Not Found` —— `session_id` 未知
+- `409 Conflict` —— 该会话已有活跃录制,或 writer 挂载到 hub 失败
+- `410 Gone` —— 会话已关闭
+
+### POST /api/sessions/{session_id}/recording/stop
+
+停止当前会话的活跃录制。仅 owner。从 hub 卸载、广播 `RecordingStopped`,writer 任务异步 flush 并最终化 DB 行。
+
+**响应** `204 No Content`。
+
+**错误**
+- `401 Unauthorized` / `403 Forbidden` —— 同上
+- `404 Not Found` —— 该会话没有活跃录制
+- `409 Conflict` —— hub 拒绝卸载(少见,通常是和会话关闭赛跑)
+
+### GET /api/recordings
+
+列出调用方创建的录制。管理员在此处**仅能看到自己的** —— 全局视图请用 `GET /api/admin/recordings`。
+
+**响应** `200 OK` —— `Recording` 数组,按时间倒序。
+
+### GET /api/recordings/{recording_id}
+
+获取单个录制的元数据。Owner 或 admin。
+
+**响应** `200 OK` —— `Recording` 对象。
+
+**错误**
+- `401 Unauthorized` / `403 Forbidden` —— 既不是 owner 也不是 admin
+- `404 Not Found` —— recording id 未知
+
+### GET /api/recordings/{recording_id}/data
+
+下载 asciicast v2 `.cast` 文件。两种访问模式:
+
+1. **Bearer token**(owner 或 admin):标准 `Authorization: Bearer <token>`。
+2. **Share token**(匿名):追加 `?token=<raw_share_token>`。服务端用单条 `UPDATE … RETURNING` 原子地校验 recording-id 匹配、过期时间、剩余次数并递增 `used_count` —— 无 TOCTOU 窗口。
+
+**Query**
+| 参数 | 说明 |
+|------|------|
+| `token` | `POST /api/recordings/{id}/shares` 返回的原始 share token。传了就忽略 auth header。 |
+
+**响应** `200 OK`
+- `Content-Type: application/x-asciicast`
+- `Content-Disposition: attachment; filename="<recording_id>.cast"`
+
+**错误**
+- `401 Unauthorized` —— 既没提供有效 bearer token,也没提供有效 share token
+- `403 Forbidden` —— 已认证但既不是 owner 也不是 admin
+- `404 Not Found` —— recording id 未知,或磁盘上 `.cast` 文件已丢失
+- `410 Gone` —— share token 过期或用光
+
+### DELETE /api/recordings/{recording_id}
+
+删除一个录制。Owner 或 admin。先删 `.cast` 文件,再删 DB 行(相关 `recording_shares` 行通过 `ON DELETE CASCADE` 级联清理)。
+
+**响应** `204 No Content`。
+
+**错误**
+- `401 Unauthorized` / `403 Forbidden` —— 同上
+- `404 Not Found` —— recording id 未知
+- `409 Conflict` —— 录制仍活跃(`status = 'recording'`),需先停止
+
+### POST /api/recordings/{recording_id}/keep
+
+清除 `expires_at`,把录制标记为永久。Owner 或 admin。返回更新后的 `Recording`,UI 无需再查一次。
+
+**响应** `200 OK` —— 更新后的 `Recording`,`"expires_at": null`。
+
+**错误**
+- `401` / `403` / `404` —— 同上
+
+### POST /api/recordings/{recording_id}/expire
+
+给录制重新套上 TTL。把 `expires_at` 设为当前时间 + `--recording-ttl-days`。Owner 或 admin。
+
+**响应** `200 OK` —— 更新后的 `Recording`,带新的 `expires_at`。
+
+**错误**
+- `401` / `403` / `404` —— 同上
+
+### POST /api/recordings/{recording_id}/shares
+
+签发一个分享链接。**仅 owner** —— 非 owner 的 admin 会被拒绝(分享创建是 owner 独占的,这样一个 admin 不能对别的用户的录制生成长期匿名访问入口)。
+
+**请求**
+```json
+{
+  "max_uses": 10,
+  "expires_at": "2026-04-20T00:00:00Z"
+}
+```
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `max_uses` | integer \| null | `0`(无限) | 最多兑换次数。`0` 表示不设上限。 |
+| `expires_at` | string \| null | `null`(不过期) | ISO 8601 UTC 过期时间。 |
+
+**响应** `201 Created`
+```json
+{
+  "token": "raw-share-token-returned-once",
+  "share": {
+    "token_sha256": "...",
+    "recording_id": "e4a5b2c1-...",
+    "max_uses": 10,
+    "used_count": 0,
+    "expires_at": "2026-04-20T00:00:00Z",
+    "created_at": "2026-04-04T12:10:00Z"
+  }
+}
+```
+
+原始 `token` **只会返回一次** —— 落库的只是它的 SHA-256(在 `recording_shares.token_sha256`)。把原始值以 `?token=...` 的形式交给观看者。
+
+**错误**
+- `401` / `403` / `404` —— 同上
+
+### GET /api/recordings/{recording_id}/shares
+
+列出某个录制的所有 share。**仅 owner**。原始 token **永不**返回,只返回摘要、使用次数和过期时间。
+
+**响应** `200 OK` —— share 对象数组(形状与 `POST` 返回的 `share` 对象相同)。
+
+### DELETE /api/recordings/{recording_id}/shares/{token_sha256}
+
+撤销一个 share 链接。**仅 owner**。路径参数是摘要(从 `GET …/shares` 拿),**不是**原始 token —— 把 raw secret 放进 URL 会让它泄漏到访问日志。删除在 storage 层被限定到 `(recording_id, token_sha256)`,这样一个 owner 没法通过对一个泄露的 URL 做哈希并拼上自己的 `recording_id` 来撤销别人的 share。
+
+**响应** `204 No Content`。
+
+**错误**
+- `401` / `403` —— 同上
+- `404 Not Found` —— 摘要未知,或摘要属于另一个 recording(故意让两种情况无法区分)
+
+### GET /api/admin/recordings
+
+仅管理员。列出系统内所有录制,按时间倒序。
+
+**响应** `200 OK` —— `Recording` 数组。
+
+**错误**
+- `401 Unauthorized` / `403 Forbidden` —— 非管理员
+
+### DELETE /api/admin/recordings/{recording_id}
+
+仅管理员。强制删除,绕过 owner 检查,但 `status = 'recording'` 时仍会被拒(需先停止会话)。
+
+**响应** `204 No Content`。
+
+**错误**
+- `401` / `403` —— 同上
+- `404 Not Found` —— recording id 未知
+- `409 Conflict` —— 录制仍活跃

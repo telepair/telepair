@@ -177,21 +177,60 @@ telepair 在生产环境中把前端作为**同源**(same-origin)静态资源一
 
 ### 环境变量
 
+下表每个环境变量都有对应的 CLI flag(`--data-dir`、`--smtp-host` 等);两者同时设置时 flag 获胜。
+
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `RUST_LOG` | `info` | 日志级别(`debug`、`info`、`warn`、`error`) |
+| `TELEPAIR_DATA_DIR` | `~/.telepair` | 覆盖数据目录(DB、admin token、targets.yaml、recordings)。 |
+| `TELEPAIR_TRUST_FORWARDED_HEADERS` | `false` | 允许每 IP 注册限流器信任 `X-Forwarded-For` / `X-Real-IP`。**仅当** telepair 跑在会对每个请求重写这两个 header 的反向代理之后才打开;直接暴露时启用会让任何客户端伪造 header 绕过限流。 |
+| `TELEPAIR_SMTP_HOST` | *(未设置)* | SMTP 服务器主机名。设置后才启用邮箱注册;不设置则 OTP 路径禁用。 |
+| `TELEPAIR_SMTP_PORT` | `587` | SMTP 端口(STARTTLS)。 |
+| `TELEPAIR_SMTP_USER` | *(未设置)* | SMTP 用户名。 |
+| `TELEPAIR_SMTP_PASS` | *(未设置)* | SMTP 密码。 |
+| `TELEPAIR_SMTP_FROM` | *(未设置)* | SMTP 发件人地址,形如 `"Telepair <noreply@example.com>"`。 |
+| `TELEPAIR_RECORDING_ENABLED` | `false` | 会话录制的总开关。关闭时任何会话都不会被录制。 |
+| `TELEPAIR_RECORDING_TTL_DAYS` | `30` | 保留天数。`0` 表示永久(不触发 TTL 清理)。 |
+| `TELEPAIR_RECORDING_DIR` | `<data-dir>/recordings` | `.cast` 文件的存放目录。 |
 
 ### 数据目录
 
-telepair 所有持久化数据放在 `~/.telepair/`:
+telepair 所有持久化数据放在 `~/.telepair/`(可用 `--data-dir` / `TELEPAIR_DATA_DIR` 覆盖):
 
-| 文件 | 用途 |
+| 路径 | 用途 |
 |------|------|
-| `telepair.db` | SQLite 数据库(users、sessions、participants、invites) |
+| `telepair.db` | SQLite 数据库(users、sessions、participants、invites、audit_events、recordings、recording_shares) |
 | `admin_token` | admin bearer token(首次运行时创建,权限 0600) |
 | `targets.yaml` | 虚拟目标定义(可选) |
+| `recordings/` | 会话录制 `.cast` 文件,每个录制一个,按 recording id 命名;首次录制时创建。可用 `--recording-dir` / `TELEPAIR_RECORDING_DIR` 覆盖。 |
 
-备份 `telepair.db` 就可以保住用户账号和会话历史。
+备份 `telepair.db`(启用录制时再加上 `recordings/`)即可保住用户账号、会话历史和回放。
+
+## 会话录制
+
+会话录制**默认关闭**,必须显式 opt-in。使用 `--recording-enabled`(或 `TELEPAIR_RECORDING_ENABLED=true`)启用:
+
+```bash
+./telepair --web-dir web/dist \
+           --recording-enabled \
+           --recording-ttl-days 30
+```
+
+启用后你会得到:
+
+- 会话所有者可以从会话内的 Recording 面板 **开始 / 停止** 录制(`POST /api/sessions/{id}/recording/{start,stop}`)。同一会话同一时刻只能有一个活跃录制。
+- Owner 和 admin 可以 **列表 / 回放 / 删除** 自己的录制;admin 还能通过 `GET /api/admin/recordings` 看到所有人的。
+- Owner 可以通过 `POST /api/recordings/{id}/shares` 生成 **带签名的分享链接**(TTL + 最多使用次数)。匿名观看者访问 `/recordings/{id}/play?token=...` 会绕过 `AuthGuard` 直接命中 `/api/recordings/{id}/data?token=...` —— token 会通过单条 `UPDATE … RETURNING` 同时校验 recording id、剩余使用次数和过期时间,无 TOCTOU 窗口。
+- 后台 **cleaner** 每隔数分钟扫描 `expires_at`,删除过期行。候选集中**始终**排除活跃录制(`status = 'recording'`)作为防御性兜底。`expires_at IS NULL` 表示"永久保留"。
+
+存储细节:
+
+- 录制以 asciicast v2 `.cast` 文件存放在 `--recording-dir`(默认 `<data-dir>/recordings/`)下,以 recording id 命名。
+- 元数据(`file_size`、`duration_ms`、`event_count`、`status`、`expires_at`)存入 `recordings` 表,share token 存入 `recording_shares` 表。两张表都通过 `ON DELETE CASCADE` 跟随父行级联清理。
+- 若录制期间 writer 因背压丢过事件,该录制会被最终化为 `status = 'failed'`(而不是 `completed`),这样 "completed" 永远意味着 "asciicast 完整无缺口"。
+- 启用录制会占用磁盘 —— 粗略量级是每个活跃会话每秒几 KB 的 PTY 输出,再加上聊天 / 参与者事件。请据此规划卷容量或调小 `TELEPAIR_RECORDING_TTL_DAYS`。
+
+录制**关闭**时,前端的 Recording 面板会隐藏,`POST /api/sessions/{id}/recording/start` 返回 `403 Forbidden`("session recording is disabled on this server"),也不会有 writer 被拉起。读路径(`GET /api/recordings`、`GET /api/recordings/{id}/data`、shares 等)照常工作,这样在运维把开关关掉之后,已有的录制依然可回放。
 
 ## 安全注意事项
 

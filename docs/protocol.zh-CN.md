@@ -111,9 +111,27 @@ Client                              Server
   "participants": [
     { "user_id": "...", "name": "alice", "role": "owner", "color": "#58a6ff" }
   ],
-  "your_role": "owner"
+  "your_role": "owner",
+  "your_user_id": "...",
+  "chat_history": [
+    {
+      "user_id": "...",
+      "name": "alice",
+      "text": "hi team",
+      "ts": "2026-04-04T12:04:12.001Z"
+    }
+  ],
+  "recording": {
+    "recording_id": "e4a5b2c1-...",
+    "started_at": "2026-04-04T12:02:00Z"
+  }
 }
 ```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `chat_history` | array | 有界的会话内聊天回放(从旧到新,短暂的 —— 会话关闭即销毁)。每条 entry 与 `PeerChat` 字段一一对应,同一套渲染器即可处理回放与实时消息。 |
+| `recording` | object \| null | 加入时若有活跃录制,则为 `{ recording_id, started_at }`;否则缺省(或为 `null`),这样后加入者无需额外 REST 调用就能看到录制指示。 |
 
 #### PeerJoined
 
@@ -185,6 +203,28 @@ WS handler 还会拦截指向当前连接的消息,就地重新计算输入权�
 |------|------|------|
 | `user_id` | string | 角色被变更的参与者 UUID |
 | `new_role` | string | 新角色:`"operator"` 或 `"viewer"` |
+
+#### RecordingStarted
+
+会话开始录制时广播给所有参与者。客户端据此切换会话内的 "● REC" 指示灯,无需轮询 REST 端点。需要服务端以 `--recording-enabled` 启动。
+
+```json
+{
+  "type": "RecordingStarted",
+  "recording_id": "e4a5b2c1-..."
+}
+```
+
+#### RecordingStopped
+
+当前活跃录制停止时广播(显式调用 `POST /api/sessions/{id}/recording/stop`,或会话关闭时隐式停止)。客户端据此隐藏录制指示并清除缓存的活跃录制状态。
+
+```json
+{
+  "type": "RecordingStopped",
+  "recording_id": "e4a5b2c1-..."
+}
+```
 
 #### Error
 
