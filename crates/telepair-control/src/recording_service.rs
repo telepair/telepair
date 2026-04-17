@@ -142,11 +142,46 @@ impl RecordingService {
     }
 
     /// Hard-delete a recording row and its associated file on disk.
+    ///
+    /// Refuses to delete a recording that is still being captured
+    /// (`status == 'recording'`): the writer still holds the file
+    /// handle, `stop_recording` would race into a 404 because the
+    /// active row disappeared, and the hub's sender slot would stay
+    /// occupied until the session ends. Callers must stop the
+    /// recording first. Returns [`Error::Conflict`] (409) in that
+    /// case.
+    ///
+    /// File removal runs only after the status check passes. A
+    /// missing file is tolerated (already cleaned up by a previous
+    /// partial run or the TTL cleaner), but any other I/O failure
+    /// bubbles up so the DB row survives for a retry — deleting the
+    /// row with the file still on disk would create an orphan that
+    /// the TTL cleaner can never pick up again.
     pub async fn delete_recording(&self, id: &str) -> Result<()> {
-        // Best-effort file removal. A missing file is not an error — the
-        // DB row is the authoritative "exists" record.
+        let Some(row) = self.storage.get_recording(id).await? else {
+            // Row already gone — matches the idempotent semantics of
+            // the underlying storage DELETE. Skip the file removal
+            // so a typo-ed id doesn't nuke some other recording's
+            // file that shares a coincidental name.
+            return Ok(());
+        };
+        if row.status == "recording" {
+            return Err(Error::Conflict(format!(
+                "recording {id} is still being captured; stop it before deleting",
+            )));
+        }
+
         let path = self.recording_file_path(id);
-        let _ = std::fs::remove_file(&path);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Internal(format!(
+                    "failed to remove recording file {}: {e}",
+                    path.display()
+                )));
+            }
+        }
 
         self.storage.delete_recording(id).await
     }
@@ -216,15 +251,25 @@ impl RecordingService {
         self.storage.list_recording_shares(recording_id).await
     }
 
-    /// Hard-delete a share token by its SHA-256 digest. The admin UI
-    /// already has the digest from `list_shares`; the raw token is
-    /// only ever returned at mint time. Accepting the digest avoids
-    /// putting the raw secret in DELETE URLs (where it would land in
-    /// access logs and Referer headers) and prevents the previous
-    /// double-hash bug where the handler treated the URL parameter as
-    /// a raw token and re-hashed it before lookup.
-    pub async fn delete_share_by_sha256(&self, token_sha256: &str) -> Result<()> {
-        self.storage.delete_recording_share(token_sha256).await
+    /// Hard-delete a share token by its SHA-256 digest, scoped to
+    /// `recording_id`. Returns `true` if a matching share was
+    /// actually deleted, `false` if none existed under this
+    /// recording. The scope is load-bearing: the share digest is not
+    /// a secret (it is the SHA-256 of a token that already appears
+    /// verbatim in the share link), so a delete-by-digest-only API
+    /// lets any owner revoke another owner's share by passing their
+    /// own `recording_id` on the URL. Binding the delete to
+    /// `(recording_id, token_sha256)` closes that hole; handlers then
+    /// map `false` to 404 so a mismatched revoke looks exactly like
+    /// a truly-unknown digest.
+    pub async fn delete_share_by_sha256(
+        &self,
+        recording_id: &str,
+        token_sha256: &str,
+    ) -> Result<bool> {
+        self.storage
+            .delete_recording_share(recording_id, token_sha256)
+            .await
     }
 }
 
@@ -470,9 +515,11 @@ mod tests {
             .unwrap();
 
         let (raw, share) = svc.create_share(&rec.id, 0, None).await.unwrap();
-        svc.delete_share_by_sha256(&share.token_sha256)
+        let deleted = svc
+            .delete_share_by_sha256(&rec.id, &share.token_sha256)
             .await
             .unwrap();
+        assert!(deleted, "well-scoped revoke must report deletion");
 
         // Token should no longer validate.
         let err = svc
@@ -480,6 +527,60 @@ mod tests {
             .await
             .expect_err("deleted share must fail");
         assert!(matches!(err, Error::InvalidInput(_)));
+    }
+
+    /// Service-level guard that the scoped revoke refuses a
+    /// mismatched `recording_id`. Paired with the storage-level
+    /// regression in `recording_storage_delete_share_is_scoped_to_recording_id`
+    /// so the contract is pinned at both layers — a future refactor
+    /// that shortcuts the scope check via the service (e.g. auto-
+    /// forwarding the URL digest to a new helper) still trips this
+    /// test.
+    #[tokio::test]
+    async fn delete_share_refuses_mismatched_recording_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+        let svc = RecordingService::new(storage.clone(), test_config(dir.path()));
+
+        let (user, _) = storage.create_user("tester", false).await.unwrap();
+        let session = storage
+            .create_session_with_owner(
+                user.id,
+                "local-shell",
+                telepair_core::session::InputMode::Serialized,
+                None,
+            )
+            .await
+            .unwrap();
+        let rec_a = svc
+            .create_recording(&session.id, user.id, 80, 24)
+            .await
+            .unwrap();
+        // Second recording for the same session must NOT conflict with
+        // the first — complete the first so the "one active recording
+        // per session" invariant stays happy.
+        storage
+            .complete_recording(&rec_a.id, 1000, 1, 256)
+            .await
+            .unwrap();
+        let rec_b = svc
+            .create_recording(&session.id, user.id, 80, 24)
+            .await
+            .unwrap();
+
+        let (raw, share) = svc.create_share(&rec_a.id, 0, None).await.unwrap();
+
+        // Wrong recording id is a no-op.
+        let deleted = svc
+            .delete_share_by_sha256(&rec_b.id, &share.token_sha256)
+            .await
+            .unwrap();
+        assert!(!deleted, "revoke under wrong recording_id must not match");
+
+        // The share still validates against the right recording id.
+        svc.validate_share_token(&raw, &rec_a.id)
+            .await
+            .expect("share must survive a mismatched revoke");
     }
 
     #[tokio::test]
@@ -508,6 +609,126 @@ mod tests {
 
         let shares = svc.list_shares(&rec.id).await.unwrap();
         assert_eq!(shares.len(), 2);
+    }
+
+    /// Regression for "deleting an active recording wedges the
+    /// session." Before the fix, `delete_recording` removed the
+    /// file and the DB row even while a writer still held the
+    /// file handle — `stop_recording` then 404'd (no active row to
+    /// find), the hub's sender slot stayed occupied, and a fresh
+    /// `start_recording` would conflict until the session ended.
+    /// The service now returns `Conflict` (409) without touching
+    /// the file or the row, so the recording stays consistent and
+    /// the caller gets an explicit "stop it first" signal.
+    #[tokio::test]
+    async fn delete_recording_refuses_while_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+        let svc = RecordingService::new(storage.clone(), test_config(dir.path()));
+
+        let (user, _) = storage.create_user("tester", false).await.unwrap();
+        let session = storage
+            .create_session_with_owner(
+                user.id,
+                "local-shell",
+                telepair_core::session::InputMode::Serialized,
+                None,
+            )
+            .await
+            .unwrap();
+        let rec = svc
+            .create_recording(&session.id, user.id, 80, 24)
+            .await
+            .unwrap();
+        // Simulate a real writer's side-effect — a file on disk we
+        // must NOT delete while the recording is active, or the
+        // writer would be left with a dangling handle.
+        let path = svc.recording_file_path(&rec.id);
+        std::fs::write(&path, b"live capture in progress").unwrap();
+
+        let err = svc
+            .delete_recording(&rec.id)
+            .await
+            .expect_err("active recording must not be deletable");
+        assert!(matches!(err, Error::Conflict(_)));
+
+        // File must still exist — deleting it out from under the
+        // writer would corrupt the capture.
+        assert!(path.exists(), "file must survive a blocked delete attempt");
+        // Row must still exist.
+        assert!(
+            storage.get_recording(&rec.id).await.unwrap().is_some(),
+            "DB row must survive a blocked delete attempt"
+        );
+
+        // After completion, delete goes through.
+        storage
+            .complete_recording(&rec.id, 500, 3, 64)
+            .await
+            .unwrap();
+        svc.delete_recording(&rec.id).await.unwrap();
+        assert!(!path.exists());
+        assert!(storage.get_recording(&rec.id).await.unwrap().is_none());
+    }
+
+    /// When the file is present but `remove_file` fails for any
+    /// reason other than NotFound, the service must bail BEFORE
+    /// deleting the DB row. Leaving the row alive lets the TTL
+    /// cleaner (or a retry from the owner) come back and try
+    /// again — removing the row would strand the file on disk with
+    /// no authoritative record the cleaner can match against.
+    #[tokio::test]
+    async fn delete_recording_preserves_row_when_file_remove_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+        // Point the service's recording dir at a path we'll swap
+        // into a non-writable state *without* actually touching
+        // filesystem permissions (permission-based tests are flaky
+        // across macOS/Linux and in CI containers): we simulate
+        // the IO failure by creating a *directory* where the
+        // `.cast` file should live. `std::fs::remove_file` on a
+        // directory returns Err on every platform.
+        let svc = RecordingService::new(storage.clone(), test_config(dir.path()));
+
+        let (user, _) = storage.create_user("tester", false).await.unwrap();
+        let session = storage
+            .create_session_with_owner(
+                user.id,
+                "local-shell",
+                telepair_core::session::InputMode::Serialized,
+                None,
+            )
+            .await
+            .unwrap();
+        let rec = svc
+            .create_recording(&session.id, user.id, 80, 24)
+            .await
+            .unwrap();
+        storage
+            .complete_recording(&rec.id, 500, 3, 64)
+            .await
+            .unwrap();
+
+        // Replace the would-be file with a non-empty directory so
+        // `remove_file` fails with something other than NotFound.
+        let path = svc.recording_file_path(&rec.id);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("sentinel"), b"").unwrap();
+
+        let err = svc
+            .delete_recording(&rec.id)
+            .await
+            .expect_err("file remove failure must surface");
+        assert!(matches!(err, Error::Internal(_)));
+
+        assert!(
+            path.exists(),
+            "directory (standing in for the file) must survive the failed delete"
+        );
+        assert!(
+            storage.get_recording(&rec.id).await.unwrap().is_some(),
+            "DB row must not be removed when file removal failed"
+        );
     }
 
     #[tokio::test]

@@ -130,6 +130,9 @@ mod tests {
             .unwrap();
 
         // One expired recording: row + file that the cleaner should erase.
+        // Completed so the TTL cleaner's status filter lets it
+        // through — an in-progress recording must never be handed to
+        // the cleaner, even with a past `expires_at`.
         let expired_id = "rec_ttl_expired";
         let expired_file = format!("{expired_id}.cast");
         let expired_path = dir.path().join(&expired_file);
@@ -146,6 +149,10 @@ mod tests {
             )
             .await
             .unwrap();
+        storage
+            .complete_recording(expired_id, 1000, 5, 512)
+            .await
+            .unwrap();
 
         // One permanent recording the cleaner must NOT touch.
         let keep_id = "rec_ttl_keep";
@@ -154,6 +161,10 @@ mod tests {
         std::fs::write(&keep_path, b"keep").unwrap();
         storage
             .create_recording(keep_id, &session.id, user.id, 80, 24, &keep_file, None)
+            .await
+            .unwrap();
+        storage
+            .complete_recording(keep_id, 1000, 5, 512)
             .await
             .unwrap();
 
@@ -204,6 +215,10 @@ mod tests {
             )
             .await
             .unwrap();
+        // Mark completed so the cleaner's status filter lets it
+        // through — active recordings are now excluded at the
+        // listing layer.
+        storage.complete_recording(id, 1000, 5, 512).await.unwrap();
 
         // No file written — run should still drop the row.
         run_once(&storage, dir.path()).await;

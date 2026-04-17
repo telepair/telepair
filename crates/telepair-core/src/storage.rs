@@ -487,6 +487,14 @@ pub trait Storage: Send + Sync {
     /// List all share tokens for a recording, newest-first.
     async fn list_recording_shares(&self, recording_id: &str) -> Result<Vec<RecordingShareRow>>;
 
-    /// Hard-delete a share token row.
-    async fn delete_recording_share(&self, token_sha256: &str) -> Result<()>;
+    /// Hard-delete a share token row scoped to `recording_id`. The
+    /// URL path (not the digest alone) is the authoritative scope:
+    /// without the recording_id filter, any owner who happens to know
+    /// a share digest — which is trivially computable from the raw
+    /// token the share link already embeds — could revoke shares
+    /// belonging to other recordings by hitting the delete endpoint
+    /// with their own `recording_id` in the URL. Returns `true` if a
+    /// matching row was deleted, `false` otherwise; callers map the
+    /// `false` case to 404.
+    async fn delete_recording_share(&self, recording_id: &str, token_sha256: &str) -> Result<bool>;
 }

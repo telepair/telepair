@@ -2295,9 +2295,18 @@ impl Storage for SqliteStorage {
 
     async fn list_expired_recordings(&self, limit: i64) -> Result<Vec<RecordingRow>> {
         let now_str = now_rfc3339();
+        // Excluding `status = 'recording'` is defense-in-depth: a
+        // fresh recording's `expires_at` is always `now + ttl_days`,
+        // so a still-active row shouldn't appear in this query under
+        // normal operation. The filter protects against the edge
+        // case where a wall-clock jump or a bad `expires_at` write
+        // would otherwise hand the TTL cleaner an active row and it
+        // would silently delete the writer's file out from under it.
         let rows = sqlx::query(
             "SELECT * FROM recordings \
-             WHERE expires_at IS NOT NULL AND expires_at < ? \
+             WHERE expires_at IS NOT NULL \
+               AND expires_at < ? \
+               AND status != 'recording' \
              ORDER BY expires_at ASC LIMIT ?",
         )
         .bind(&now_str)
@@ -2412,12 +2421,14 @@ impl Storage for SqliteStorage {
         Ok(rows.iter().map(row_to_recording_share).collect())
     }
 
-    async fn delete_recording_share(&self, token_sha256: &str) -> Result<()> {
-        sqlx::query("DELETE FROM recording_shares WHERE token_sha256 = ?")
-            .bind(token_sha256)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+    async fn delete_recording_share(&self, recording_id: &str, token_sha256: &str) -> Result<bool> {
+        let result =
+            sqlx::query("DELETE FROM recording_shares WHERE recording_id = ? AND token_sha256 = ?")
+                .bind(recording_id)
+                .bind(token_sha256)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
     }
 }
 
