@@ -79,6 +79,35 @@ describe('PlaybackEngine', () => {
     expect(outputs).toContain('file1.txt\r\n');
   });
 
+  it('replays participant join/leave and chat events on seek', () => {
+    engine.load(SAMPLE_CAST);
+    const joins: Array<{ user_id: string; name: string }> = [];
+    const leaves: Array<{ user_id: string }> = [];
+    const chats: Array<{ user_id: string; text: string }> = [];
+    engine.onParticipantJoin = (p) => joins.push({ user_id: p.user_id, name: p.name });
+    engine.onParticipantLeave = (p) => leaves.push(p);
+    engine.onChat = (p) => chats.push({ user_id: p.user_id, text: p.text });
+
+    // Seek past the join + chat but before the leave.
+    engine.seek(2.7);
+    expect(joins).toEqual([{ user_id: 'u1', name: 'bob' }]);
+    expect(chats).toEqual([{ user_id: 'u1', text: 'hi' }]);
+    expect(leaves).toEqual([]);
+
+    // Seek past the leave: the listener should now have observed the leave too.
+    engine.seek(3.0);
+    expect(leaves).toEqual([{ user_id: 'u1' }]);
+  });
+
+  it('reports the requested seek target via currentTime', () => {
+    engine.load(SAMPLE_CAST);
+    engine.seek(2.7);
+    // Even though the last replayed event was at t=2.5, the engine
+    // pins currentTime to the requested target so the progress bar
+    // and onTimeUpdate consumers see the user-requested position.
+    expect(engine.currentTime).toBeCloseTo(2.7, 5);
+  });
+
   it('respects speed multiplier', () => {
     engine.load(SAMPLE_CAST);
     const outputs: string[] = [];
