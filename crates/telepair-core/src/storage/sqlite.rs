@@ -63,6 +63,18 @@ impl SqliteStorage {
             .execute(&self.pool)
             .await?;
 
+        // 003 sweeps orphan `status='recording'` rows (always stale at
+        // boot — see file header) and adds the partial unique index that
+        // turns the start-recording race into a `409 Conflict` instead
+        // of duplicate rows + an orphan .cast file. Idempotent: the
+        // sweep is a no-op once converged and the index uses
+        // `IF NOT EXISTS`.
+        sqlx::raw_sql(include_str!(
+            "../../../../migrations/003_recordings_unique_active.sql"
+        ))
+        .execute(&self.pool)
+        .await?;
+
         // In-place upgrades from an older v0.1.x DB: `CREATE TABLE IF
         // NOT EXISTS` does not touch an existing table, so columns
         // added after the original v0.1.0 shape need explicit ALTER
@@ -2182,7 +2194,15 @@ impl Storage for SqliteStorage {
     ) -> Result<RecordingRow> {
         let now_str = now_rfc3339();
 
-        sqlx::query(
+        // The `idx_recordings_one_active_per_session` partial unique
+        // index (migration 003) makes a duplicate `status='recording'`
+        // row for the same session a `SQLITE_CONSTRAINT_UNIQUE`. Map
+        // it back to `Error::Conflict` so the HTTP handler returns
+        // 409 instead of a generic 500 — without this, a second
+        // concurrent start-recording POST that slipped past the
+        // service-layer fast path would surface as an internal error
+        // even though the situation is a clean client-side conflict.
+        if let Err(err) = sqlx::query(
             "INSERT INTO recordings \
                (id, session_id, status, file_path, file_size, width, height, \
                 event_count, started_at, expires_at, created_by) \
@@ -2198,7 +2218,16 @@ impl Storage for SqliteStorage {
         .bind(expires_at)
         .bind(created_by.to_string())
         .execute(&self.pool)
-        .await?;
+        .await
+        {
+            let storage_err = Error::from(err);
+            if crate::auth::is_unique_violation(&storage_err) {
+                return Err(Error::Conflict(format!(
+                    "session {session_id} already has an active recording",
+                )));
+            }
+            return Err(storage_err);
+        }
 
         Ok(RecordingRow {
             id: id.to_string(),
