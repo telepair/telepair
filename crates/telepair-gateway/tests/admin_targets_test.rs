@@ -24,6 +24,7 @@ use tower::ServiceExt;
 
 use telepair_agent::virtual_target::TargetEngine;
 use telepair_core::audit::{AuditEventType, AuditFilter};
+use telepair_core::recording::RecordingConfig;
 use telepair_core::session::InputMode;
 use telepair_core::storage::{SqliteStorage, Storage};
 use telepair_gateway::session_hub::PtyLaunch;
@@ -91,6 +92,7 @@ async fn setup(
         Some(path.clone()),
         None,
         std::path::PathBuf::from("/tmp/telepair-test"),
+        RecordingConfig::default(),
     )
     .await;
     let router = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
@@ -302,6 +304,7 @@ async fn reload_targets_audit_event_is_recorded() {
         Some(path.clone()),
         None,
         std::path::PathBuf::from("/tmp/telepair-test"),
+        RecordingConfig::default(),
     )
     .await;
     let app = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
@@ -458,6 +461,7 @@ async fn reload_targets_rejects_drop_of_still_referenced_target() {
         Some(path.clone()),
         None,
         std::path::PathBuf::from("/tmp/telepair-test"),
+        RecordingConfig::default(),
     )
     .await;
     state
@@ -577,6 +581,7 @@ async fn reload_targets_allows_adding_new_target_with_referenced_alive() {
         Some(path.clone()),
         None,
         std::path::PathBuf::from("/tmp/telepair-test"),
+        RecordingConfig::default(),
     )
     .await;
     state
@@ -664,6 +669,7 @@ async fn reload_targets_allows_drop_when_only_stale_db_row_present() {
         Some(path.clone()),
         None,
         std::path::PathBuf::from("/tmp/telepair-test"),
+        RecordingConfig::default(),
     )
     .await;
     let app = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
@@ -742,6 +748,7 @@ async fn reload_targets_rejects_drop_during_create_to_attach_gap() {
         Some(path.clone()),
         None,
         std::path::PathBuf::from("/tmp/telepair-test"),
+        RecordingConfig::default(),
     )
     .await;
     let app = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();

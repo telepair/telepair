@@ -1,6 +1,6 @@
 [package]
 name = "telepair-core"
-version = "0.1.7"
+version = "0.1.8"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -19,7 +19,9 @@ hex = { workspace = true }
 argon2 = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
+bytes = { workspace = true }

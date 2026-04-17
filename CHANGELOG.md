@@ -7,6 +7,213 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-04-17
+
+Minor release centred on **session recording and playback**. Live
+sessions can be captured as asciicast v2 `.cast` files on demand,
+replayed in the browser with play / pause / seek / speed controls, and
+shared via public signed links with configurable expiry and use
+quotas. The subsystem ships with a streaming writer (1 s timer /
+64 KiB threshold flush), a TTL background cleaner, full REST +
+WebSocket + CLI surfaces, and a collaboration-aware playback UI that
+replays participants and chat timelines in step with PTY output.
+
+The release also lands a focused **security pass** on the auth and
+share-link paths — per-IP throttling now covers `/api/auth/login` and
+`/api/auth/verify` (previously only `/api/auth/register`), share-link
+revocation URLs carry the SHA-256 digest instead of the raw token,
+share-token validation runs as a single atomic `UPDATE … RETURNING`
+closing a TOCTOU race on `max_uses`, and share revoke itself is now
+scoped by `(recording_id, token_sha256)` so one owner cannot revoke
+another owner's share links by computing their SHA-256 from the
+(non-secret) raw URL.
+
+Two new tables (`recordings`, `recording_shares`) are applied
+idempotently at boot. Two new additive `ServerMessage` variants
+(`RecordingStarted`, `RecordingStopped`) and two new audit event
+types (`recording.started`, `recording.stopped`) land on the wire;
+no existing message, column, or response shape changes. Drop-in
+upgrade from 0.1.7.
+
+### Added — Session recording
+
+- New session recording subsystem: opt-in `.cast` (asciicast v2)
+  capture of every active session, with a streaming writer that
+  flushes on a 1 s timer or 64 KiB threshold and a TTL background
+  task that purges expired recordings.
+- REST surface for recordings: `POST /api/sessions/:id/recording/{start,stop}`,
+  `GET /api/recordings`, `GET /api/recordings/:id`, `GET /api/recordings/:id/data`,
+  `DELETE /api/recordings/:id`, `POST /api/recordings/:id/{keep,expire}`,
+  plus share-link CRUD at `/api/recordings/:id/shares` and a public
+  `?token=` access path on the `/data` endpoint.
+- Browser playback page powered by xterm.js with play / pause /
+  seek / speed controls, a participant + chat sidebar replayed in
+  step with PTY output, and an event timeline of the recorded
+  collab messages.
+- WebSocket `RecordingStarted` / `RecordingStopped` server messages
+  so every connected client surfaces the live indicator.
+- New audit event types `recording.started` / `recording.stopped`
+  written by the gateway and rendered in the admin audit timeline.
+- New CLI flags `--recording-enabled`, `--recording-dir`,
+  `--recording-ttl-days` (and matching `TELEPAIR_*` env vars), with
+  `--recording-enabled=false` now actually rejecting `start_recording`
+  requests at the HTTP layer.
+
+### Security
+
+- `POST /api/auth/login` and `POST /api/auth/verify` now share the
+  per-IP throttle that already protected `/api/auth/register`,
+  closing a credential-stuffing / OTP brute-force gap (the
+  per-account 5-strike lockout and per-email OTP throttle were not
+  enough on their own).
+- `DELETE /api/recordings/:id/shares/:token_sha256` now takes the
+  SHA-256 digest in the URL — putting the raw share token in the
+  path leaked it into access logs and Referer headers.
+- Share-token validation runs as a single `UPDATE … RETURNING` that
+  checks expiry, remaining uses, and the requested recording id in
+  one statement. The previous read-then-update sequence had a TOCTOU
+  race on `max_uses` and let any holder of one recording's token
+  burn quota by hitting another recording's URL.
+- `DELETE /api/recordings/:id/shares/:token_sha256` now scopes the
+  delete to `(recording_id, token_sha256)` at the storage layer
+  instead of by digest alone. Before the fix, any owner who learned
+  a share link (the raw token is the link itself — not a secret)
+  could compute its SHA-256 and revoke it by hitting the endpoint
+  under their own `recording_id` in the URL, enabling cross-owner
+  share revocation. A mismatched `(recording_id, token_sha256)` pair
+  now returns 404, making cross-owner revoke indistinguishable from
+  a truly unknown digest.
+
+### Fixed
+
+- Recording id is now generated once in `RecordingService` and
+  reused as the on-disk filename, the asciicast `telepair` block,
+  and the DB primary key. Previously the storage layer minted its
+  own id, so `RecordingRow.id` and `file_path` referred to
+  different recordings and the TTL cleaner deleted the row but
+  left the `.cast` file behind.
+- Anonymous share playback works: `/recordings/:id/play` is now a
+  dedicated route outside `AuthGuard`, so a recipient with a
+  `?token=` link is not bounced to `/login`.
+- Revoking a share link actually removes the row. The HTTP handler
+  previously called `delete_share` with the SHA-256 digest from the
+  UI, which the service then re-hashed before lookup; the
+  `DELETE … WHERE token_sha256 = ?` saw nothing and returned 204
+  while the link kept working.
+- Recording dimensions reflect the actual PTY size: the start
+  handler now reads `(cols, rows)` from the live session instead of
+  hardcoding `80×24`, and the PTY I/O loop keeps the size in sync
+  on every resize.
+- Writer-task I/O failures release the hub's recording slot so the
+  owner can stop and restart recording in the same session — the
+  previous behaviour stranded the slot bound to a dead writer until
+  the session itself ended.
+- Player seek uses `term.reset()` instead of `term.clear()` so
+  rewinding does not stack the old run into the scrollback buffer.
+- `stop_recording` no longer holds the sessions `RwLock` read guard
+  across the `.send().await` to the writer — under back-pressure
+  the previous code blocked every concurrent write-lock acquirer
+  for the duration of the flush handshake.
+- `DELETE /api/recordings/:id` refuses (409) while the recording is
+  still being captured (`status = 'recording'`). The previous code
+  removed the file and DB row from under the live writer, leaving a
+  dangling file handle, wedging `stop_recording` into a 404, and
+  keeping the hub's recording slot occupied until the session ended.
+  File removal no longer proceeds when the status check fails, and
+  IO errors other than `NotFound` bubble up so the DB row survives
+  for a retry instead of leaving an orphan on disk.
+- The TTL background cleaner excludes `status = 'recording'` rows
+  from its expiry scan, belt-and-suspenders defence against a bad
+  `expires_at` write or wall-clock jump handing it an active row.
+- Recording writer marks the capture `failed` instead of `completed`
+  when any PTY / collab events were dropped under back-pressure.
+  Previously `try_send` failures were swallowed and the final status
+  was always `completed`, so viewers could load a capture with
+  invisible gaps. The hub's recording slot now bundles the mpsc
+  sender with a shared `AtomicU64` drop counter, and the writer
+  reads it at finalisation — a non-zero count flips the status and
+  logs the drop total at `error!` level.
+
+### Testing
+
+- Cargo test count: **372 → 416** (all green). New coverage:
+  `recording_test` (asciicast v2 encode/decode round-trip,
+  `Recording` lifecycle, share-token hashing), `recording_storage_test`
+  (atomic `UPDATE … RETURNING` consumption, TTL cleaner row+file
+  parity, cross-recording token quota isolation, cross-owner share-
+  revoke rejection, delete-while-active guard), and gateway-level
+  REST coverage for the recording endpoints and access-control gates.
+- Vitest count: **185 → 194** (all green). New coverage:
+  `playback.test.ts` for the PlaybackEngine asciicast v2 parser and
+  play/pause/seek/speed state machine.
+- Playwright count: **44 → 51** (all green). New spec
+  `recording.spec.ts` exercises the owner start/stop flow, the live
+  indicator broadcast to peers, the share-link dialog, and the
+  anonymous `?token=` playback path outside `AuthGuard`.
+
+## [0.1.7] - 2026-04-16
+
+Patch release focused on **terminal personalization and out-of-tab
+awareness**: the session page gains a settings panel for theme, font,
+and cursor style (all persisted in `localStorage`), and a browser-
+notification path surfaces chat messages and peer joins when the tab
+is hidden. Web-only change — no backend, schema, or wire-format impact.
+Drop-in upgrade from 0.1.6.
+
+### Added — Terminal settings panel
+
+- New `SettingsPanel` in the session topbar with a gear affordance,
+  click-outside dismissal, and full keyboard access.
+- Five bundled color themes (`github-dark`, `github-light`, `dracula`,
+  `monokai`, `solarized-dark`) rendered as live swatches so the preview
+  matches exactly what xterm.js will show.
+- Font size stepper (10–24 px) and font-family picker across five
+  bundled monospace families (`jetbrains-mono`, `fira-code`,
+  `source-code-pro`, `cascadia-code`, `system-mono`).
+- Cursor style selector (`block` / `underline` / `bar`) plus a blink
+  toggle, both applied to the live xterm instance without reconnect.
+- All settings persist in `localStorage` and restore on next page
+  load; stored values are validated against the allowed set so a
+  manually edited storage entry cannot poison the terminal with an
+  unknown theme or font id.
+- `settings` i18n namespace added to both `en.ts` and `zh.ts` with
+  parity enforced by the existing dict-symmetry test.
+
+### Added — Browser notifications
+
+- Opt-in browser notifications fire on **incoming chat messages** and
+  **peer-join** events while the tab is backgrounded (`document.hidden`),
+  so collaborators are not missed when the terminal is not focused.
+- Notifications are gated on user consent: the settings panel requests
+  `Notification.requestPermission()` on first toggle and surfaces a
+  `warning` toast when the browser denies the prompt, so the UI never
+  silently flips back to "disabled" without telling the user why.
+- No notifications are emitted while the tab has focus, and permission
+  state is re-checked on every toggle so revoking at the browser level
+  is picked up without a reload.
+
+### Fixed
+
+- The collaboration sidebar auto-closes on narrow viewports so the
+  terminal stays visible on phones and split-pane layouts instead of
+  being pushed off-screen by the participants / chat pane.
+- The persisted `cursorBlink` value is restored after a viewer→operator
+  unlock, closing a small regression where the cursor would stop
+  blinking even though the stored setting said it should.
+- Stored settings are validated against the allowed theme / font /
+  cursor-style enums before being applied, so a stale or manually
+  edited `localStorage` entry no longer leaves the terminal in an
+  undefined visual state.
+
+### Testing
+
+- Vitest count: **159 → 185** (all green). New coverage:
+  `notifications.test.ts` (permission flow, tab-hidden gating,
+  unsupported-browser fallback) and `stores/settings.test.ts`
+  (persistence, validation, cursor-style round-trip, reset).
+- Cargo test count: **372** (unchanged — web-only release).
+- Playwright count: **44** (unchanged).
+
 ## [0.1.6] - 2026-04-16
 
 Patch release focused on **change-password API contract correctness** and
@@ -1132,7 +1339,9 @@ role-based permissions, invite links, and real-time chat.
 - GitHub Actions CI pipeline and release workflow.
 - MIT license across the workspace.
 
-[Unreleased]: https://github.com/telepair/telepair/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/telepair/telepair/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/telepair/telepair/compare/v0.1.7...v0.1.8
+[0.1.7]: https://github.com/telepair/telepair/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/telepair/telepair/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/telepair/telepair/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/telepair/telepair/compare/v0.1.3...v0.1.4

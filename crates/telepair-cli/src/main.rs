@@ -13,6 +13,7 @@ use telepair_control::auth_service::{AuthService, SmtpConfig};
 use telepair_control::session_service::SessionService;
 use telepair_core::audit::{AuditEvent, AuditEventType, AuditFilter, AuditSink};
 use telepair_core::auth::TokenAuthProvider;
+use telepair_core::recording::RecordingConfig;
 use telepair_core::session::{CloseReason, User};
 use telepair_core::storage::{SqliteStorage, Storage};
 use telepair_gateway::state::AppState;
@@ -93,6 +94,21 @@ struct Cli {
     /// SMTP sender address, e.g. "Telepair <noreply@example.com>"
     #[arg(long, env = "TELEPAIR_SMTP_FROM")]
     smtp_from: Option<String>,
+
+    /// Enable session recording. When false (default), no sessions
+    /// are recorded regardless of per-session overrides.
+    #[arg(long, env = "TELEPAIR_RECORDING_ENABLED", default_value_t = false)]
+    recording_enabled: bool,
+
+    /// Recording retention in days. Recordings older than this are
+    /// candidates for automatic cleanup. 0 means permanent (no expiry).
+    #[arg(long, env = "TELEPAIR_RECORDING_TTL_DAYS", default_value_t = 30)]
+    recording_ttl_days: u32,
+
+    /// Directory to store recording files (.cast). Defaults to
+    /// `<data-dir>/recordings`.
+    #[arg(long, env = "TELEPAIR_RECORDING_DIR")]
+    recording_dir: Option<PathBuf>,
 
     /// Trust the `X-Forwarded-For` / `X-Real-IP` headers when keying
     /// the per-IP register rate limiter. Set this ONLY when telepair
@@ -758,8 +774,27 @@ async fn main() -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("--web-dir path is not valid UTF-8"))
             })
             .transpose()?;
-        let mut state = AppState::new(storage, engine, targets_path, smtp, data_dir.clone()).await;
+        let recording_config = RecordingConfig {
+            enabled: cli.recording_enabled,
+            ttl_days: cli.recording_ttl_days,
+            dir: cli
+                .recording_dir
+                .unwrap_or_else(|| data_dir.join("recordings")),
+        };
+        let mut state = AppState::new(
+            storage,
+            engine,
+            targets_path,
+            smtp,
+            data_dir.clone(),
+            recording_config,
+        )
+        .await;
         state.trust_forwarded_headers = cli.trust_forwarded_headers;
+        telepair_gateway::recording_cleaner::spawn_recording_cleaner(
+            state.storage.clone(),
+            state.recording.config().dir.clone(),
+        );
         let cors_mode = if cli.allow_any_origin {
             telepair_gateway::CorsMode::AllowAny
         } else {
