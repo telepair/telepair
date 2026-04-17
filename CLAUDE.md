@@ -20,15 +20,15 @@ cd web && npm run dev                        # dev server on :5173, proxies /api
 ## Testing
 
 ```bash
-cargo test --workspace                       # 372 Rust tests across all crates
+cargo test --workspace                       # 416 Rust tests across all crates
 cargo test -p telepair-core                  # single crate
 cargo test -p telepair-core storage          # single test by name substring
 
-cd web && npm test                           # 159 Vitest unit tests
+cd web && npm test                           # 186 Vitest unit tests
 cd web && npm run test:watch                 # watch mode
 cd web && npm run type-check                 # TypeScript type checking
 
-cd web && npm run e2e                        # 44 Playwright browser E2E tests
+cd web && npm run e2e                        # 61 Playwright browser E2E tests
 cd web && npm run e2e:ui                     # Playwright UI mode (interactive)
 ```
 
@@ -64,19 +64,25 @@ still need to be verified by CI itself.
 
 ## Release Flow
 
-Releases are tag-driven. **Never tag or publish a GitHub Release before
-CI on `main` is green** for the release commit — the published bits stay
-in lockstep with a verified build.
+Releases are tag-driven. See [docs/release.md](docs/release.md) for
+the full procedure. Summary of invariants:
 
-```text
-1. push the release commit to main
-2. wait for the CI workflow on that commit to go green
-3. git tag -s vX.Y.Z + git push origin vX.Y.Z   (Release workflow uploads artifacts)
-4. gh release create vX.Y.Z                      (only after the Release workflow is green)
-```
-
-If CI fails after a tag/release went out, ship a hotfix to `main`
-immediately rather than retagging — the tag is immutable history.
+- **PRs merge to `main` via rebase only** — no merge commits, no squash.
+  `main` stays linear so release tags point at a single semantic commit.
+- **`chore(release): prepare vX.Y.Z` is always the last commit on the
+  release branch** — bumps 5 `Cargo.toml`s + `Cargo.lock` +
+  `web/package{,-lock}.json` and promotes `CHANGELOG.md`'s `[Unreleased]`
+  to `[X.Y.Z] - YYYY-MM-DD` with a release preamble and `### Testing`
+  counts.
+- **`make all` must be green locally**, then **`main` CI must be green**
+  on the prepare commit, before any tag is pushed.
+- **Tag, don't publish.** The only human step is
+  `git tag -s vX.Y.Z origin/main -m "..." && git push origin vX.Y.Z`.
+  The Release workflow builds tarballs, publishes the GHCR image, and
+  creates the GitHub Release from the CHANGELOG. **Never** run
+  `gh release create` by hand.
+- **Tags are immutable.** A broken release is fixed by shipping
+  `vX.Y.Z+1`, never by retagging or deleting.
 
 ## Architecture
 
