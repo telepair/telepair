@@ -13,6 +13,8 @@ import AdminUsers from './pages/AdminUsers';
 import AdminAudit from './pages/AdminAudit';
 import AdminSystem from './pages/AdminSystem';
 import ChangePassword from './pages/ChangePassword';
+import Recordings from './pages/Recordings';
+import RecordingPlayer from './pages/RecordingPlayer';
 import ToastContainer from './components/Toast';
 
 function AuthGuard(props: { children: JSX.Element }) {
@@ -74,6 +76,16 @@ export default function App() {
         <Route path="/" component={() => <AuthGuard><Dashboard /></AuthGuard>} />
         <Route path="/session/:id" component={() => <AuthGuard><Session /></AuthGuard>} />
         <Route path="/change-password" component={() => <AuthGuard><ChangePassword /></AuthGuard>} />
+        <Route path="/recordings" component={() => <AuthGuard><Recordings /></AuthGuard>} />
+        <Route path="/recordings/:id" component={() => <AuthGuard><RecordingPlayer /></AuthGuard>} />
+        {/*
+          Anonymous share-token playback. Lives outside AuthGuard so a
+          recipient with a `?token=...` query parameter can open the
+          link without an account; the player component itself reads
+          the token and uses the public `/recordings/:id/data?token=`
+          endpoint instead of the authed metadata endpoint.
+        */}
+        <Route path="/recordings/:id/play" component={RecordingPlayer} />
         <Route
           path="/admin/targets"
           component={() => (

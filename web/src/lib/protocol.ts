@@ -159,6 +159,8 @@ export type ServerMessage =
        * duplicate entries found here.
        */
       chat_history: ChatEntry[];
+      /** Non-null when a recording is currently in progress for this session. */
+      recording: RecordingStatusInfo | null;
     }
   | { type: 'PeerJoined'; user_id: string; name: string; role: Role; color: string }
   | { type: 'PeerLeft'; user_id: string }
@@ -190,7 +192,9 @@ export type ServerMessage =
   | { type: 'PeerCursor'; user_id: string; x: number; y: number }
   | { type: 'PeerChat'; user_id: string; name: string; text: string; ts: string }
   | { type: 'InputDenied'; reason: InputDeniedReason }
-  | { type: 'Error'; code: string; message: string };
+  | { type: 'Error'; code: string; message: string }
+  | { type: 'RecordingStarted'; recording_id: string }
+  | { type: 'RecordingStopped'; recording_id: string };
 
 // Reason codes mirroring `crates/telepair-core/src/protocol.rs::input_denied`.
 // The server only sends these strings; any unknown value should be rendered
@@ -229,6 +233,8 @@ export const AuditEventType = {
   AUTH_PASSWORD_CHANGED: 'auth.password_changed',
   AUTH_ADMIN_USER_CREATED: 'auth.admin_user_created',
   PARTICIPANT_ROLE_CHANGED: 'participant.role_changed',
+  RECORDING_STARTED: 'recording.started',
+  RECORDING_STOPPED: 'recording.stopped',
 } as const;
 export type AuditEventType = (typeof AuditEventType)[keyof typeof AuditEventType];
 
@@ -450,4 +456,52 @@ export interface BlockedTarget {
 export interface AdminUsersResponse {
   users: AdminUserInfo[];
   total: number;
+}
+
+// --- Recording types ---
+
+/**
+ * Snapshot of an active recording attached to a session. Delivered
+ * inside `SessionState.recording` when the session was started with
+ * recording enabled, and replaced by `null` once stopped.
+ */
+export interface RecordingStatusInfo {
+  recording_id: string;
+  started_at: string;
+}
+
+/**
+ * Full recording row returned by `GET /api/recordings` and
+ * `GET /api/recordings/{id}`. Mirrors `RecordingInfo` in
+ * `crates/telepair-gateway/src/http.rs`.
+ */
+export interface Recording {
+  id: string;
+  session_id: string;
+  status: 'recording' | 'completed' | 'failed';
+  file_path: string | null;
+  file_size: number;
+  duration_ms: number | null;
+  width: number;
+  height: number;
+  event_count: number;
+  started_at: string;
+  completed_at: string | null;
+  expires_at: string | null;
+  created_by: string;
+}
+
+/**
+ * One share-link row returned by the recording share endpoints.
+ * Mirrors `RecordingShareInfo` in `crates/telepair-gateway/src/http.rs`.
+ * The raw plaintext token is only returned on creation; subsequent
+ * list calls return `token_sha256` as the stable revocation handle.
+ */
+export interface RecordingShare {
+  token_sha256: string;
+  recording_id: string;
+  max_uses: number;
+  used_count: number;
+  expires_at: string | null;
+  created_at: string;
 }

@@ -307,6 +307,8 @@ export const en = {
     event_auth_password_changed: 'Password changed',
     event_auth_admin_user_created: 'Admin created user',
     event_participant_role_changed: 'Role changed',
+    event_recording_started: 'Recording started',
+    event_recording_stopped: 'Recording stopped',
   },
   chat: {
     heading: 'Chat',

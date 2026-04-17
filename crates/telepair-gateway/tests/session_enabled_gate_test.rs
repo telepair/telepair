@@ -33,6 +33,7 @@ use telepair_agent::virtual_target::TargetEngine;
 use telepair_core::audit::{AuditEventType, AuditFilter};
 use telepair_core::permission::Role;
 use telepair_core::protocol::{ServerMessage, error_codes};
+use telepair_core::recording::RecordingConfig;
 use telepair_core::session::{InputMode, SessionListFilter};
 use telepair_core::storage::{SqliteStorage, Storage};
 use telepair_gateway::state::AppState;
@@ -51,6 +52,7 @@ async fn setup() -> (axum::Router, AppState, Arc<SqliteStorage>) {
         None,
         None,
         std::path::PathBuf::from("/tmp/telepair-test"),
+        RecordingConfig::default(),
     )
     .await;
     let router = build_router_with_options(state.clone(), None, CorsMode::AllowAny).unwrap();
@@ -198,6 +200,7 @@ async fn start_server() -> (String, AppState, Arc<SqliteStorage>) {
         None,
         None,
         std::path::PathBuf::from("/tmp/telepair-test"),
+        RecordingConfig::default(),
     )
     .await;
     let router = build_router(state.clone());
@@ -255,6 +258,7 @@ async fn start_server_with_router() -> (String, axum::Router, AppState, Arc<Sqli
         None,
         None,
         std::path::PathBuf::from("/tmp/telepair-test"),
+        RecordingConfig::default(),
     )
     .await;
     let router = build_router(state.clone());

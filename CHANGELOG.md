@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Session recording
+
+- New session recording subsystem: opt-in `.cast` (asciicast v2)
+  capture of every active session, with a streaming writer that
+  flushes on a 1 s timer or 64 KiB threshold and a TTL background
+  task that purges expired recordings.
+- REST surface for recordings: `POST /api/sessions/:id/recording/{start,stop}`,
+  `GET /api/recordings`, `GET /api/recordings/:id`, `GET /api/recordings/:id/data`,
+  `DELETE /api/recordings/:id`, `POST /api/recordings/:id/{keep,expire}`,
+  plus share-link CRUD at `/api/recordings/:id/shares` and a public
+  `?token=` access path on the `/data` endpoint.
+- Browser playback page powered by xterm.js with play / pause /
+  seek / speed controls, a participant + chat sidebar replayed in
+  step with PTY output, and an event timeline of the recorded
+  collab messages.
+- WebSocket `RecordingStarted` / `RecordingStopped` server messages
+  so every connected client surfaces the live indicator.
+- New audit event types `recording.started` / `recording.stopped`
+  written by the gateway and rendered in the admin audit timeline.
+- New CLI flags `--recording-enabled`, `--recording-dir`,
+  `--recording-ttl-days` (and matching `TELEPAIR_*` env vars), with
+  `--recording-enabled=false` now actually rejecting `start_recording`
+  requests at the HTTP layer.
+
+### Security
+
+- `POST /api/auth/login` and `POST /api/auth/verify` now share the
+  per-IP throttle that already protected `/api/auth/register`,
+  closing a credential-stuffing / OTP brute-force gap (the
+  per-account 5-strike lockout and per-email OTP throttle were not
+  enough on their own).
+- `DELETE /api/recordings/:id/shares/:token_sha256` now takes the
+  SHA-256 digest in the URL — putting the raw share token in the
+  path leaked it into access logs and Referer headers.
+- Share-token validation runs as a single `UPDATE … RETURNING` that
+  checks expiry, remaining uses, and the requested recording id in
+  one statement. The previous read-then-update sequence had a TOCTOU
+  race on `max_uses` and let any holder of one recording's token
+  burn quota by hitting another recording's URL.
+
+### Fixed
+
+- Recording id is now generated once in `RecordingService` and
+  reused as the on-disk filename, the asciicast `telepair` block,
+  and the DB primary key. Previously the storage layer minted its
+  own id, so `RecordingRow.id` and `file_path` referred to
+  different recordings and the TTL cleaner deleted the row but
+  left the `.cast` file behind.
+- Anonymous share playback works: `/recordings/:id/play` is now a
+  dedicated route outside `AuthGuard`, so a recipient with a
+  `?token=` link is not bounced to `/login`.
+- Revoking a share link actually removes the row. The HTTP handler
+  previously called `delete_share` with the SHA-256 digest from the
+  UI, which the service then re-hashed before lookup; the
+  `DELETE … WHERE token_sha256 = ?` saw nothing and returned 204
+  while the link kept working.
+- Recording dimensions reflect the actual PTY size: the start
+  handler now reads `(cols, rows)` from the live session instead of
+  hardcoding `80×24`, and the PTY I/O loop keeps the size in sync
+  on every resize.
+- Writer-task I/O failures release the hub's recording slot so the
+  owner can stop and restart recording in the same session — the
+  previous behaviour stranded the slot bound to a dead writer until
+  the session itself ended.
+- Player seek uses `term.reset()` instead of `term.clear()` so
+  rewinding does not stack the old run into the scrollback buffer.
+- `stop_recording` no longer holds the sessions `RwLock` read guard
+  across the `.send().await` to the writer — under back-pressure
+  the previous code blocked every concurrent write-lock acquirer
+  for the duration of the flush handshake.
+
 ## [0.1.6] - 2026-04-16
 
 Patch release focused on **change-password API contract correctness** and

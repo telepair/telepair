@@ -10,6 +10,7 @@ use tower::ServiceExt;
 
 use telepair_agent::virtual_target::TargetEngine;
 use telepair_core::audit::{AuditEvent, AuditEventType, AuditSink};
+use telepair_core::recording::RecordingConfig;
 use telepair_core::storage::{SqliteStorage, Storage};
 use telepair_gateway::state::AppState;
 use telepair_gateway::{CorsMode, build_router_with_options};
@@ -41,6 +42,7 @@ async fn setup() -> (axum::Router, String) {
         None,
         None,
         PathBuf::from("/tmp/telepair-test"),
+        RecordingConfig::default(),
     )
     .await;
     let router = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
@@ -182,6 +184,7 @@ async fn export_csv_neutralizes_formula_prefixes() {
         None,
         None,
         PathBuf::from("/tmp/telepair-test"),
+        RecordingConfig::default(),
     )
     .await;
     let app = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
@@ -258,6 +261,7 @@ async fn export_requires_admin() {
         None,
         None,
         PathBuf::from("/tmp/telepair-test"),
+        RecordingConfig::default(),
     )
     .await;
     let app = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();

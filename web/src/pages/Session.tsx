@@ -16,6 +16,8 @@ import InviteDialog from '../components/InviteDialog';
 import Banner from '../components/Banner';
 import LocaleSwitcher from '../components/LocaleSwitcher';
 import SettingsPanel from '../components/SettingsPanel';
+import RecordingIndicator from '../components/RecordingIndicator';
+import ShareRecordingDialog from '../components/ShareRecordingDialog';
 import { toast } from '../stores/toast';
 import { terminalSettings } from '../stores/settings';
 import { notify } from '../lib/notifications';
@@ -81,6 +83,9 @@ export default function SessionPage() {
   const [participants, setParticipants] = createSignal<ParticipantInfo[]>([]);
   const [chatMessages, setChatMessages] = createSignal<ChatMessage[]>([]);
   const [showInvite, setShowInvite] = createSignal(false);
+  const [isRecording, setIsRecording] = createSignal(false);
+  const [recordingId, setRecordingId] = createSignal<string | null>(null);
+  const [showShareDialog, setShowShareDialog] = createSignal(false);
   // Initial sidebar state is viewport-dependent: on narrow screens
   // (<=640px matches the @media rule below) the sidebar promotes to a
   // full-width overlay drawer that covers the terminal, so defaulting
@@ -164,6 +169,14 @@ export default function SessionPage() {
         setRolePinned(true);
         setInputMode(msg.session.input_mode);
         setParticipants(msg.participants);
+        // Sync recording status from the session snapshot.
+        if (msg.recording != null) {
+          setIsRecording(true);
+          setRecordingId(msg.recording.recording_id);
+        } else {
+          setIsRecording(false);
+          setRecordingId(null);
+        }
         // Seed the chat panel from the server's bounded backlog on the
         // FIRST SessionState only. A reconnect delivers SessionState
         // again, but by then local state is richer than the server
@@ -278,6 +291,14 @@ export default function SessionPage() {
         break;
       case 'Error':
         handleServerError(msg.code, msg.message);
+        break;
+      case 'RecordingStarted':
+        setIsRecording(true);
+        setRecordingId(msg.recording_id);
+        break;
+      case 'RecordingStopped':
+        setIsRecording(false);
+        setRecordingId(msg.recording_id);
         break;
     }
   };
@@ -448,6 +469,15 @@ export default function SessionPage() {
     }
   };
 
+  const handleStopRecording = async () => {
+    try {
+      await api.stopRecording(params.id);
+      // State will update via RecordingStopped WS message.
+    } catch (e) {
+      toast.error(`Failed to stop recording: ${fmtError(e)}`);
+    }
+  };
+
   // Return button dispatch: the choice between "back to dashboard"
   // and "log out" is a property of the CREDENTIAL, not the session
   // role. A scoped-guest token is only valid for this one session
@@ -545,10 +575,18 @@ export default function SessionPage() {
         <span class="role-badge" data-role={role()}>{roleLabel(t, role())}</span>
         <span class="status-dot" data-status={status()} />
         <div class="topbar-actions">
+          <RecordingIndicator
+            isRecording={isRecording()}
+            isOwner={role() === 'owner'}
+            onStop={handleStopRecording}
+          />
           <LocaleSwitcher variant="topbar" />
           <SettingsPanel />
           <Show when={role() === 'owner' && !endedReasonKey()}>
             <button class="action-btn" onClick={() => setShowInvite(true)}>{t('session.invite')}</button>
+            <Show when={recordingId() && !isRecording()}>
+              <button class="action-btn" onClick={() => setShowShareDialog(true)}>Share Rec</button>
+            </Show>
             <button
               class={closeArmed() ? 'action-btn danger armed' : 'action-btn danger'}
               onClick={handleCloseSession}
@@ -660,6 +698,13 @@ export default function SessionPage() {
         open={showInvite()}
         onClose={() => setShowInvite(false)}
       />
+
+      <Show when={showShareDialog() && recordingId()}>
+        <ShareRecordingDialog
+          recordingId={recordingId()!}
+          onClose={() => setShowShareDialog(false)}
+        />
+      </Show>
 
       <style>{`
         .session-page {

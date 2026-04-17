@@ -16,6 +16,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 argon2 = { workspace = true }
 lettre = { workspace = true }
+sha2 = { workspace = true }
+nanoid = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }

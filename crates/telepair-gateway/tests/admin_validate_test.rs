@@ -11,6 +11,7 @@ use tempfile::NamedTempFile;
 use tower::ServiceExt;
 
 use telepair_agent::virtual_target::TargetEngine;
+use telepair_core::recording::RecordingConfig;
 use telepair_core::storage::{SqliteStorage, Storage};
 use telepair_gateway::state::AppState;
 use telepair_gateway::{CorsMode, build_router_with_options};
@@ -44,6 +45,7 @@ async fn setup(yaml: &str) -> (axum::Router, String, PathBuf, NamedTempFile) {
         Some(path.clone()),
         None,
         PathBuf::from("/tmp/telepair-test"),
+        RecordingConfig::default(),
     )
     .await;
     let router = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();
@@ -246,6 +248,7 @@ async fn validate_requires_admin() {
         None,
         None,
         PathBuf::from("/tmp/telepair-test"),
+        RecordingConfig::default(),
     )
     .await;
     let app = build_router_with_options(state, None, CorsMode::AllowAny).unwrap();

@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::audit::{AuditEvent, AuditFilter};
 use crate::error::Result;
 use crate::permission::Role;
+use crate::recording::{RecordingRow, RecordingShareRow};
 use crate::session::{
     CloseReason, CreateUserTargetParams, InputMode, InviteToken, LoginFailureOutcome, Participant,
     PendingVerifyResult, RedeemIdentity, RedeemOutcome, Session, SessionListFilter, User,
@@ -381,4 +382,111 @@ pub trait Storage: Send + Sync {
     /// Query `audit_events` with the given filter. Rows are sorted
     /// newest-first. An unset `filter.limit` falls back to `100`.
     async fn list_audit_events(&self, filter: &AuditFilter) -> Result<Vec<AuditEvent>>;
+
+    // ── Recordings ────────────────────────────────────────────────────
+
+    /// Create a new recording row in `recording` status. The caller
+    /// supplies `id` so that the recording id, the on-disk filename,
+    /// and the DB primary key are all derived from a single source —
+    /// preventing the cleaner / downloader from looking up a file
+    /// under one id while the row was inserted under another.
+    /// `expires_at` is an optional RFC3339 string; `None` means the
+    /// recording never expires (permanent).
+    #[allow(clippy::too_many_arguments)] // Atomic insert, no natural sub-grouping.
+    async fn create_recording(
+        &self,
+        id: &str,
+        session_id: &str,
+        created_by: Uuid,
+        width: i64,
+        height: i64,
+        file_path: &str,
+        expires_at: Option<&str>,
+    ) -> Result<RecordingRow>;
+
+    /// Look up a recording by id. Returns `Ok(None)` on miss.
+    async fn get_recording(&self, id: &str) -> Result<Option<RecordingRow>>;
+
+    /// Transition a recording to `completed` status with final
+    /// duration, event count, and file size.
+    async fn complete_recording(
+        &self,
+        id: &str,
+        duration_ms: i64,
+        event_count: i64,
+        file_size: i64,
+    ) -> Result<()>;
+
+    /// Transition a recording to `failed` status.
+    async fn fail_recording(&self, id: &str) -> Result<()>;
+
+    /// Find the active (`status = 'recording'`) recording for a
+    /// session, if any. At most one recording per session can be
+    /// active at a time — the caller is responsible for enforcing
+    /// this invariant at creation time.
+    async fn find_active_recording(&self, session_id: &str) -> Result<Option<RecordingRow>>;
+
+    /// List all recordings created by a specific user, newest-first.
+    async fn list_recordings_for_user(&self, user_id: Uuid) -> Result<Vec<RecordingRow>>;
+
+    /// List every recording in the system, newest-first. Admin-only
+    /// gate is the caller's responsibility.
+    async fn list_all_recordings(&self) -> Result<Vec<RecordingRow>>;
+
+    /// List recordings whose `expires_at` has passed (< now), up to
+    /// `limit` rows. Used by the TTL cleaner to find candidates for
+    /// deletion.
+    async fn list_expired_recordings(&self, limit: i64) -> Result<Vec<RecordingRow>>;
+
+    /// Hard-delete a recording row. Cascade deletes will remove any
+    /// associated `recording_shares` rows.
+    async fn delete_recording(&self, id: &str) -> Result<()>;
+
+    /// Clear `expires_at` so the recording never expires.
+    async fn set_recording_permanent(&self, id: &str) -> Result<()>;
+
+    /// Set or update `expires_at` to the given RFC3339 timestamp.
+    async fn set_recording_expiry(&self, id: &str, expires_at: &str) -> Result<()>;
+
+    // ── Recording shares ──────────────────────────────────────────────
+
+    /// Create a share token row for a recording. `token_sha256` is the
+    /// hex-encoded SHA-256 of the raw token (the raw token is only
+    /// visible at mint time). `max_uses` of 0 means unlimited.
+    async fn create_recording_share(
+        &self,
+        recording_id: &str,
+        token_sha256: &str,
+        max_uses: i64,
+        expires_at: Option<&str>,
+    ) -> Result<RecordingShareRow>;
+
+    /// Atomically validate and consume a share token. Single SQL
+    /// statement that increments `used_count` only when ALL of the
+    /// following hold:
+    /// - the token row exists,
+    /// - it belongs to `expected_recording_id`,
+    /// - it has not expired (`expires_at IS NULL OR > now`),
+    /// - it has remaining uses (`max_uses = 0 OR used_count < max_uses`).
+    ///
+    /// Returns the post-increment row on success, `None` otherwise.
+    /// Doing this in one statement closes two earlier holes:
+    /// 1. TOCTOU race where two concurrent requests both pass an
+    ///    application-level `used_count < max_uses` check before
+    ///    either UPDATE landed and exhausted the limit;
+    /// 2. caller incrementing the counter before validating that the
+    ///    token belonged to the requested recording — letting any
+    ///    holder of a share burn another recording's quota with a
+    ///    bogus URL.
+    async fn consume_recording_share(
+        &self,
+        token_sha256: &str,
+        expected_recording_id: &str,
+    ) -> Result<Option<RecordingShareRow>>;
+
+    /// List all share tokens for a recording, newest-first.
+    async fn list_recording_shares(&self, recording_id: &str) -> Result<Vec<RecordingShareRow>>;
+
+    /// Hard-delete a share token row.
+    async fn delete_recording_share(&self, token_sha256: &str) -> Result<()>;
 }
