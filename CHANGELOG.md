@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Admins can force-close sessions they don't own (`DELETE
+  /api/sessions/:id`) — useful after disabling the owner, so
+  operators don't have to wait for the idle reaper. History rows
+  stamp a new `CloseReason::Admin` (surfaced as "Closed by admin"
+  on the dashboard) so the action isn't misattributed to the owner.
+
+### Fixed
+
+- Disabled-then-re-enabled user's session tab no longer lingers
+  in zombie state. `PeerEvicted` now self-detects: `account_disabled`
+  refreshes the identity and routes home (dashboard shows the
+  pending-approval banner), while `token_rotated` drops credentials
+  and routes to `/login`. Previously the WS 4001 close only set
+  `status='error'` with no navigation, leaving a stale OWNER badge
+  and dead keystrokes.
+- `DELETE /api/sessions/:id` is idempotent on already-closed
+  sessions — a UI double-click now returns 204 instead of a
+  misleading 404. Concurrent close races (reaper beating the
+  owner, two admin tabs) are also absorbed as success.
+
 ## [0.1.8] - 2026-04-17
 
 Minor release centred on **session recording and playback**. Live

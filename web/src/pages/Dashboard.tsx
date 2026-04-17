@@ -872,6 +872,8 @@ function reasonLabel(
   switch (reason) {
     case 'owner':
       return { label: t('dashboard.sessions_closed_by_owner'), data: 'owner' };
+    case 'admin':
+      return { label: t('dashboard.sessions_closed_by_admin'), data: 'admin' };
     case 'reaper':
       return { label: t('dashboard.sessions_closed_by_reaper'), data: 'reaper' };
     case 'startup':

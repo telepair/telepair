@@ -113,6 +113,7 @@ export const en = {
     sessions_tab_all: 'All',
     sessions_status_active: 'Active',
     sessions_closed_by_owner: 'Closed by owner',
+    sessions_closed_by_admin: 'Closed by admin',
     sessions_closed_by_reaper: 'Closed (idle timeout)',
     sessions_closed_by_startup: 'Closed on restart',
     sessions_closed_by_error: 'Closed (launch error)',
@@ -200,6 +201,10 @@ export const en = {
       'Your role is now Viewer — terminal input is disabled.',
     toast_role_promoted_to_operator:
       'Your role is now Operator — you can type in the terminal.',
+    toast_evicted_account_disabled:
+      'Your account was disabled — returning to the dashboard.',
+    toast_evicted_token_rotated:
+      'Your credentials changed — please log in again.',
     sidebar_show: 'Show Sidebar',
     sidebar_hide: 'Hide Sidebar',
     viewer_readonly_badge: 'Viewer · read-only',

@@ -71,6 +71,10 @@ impl std::str::FromStr for SessionStatus {
 pub enum CloseReason {
     /// Owner clicked Close in the UI (or hit the DELETE endpoint).
     Owner,
+    /// Admin force-closed someone else's session (e.g. to clean up
+    /// after disabling a user). Distinct from `Owner` so the history
+    /// view doesn't misattribute the action to the session's owner.
+    Admin,
     /// Idle reaper ran past the grace window and reclaimed the PTY.
     Reaper,
     /// Boot-time cleanup closed an orphaned `active` row left over
@@ -84,6 +88,7 @@ impl CloseReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Owner => "owner",
+            Self::Admin => "admin",
             Self::Reaper => "reaper",
             Self::Startup => "startup",
             Self::Error => "error",
@@ -97,6 +102,7 @@ impl std::str::FromStr for CloseReason {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "owner" => Ok(Self::Owner),
+            "admin" => Ok(Self::Admin),
             "reaper" => Ok(Self::Reaper),
             "startup" => Ok(Self::Startup),
             "error" => Ok(Self::Error),

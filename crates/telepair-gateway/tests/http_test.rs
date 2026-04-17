@@ -216,7 +216,7 @@ async fn list_sessions_non_admin_is_still_owner_scoped() {
 async fn delete_session_owner_succeeds_and_marks_closed() {
     // The HTTP `DELETE /api/sessions/:id` handler used to inline the
     // ownership check; the H4 refactor moved it into
-    // `SessionService::close_session_as_owner`. Pin the wired path
+    // `SessionService::close_session_by_user`. Pin the wired path
     // end-to-end (HTTP → service → storage) so future contributors
     // can't quietly drop the auth check from the handler.
     let state = AppState::new_test().await;
@@ -279,6 +279,89 @@ async fn delete_session_non_owner_gets_403_and_session_stays_active() {
         still.status,
         SessionStatus::Active,
         "403 path must not have side-effected the session row"
+    );
+}
+
+#[tokio::test]
+async fn delete_session_is_idempotent_on_already_closed() {
+    // Regression for F3: a UI double-click on Close used to flash a
+    // "session not found" toast because the second DELETE matched
+    // zero rows at the storage `UPDATE ... WHERE status='active'`
+    // filter and bubbled up as 404. Contract now: already-closed is
+    // indistinguishable from "just closed" to the caller — both
+    // return 204.
+    let state = AppState::new_test().await;
+    let (alice, alice_token) = state.storage.create_user("alice", false).await.unwrap();
+    let session = state
+        .storage
+        .create_session_with_owner(alice.id, "local-shell", InputMode::Multiplexed, None)
+        .await
+        .unwrap();
+    let app = build_router(state);
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/sessions/{}", session.id))
+                .header("Authorization", format!("Bearer {alice_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::NO_CONTENT);
+
+    let second = app
+        .oneshot(
+            Request::delete(format!("/api/sessions/{}", session.id))
+                .header("Authorization", format!("Bearer {alice_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        StatusCode::NO_CONTENT,
+        "double-close must be idempotent, not surface as 404"
+    );
+}
+
+#[tokio::test]
+async fn delete_session_admin_can_force_close_foreign_session() {
+    // Regression for F4: after disabling a user, operators need a
+    // way to clean up the sessions that user still owns without
+    // waiting for the idle reaper. Admin DELETE must succeed against
+    // a session they don't own, with the close reason stamped as
+    // `admin` so history views don't misattribute the action.
+    let state = AppState::new_test().await;
+    let (alice, _alice_token) = state.storage.create_user("alice", false).await.unwrap();
+    let session = state
+        .storage
+        .create_session_with_owner(alice.id, "local-shell", InputMode::Multiplexed, None)
+        .await
+        .unwrap();
+    let admin_token = state.create_test_admin("admin").await;
+    let storage = state.storage.clone();
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::delete(format!("/api/sessions/{}", session.id))
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let after = storage.get_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(after.status, SessionStatus::Closed);
+    assert_eq!(
+        after.closed_reason.map(|r| r.as_str()),
+        Some("admin"),
+        "admin force-close must stamp `admin`, not `owner`"
     );
 }
 
