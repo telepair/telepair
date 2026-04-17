@@ -157,6 +157,13 @@ pub enum AuditEventType {
     /// the host operator, not an authenticated HTTP caller.
     #[serde(rename = "auth.admin_user_created")]
     AuthAdminUserCreated,
+    /// A recording started for a session. Detail: `{recording_id, session_id}`.
+    #[serde(rename = "recording.started")]
+    RecordingStarted,
+    /// A recording stopped (completed or aborted). Detail:
+    /// `{recording_id, session_id, duration_s}`.
+    #[serde(rename = "recording.stopped")]
+    RecordingStopped,
 }
 
 impl AuditEventType {
@@ -181,6 +188,8 @@ impl AuditEventType {
             Self::AuthPasswordChanged => "auth.password_changed",
             Self::ParticipantRoleChanged => "participant.role_changed",
             Self::AuthAdminUserCreated => "auth.admin_user_created",
+            Self::RecordingStarted => "recording.started",
+            Self::RecordingStopped => "recording.stopped",
         }
     }
 }
@@ -208,6 +217,8 @@ impl FromStr for AuditEventType {
             "auth.password_changed" => Ok(Self::AuthPasswordChanged),
             "participant.role_changed" => Ok(Self::ParticipantRoleChanged),
             "auth.admin_user_created" => Ok(Self::AuthAdminUserCreated),
+            "recording.started" => Ok(Self::RecordingStarted),
+            "recording.stopped" => Ok(Self::RecordingStopped),
             _ => Err(format!("unknown audit event type: {s}")),
         }
     }

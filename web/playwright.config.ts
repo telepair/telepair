@@ -46,6 +46,12 @@ export default defineConfig({
       // without PATH/HOME and silently fail before binding the port.
       ...(process.env as Record<string, string>),
       TELEPAIR_DATA_DIR: E2E_DATA_DIR,
+      // Master switch for session recording. Recording is still opt-in
+      // per session (via the recording API), but the server ignores
+      // those calls entirely when this is false — leaving the feature
+      // untestable end-to-end. Flipping it on is safe for non-recording
+      // tests since no session auto-records without an explicit start.
+      TELEPAIR_RECORDING_ENABLED: 'true',
     },
   },
 });

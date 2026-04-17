@@ -1,6 +1,6 @@
 [package]
 name = "telepair-control"
-version = "0.1.7"
+version = "0.1.8"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,6 +16,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 argon2 = { workspace = true }
 lettre = { workspace = true }
+sha2 = { workspace = true }
+nanoid = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }

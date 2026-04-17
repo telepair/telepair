@@ -141,6 +141,7 @@ describe('TelepairSocket', () => {
       your_role: 'owner',
       your_user_id: 'u',
       chat_history: [],
+      recording: null,
     };
     ws.onmessage?.({ data: JSON.stringify(state) });
 

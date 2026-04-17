@@ -15,3 +15,4 @@ test-reports/
 /package.json
 /package-lock.json
 .claude/
+.worktrees/

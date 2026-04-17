@@ -5,6 +5,7 @@ pub mod auth;
 pub mod error;
 pub mod permission;
 pub mod protocol;
+pub mod recording;
 pub mod session;
 pub mod storage;
 pub mod target;
