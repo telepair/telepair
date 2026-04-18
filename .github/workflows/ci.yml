@@ -79,3 +79,49 @@ jobs:
       - name: Run E2E tests
         working-directory: web
         run: npm run e2e
+
+  security:
+    name: Security audit (cargo + npm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Dedicated cache key so the audit tool install doesn't
+          # churn the main build cache.
+          shared-key: security-audit
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      # Fails the job on any RUSTSEC advisory — intentional. A CVE
+      # landing in a transitive dep should block merges until the
+      # affected crate is bumped.
+      - name: Rust advisories
+        run: cargo audit
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # Installs full (prod+dev) tree so the lockfile matches what's
+      # on disk; `npm audit --production` below filters the report.
+      - name: npm ci (web)
+        working-directory: web
+        run: npm ci
+
+      # `--audit-level=high` fails on high/critical only. Dev-only
+      # advisories (vite/playwright chain) are surfaced separately
+      # and not gated on, since they don't ship to users.
+      - name: npm audit (production)
+        working-directory: web
+        run: npm audit --audit-level=high --omit=dev
+
+      - name: npm audit (dev, non-blocking)
+        working-directory: web
+        continue-on-error: true
+        run: npm audit --audit-level=high
