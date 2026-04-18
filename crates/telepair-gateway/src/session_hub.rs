@@ -965,6 +965,11 @@ impl SessionHub {
         }
         hist.push_back(entry.clone());
         let _ = live.collab_tx.send(entry.clone().into());
+        // Release the chat_history guard before grabbing recording_tx
+        // to keep lock acquisition order one-at-a-time. No other path
+        // holds these two together today, but nesting them invites a
+        // deadlock the moment someone locks them in the other order.
+        drop(hist);
 
         // Recording tap: capture the chat event. Back-pressured
         // drops are counted so finalisation can reflect the gap.
