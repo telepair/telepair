@@ -72,6 +72,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `initPlayer` flow now checks an abort latch after every `await`
   (metadata fetch, data download, microtask yield) and bails
   before initialising xterm if the component has been cleaned up.
+- `POST /api/sessions/{id}/recording/start` now logs `fail_recording`
+  rollback failures at ERROR level instead of silently swallowing
+  them. Previously a DB error on the rollback path left the
+  recording row stuck in `status = 'recording'`, which in turn kept
+  the `idx_recordings_one_active_per_session` partial unique index
+  occupied — every future start for the same session returned 409
+  with no log evidence of why. The rollback is still best-effort
+  (the writer task will also finalise the row on its own), but
+  operators now have the signal they need to intervene when both
+  paths fail.
 - `recordings.expires_at` and `recording_shares.expires_at` are now
   normalised to UTC (`+00:00`) before storage. The cleaner and the
   share-consume SQL both compare these columns lexicographically
