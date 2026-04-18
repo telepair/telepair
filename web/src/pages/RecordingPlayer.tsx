@@ -1,6 +1,6 @@
 // web/src/pages/RecordingPlayer.tsx
 import { createSignal, onMount, onCleanup, Show } from 'solid-js';
-import { useParams, useSearchParams, useNavigate } from '@solidjs/router';
+import { useParams } from '@solidjs/router';
 import { Terminal as XTerm } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import { api, errorMessage } from '../lib/api';
@@ -14,12 +14,59 @@ import CollabSidebar from '../components/CollabSidebar';
 import type { CollabChatMessage } from '../components/CollabSidebar';
 import EventTimeline from '../components/EventTimeline';
 
+/**
+ * Read the share token out of `location.hash` (legacy paths used a
+ * query string; see `ShareRecordingDialog` for why fragments are
+ * preferable) and strip the fragment via `history.replaceState`.
+ *
+ * Returning `undefined` for both the missing-hash and malformed-hash
+ * cases lets the caller treat "no token" and "bad token" identically
+ * — the server will 401 either way, and the UI surfaces the same
+ * "Recording not available" banner in both branches.
+ *
+ * Runs synchronously at render time so no byte of the token leaks to
+ * `document.referrer` on any subsequent navigation — if we deferred
+ * to `onMount` a user could right-click → Copy Link first.
+ */
+function captureShareTokenFromHash(): string | undefined {
+  if (typeof window === 'undefined') return undefined;
+  const hash = window.location.hash;
+  if (!hash || hash.length < 2) return undefined;
+  // Strip the leading `#` and parse as a flat querystring so future
+  // additions (e.g. `#t=12s&token=…`) don't break the extraction.
+  const params = new URLSearchParams(hash.slice(1));
+  const token = params.get('token') ?? undefined;
+  if (!token) return undefined;
+  // Scrub the fragment so the secret doesn't linger in the URL bar,
+  // `document.referrer`, or the shared-with-bookmark state. Using
+  // `replaceState` (not `pushState`) keeps the SPA history stack
+  // clean — a share viewer pressing Back should land wherever they
+  // came from, not on the same page without a token.
+  try {
+    const cleanUrl = `${window.location.pathname}${window.location.search}`;
+    window.history.replaceState(window.history.state, '', cleanUrl);
+  } catch {
+    // Sandboxed iframes, file:// URLs, or browsers with history
+    // throttling can reject replaceState. The token is still held
+    // only in our closure and never sent to the server in a query
+    // string, so a failure to scrub is degraded but not catastrophic.
+  }
+  return token;
+}
+
 export default function RecordingPlayer() {
   const params = useParams<{ id: string }>();
-  const [searchParams] = useSearchParams<{ token?: string }>();
-  const navigate = useNavigate();
 
-  const shareToken = () => searchParams.token;
+  // Extract the share token from the URL fragment (#token=…) and
+  // immediately scrub it from the browser history. Fragments don't
+  // traverse HTTP — so reverse-proxy and gateway access logs can
+  // never see them — but they *do* linger in `document.referrer`,
+  // browser history, and the address bar until we clear them.
+  // Capturing once at mount (before any `await`) + `replaceState`
+  // leaves the player with the token in a closure but nothing
+  // user-observable after paint.
+  const capturedToken = captureShareTokenFromHash();
+  const shareToken = () => capturedToken;
 
   // ── State ──────────────────────────────────────────────────────────────────
   const [recording, setRecording] = createSignal<Recording | null>(null);
@@ -70,28 +117,13 @@ export default function RecordingPlayer() {
         setRecording(rec);
       }
 
-      // Fetch the asciicast data file. For share-token (anonymous) access
-      // we use a bare fetch with the token in the URL. For authenticated
-      // access we go through api.downloadBlob so the global 401 interceptor
-      // fires on expired tokens.
-      let castContent: string;
-      const token = shareToken();
-      if (token) {
-        const dataUrl = api.getRecordingDataUrl(params.id, token);
-        const resp = await fetch(dataUrl);
-        if (destroyed) return;
-        if (!resp.ok) {
-          throw new Error(`Failed to fetch recording data: ${resp.status} ${resp.statusText}`);
-        }
-        castContent = await resp.text();
-        if (destroyed) return;
-      } else {
-        const path = `/recordings/${params.id}/data`;
-        const { blob } = await api.downloadBlob(path);
-        if (destroyed) return;
-        castContent = await blob.text();
-        if (destroyed) return;
-      }
+      // Fetch the asciicast data file. `api.fetchRecordingData` picks
+      // the right auth path internally: `X-Share-Token` header for
+      // anonymous share viewers, bearer for owners/admins. Neither
+      // path puts the share secret in the URL, so reverse-proxy
+      // access logs don't capture it.
+      const castContent = await api.fetchRecordingData(params.id, shareToken());
+      if (destroyed) return;
 
       // ── Parse the cast first ─────────────────────────────────────────────
       // Parsing the asciicast header gives us the authoritative

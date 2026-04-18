@@ -2382,33 +2382,51 @@ pub async fn delete_recording(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Query parameter for `GET /api/recordings/{id}/data`.
-#[derive(Deserialize, Default)]
-pub struct RecordingDataQuery {
-    /// Share token — when present, no auth header is needed.
-    #[serde(default)]
-    pub token: Option<String>,
-}
+/// Header name carrying the raw share token on anonymous recording
+/// downloads. Deliberately a custom header (not `Authorization:`)
+/// because bearer-token middleware and share-token validation are
+/// different auth paths — collapsing them into the same header would
+/// invite "I am logged in AND holding a share token" confusion and
+/// force the handler to pick a precedence.
+const SHARE_TOKEN_HEADER: &str = "x-share-token";
 
 /// `GET /api/recordings/{id}/data` — download the .cast file.
 ///
 /// Supports two access modes:
-/// 1. Auth header: owner or admin can download directly.
-/// 2. `?token=<share_token>`: validates the share token (expiry +
-///    usage) without requiring auth. This powers share links.
+/// 1. `Authorization: Bearer <token>` — owner or admin can download
+///    directly.
+/// 2. `X-Share-Token: <raw_token>` — validates the share token
+///    (expiry + usage) without requiring auth. This powers share
+///    links.
+///
+/// The share token used to travel in a `?token=...` query parameter,
+/// but reverse-proxy access logs almost always capture full request
+/// URIs (query string included) while `X-Share-Token` is a custom
+/// header that the default `$request` / combined log formats do not
+/// log. Moving to the header closes a quiet log-exfiltration path —
+/// centralised log collectors, archived NGINX logs, and operator
+/// screens no longer surface raw, still-valid share secrets.
 pub async fn get_recording_data(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(recording_id): Path<String>,
-    Query(query): Query<RecordingDataQuery>,
 ) -> Result<Response, ApiError> {
+    // Read the share token from the custom header. Missing / non-
+    // ASCII values fall through to the auth path — we don't want to
+    // surface `400 Bad Header` to a caller who is legitimately using
+    // bearer auth, and `None` is already the "go check auth" sentinel.
+    let share_token: Option<String> = headers
+        .get(SHARE_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
     // Try share-token path first (no auth required). The recording
     // id is passed to `validate_share_token` so the
     // recording-mismatch check happens *inside* the same atomic
     // UPDATE that consumes a use — without this, an attacker holding
     // a valid token for recording A could burn its quota by hitting
     // recording B's URL.
-    if let Some(ref raw_token) = query.token {
+    if let Some(ref raw_token) = share_token {
         state
             .recording
             .validate_share_token(raw_token, &recording_id)

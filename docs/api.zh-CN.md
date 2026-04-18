@@ -1086,12 +1086,12 @@ WebSocket 连接时,会在 `session_enabled` 关卡处被拒绝。
 下载 asciicast v2 `.cast` 文件。两种访问模式:
 
 1. **Bearer token**(owner 或 admin):标准 `Authorization: Bearer <token>`。
-2. **Share token**(匿名):追加 `?token=<raw_share_token>`。服务端用单条 `UPDATE … RETURNING` 原子地校验 recording-id 匹配、过期时间、剩余次数并递增 `used_count` —— 无 TOCTOU 窗口。
+2. **Share token**(匿名):通过 `X-Share-Token: <raw_share_token>` 请求头传递原始 token。服务端用单条 `UPDATE … RETURNING` 原子地校验 recording-id 匹配、过期时间、剩余次数并递增 `used_count` —— 无 TOCTOU 窗口。
 
-**Query**
-| 参数 | 说明 |
-|------|------|
-| `token` | `POST /api/recordings/{id}/shares` 返回的原始 share token。传了就忽略 auth header。 |
+**请求头**
+| Header | 说明 |
+|--------|------|
+| `X-Share-Token` | `POST /api/recordings/{id}/shares` 返回的原始 share token。传了就忽略 `Authorization` 头。特意用自定义请求头(**而不是** query 参数),这样原始 token 不会出现在反向代理 / 网关的访问日志里 —— 默认的日志格式会记录完整 URI,但不会记录自定义请求头。 |
 
 **响应** `200 OK`
 - `Content-Type: application/x-asciicast`

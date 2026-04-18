@@ -194,8 +194,12 @@ test.describe.serial('Recording feature', () => {
     // AuthGuard bypass that anonymous viewers depend on.
     const anon = await browser.newContext();
     const anonPage = await anon.newPage();
+    // Token travels in the URL fragment — servers never see it in
+    // access logs, and the player strips it from history the moment
+    // it mounts. Playwright follows fragments natively, so `goto`
+    // plus the hash is enough to exercise the full anon-view flow.
     await anonPage.goto(
-      `/recordings/${recordingId}/play?token=${encodeURIComponent(shareToken)}`,
+      `/recordings/${recordingId}/play#token=${encodeURIComponent(shareToken)}`,
     );
     await expect(anonPage.locator('.terminal-container')).toBeVisible({ timeout: 10_000 });
     await expect(anonPage.getByRole('button', { name: 'Play' })).toBeVisible();
@@ -226,9 +230,13 @@ test.describe.serial('Recording feature', () => {
       share: { token_sha256: string };
     };
 
-    // Pre-revoke: anonymous fetch with the token must work.
+    // Pre-revoke: anonymous fetch with the token must work. The
+    // server only honours the `X-Share-Token` header now — passing
+    // the secret as a query param would silently fall through to
+    // the auth-required branch and 401.
     const ok = await request.get(
-      `/api/recordings/${recordingId}/data?token=${encodeURIComponent(shareToken)}`,
+      `/api/recordings/${recordingId}/data`,
+      { headers: { 'X-Share-Token': shareToken } },
     );
     expect(ok.ok()).toBe(true);
 
@@ -242,9 +250,46 @@ test.describe.serial('Recording feature', () => {
 
     // Post-revoke: anonymous fetch with the same token must fail.
     const denied = await request.get(
-      `/api/recordings/${recordingId}/data?token=${encodeURIComponent(shareToken)}`,
+      `/api/recordings/${recordingId}/data`,
+      { headers: { 'X-Share-Token': shareToken } },
     );
     expect(denied.ok()).toBe(false);
     expect([400, 401, 403, 404]).toContain(denied.status());
+  });
+
+  test('share token in query string is NOT honoured (log-hygiene regression)', async ({
+    request,
+  }) => {
+    // Even a valid token must be rejected when it travels in the
+    // URL query — that's the log-exfiltration path we're closing.
+    // The request lands on the auth-required branch, so the server
+    // returns 401 (missing bearer), not a share-token verdict.
+    const token = getAdminToken();
+    const list = await request.get('/api/recordings', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const rows = (await list.json()) as Array<{ id: string }>;
+    expect(rows.length, 'at least one recording from prior tests').toBeGreaterThan(0);
+    const recordingId = rows[0].id;
+
+    const mint = await request.post(`/api/recordings/${recordingId}/shares`, {
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      data: { max_uses: 0 },
+    });
+    const { token: shareToken } = (await mint.json()) as { token: string };
+
+    const viaQuery = await request.get(
+      `/api/recordings/${recordingId}/data?token=${encodeURIComponent(shareToken)}`,
+    );
+    expect(viaQuery.ok()).toBe(false);
+    expect(viaQuery.status()).toBe(401);
+
+    // And the same token in the header works — proves the token
+    // itself is fine, it's only the transport that changed.
+    const viaHeader = await request.get(
+      `/api/recordings/${recordingId}/data`,
+      { headers: { 'X-Share-Token': shareToken } },
+    );
+    expect(viaHeader.ok()).toBe(true);
   });
 });

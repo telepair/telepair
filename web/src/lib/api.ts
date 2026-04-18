@@ -633,11 +633,47 @@ export const api = {
   /**
    * Build the URL for streaming a recording's asciicast data. NOT async
    * — callers embed this in a `<video src>` or pass it to `fetch()`.
-   * An optional share token can be appended for unauthenticated access.
+   *
+   * Share tokens are **not** appended to the URL. Query strings get
+   * mirrored into reverse-proxy access logs (NGINX `$request`, ALB
+   * `request_url`, CloudFront standard logs, etc.), which would let
+   * anyone with log access hijack a still-valid share link. Anonymous
+   * viewers must pass the token via `fetchRecordingData` instead,
+   * which ships it in the `X-Share-Token` header (not logged by
+   * default formatters).
    */
-  getRecordingDataUrl(id: string, token?: string): string {
-    const base = `${BASE}/recordings/${id}/data`;
-    return token ? `${base}?token=${encodeURIComponent(token)}` : base;
+  getRecordingDataUrl(id: string): string {
+    return `${BASE}/recordings/${id}/data`;
+  },
+
+  /**
+   * Fetch the raw asciicast body for a recording. When `shareToken`
+   * is provided, the token is sent in the `X-Share-Token` header —
+   * the URL itself stays token-free so proxy/CDN access logs don't
+   * leak a still-valid share secret. When omitted, falls back to the
+   * authenticated bearer path (owner or admin).
+   *
+   * Returns the text body so the player can feed it straight into
+   * asciinema's `Asciinema.player.create` without a second round-
+   * trip.
+   */
+  async fetchRecordingData(id: string, shareToken?: string): Promise<string> {
+    const url = `${BASE}/recordings/${id}/data`;
+    if (shareToken) {
+      // Anonymous path: X-Share-Token header takes the place of the
+      // old `?token=` query param. `fetch` is used directly (not
+      // `authedFetch`) because share viewers have no bearer and the
+      // 401-interceptor would bounce them to /login on any soft error.
+      const resp = await fetch(url, {
+        headers: { 'X-Share-Token': shareToken },
+      });
+      if (!resp.ok) {
+        throw new ApiError(resp.status, await readErrorMessage(resp));
+      }
+      return resp.text();
+    }
+    const resp = await authedFetch(url.slice(BASE.length));
+    return resp.text();
   },
 
   /**
