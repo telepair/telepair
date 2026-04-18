@@ -72,6 +72,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `initPlayer` flow now checks an abort latch after every `await`
   (metadata fetch, data download, microtask yield) and bails
   before initialising xterm if the component has been cleaned up.
+- `recordings.expires_at` and `recording_shares.expires_at` are now
+  normalised to UTC (`+00:00`) before storage. The cleaner and the
+  share-consume SQL both compare these columns lexicographically
+  against `now_rfc3339()` (which always ends in `+00:00`), so a
+  caller submitting `…+14:00` or `…-12:00` offsets used to land in
+  the DB with a lex-incompatible offset — lex-greater values
+  lingered past their declared wall-clock expiry (share stays
+  redeemable indefinitely), lex-smaller ones got purged hours
+  early. Both `RecordingService::create_share` and
+  `RecordingService::set_expiry` now parse, shift to UTC, and
+  re-emit the RFC3339 string before it reaches storage. Existing
+  rows written under the old behaviour remain readable; only new
+  writes are affected.
 - Recording share tokens no longer travel in URL query strings.
   `GET /api/recordings/:id/data` now reads the raw token from the
   `X-Share-Token` request header (`?token=…` is no longer
