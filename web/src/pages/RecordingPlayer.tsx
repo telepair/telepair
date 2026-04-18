@@ -39,12 +39,19 @@ export default function RecordingPlayer() {
   let playerContainer: HTMLDivElement | undefined;
   let term: XTerm | undefined;
   let engine: PlaybackEngine | undefined;
+  // Abort latch: initPlayer has multiple `await` points (metadata
+  // fetch, data download, microtask yield). If the component
+  // unmounts mid-flight we must not touch DOM / xterm / signals
+  // afterward, and we must dispose any engine/term that was built
+  // before the abort.
+  let destroyed = false;
 
   onMount(async () => {
     await initPlayer();
   });
 
   onCleanup(() => {
+    destroyed = true;
     engine?.dispose();
     term?.dispose();
   });
@@ -59,6 +66,7 @@ export default function RecordingPlayer() {
       let rec: Recording | null = null;
       if (!shareToken()) {
         rec = await api.getRecording(params.id);
+        if (destroyed) return;
         setRecording(rec);
       }
 
@@ -71,14 +79,18 @@ export default function RecordingPlayer() {
       if (token) {
         const dataUrl = api.getRecordingDataUrl(params.id, token);
         const resp = await fetch(dataUrl);
+        if (destroyed) return;
         if (!resp.ok) {
           throw new Error(`Failed to fetch recording data: ${resp.status} ${resp.statusText}`);
         }
         castContent = await resp.text();
+        if (destroyed) return;
       } else {
         const path = `/recordings/${params.id}/data`;
         const { blob } = await api.downloadBlob(path);
+        if (destroyed) return;
         castContent = await blob.text();
+        if (destroyed) return;
       }
 
       // ── Parse the cast first ─────────────────────────────────────────────
@@ -104,6 +116,7 @@ export default function RecordingPlayer() {
       // xterm tries to mount.
       setLoading(false);
       await Promise.resolve();
+      if (destroyed) return;
 
       // ── Initialise xterm ────────────────────────────────────────────────
       if (!terminalContainer) throw new Error('Terminal container missing');
