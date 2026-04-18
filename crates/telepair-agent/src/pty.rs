@@ -7,7 +7,10 @@ use tokio::task;
 
 pub struct PtyManager {
     master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    /// Wrapped in `Option` so `Drop` can take ownership and hand the
+    /// child off to a blocking thread for reaping without leaving the
+    /// PTY worker stalled (see the `Drop` impl for the rationale).
+    child: Option<Box<dyn Child + Send + Sync>>,
     output_rx: mpsc::Receiver<Bytes>,
     input_tx: mpsc::Sender<Bytes>,
 }
@@ -109,7 +112,7 @@ impl PtyManager {
 
         Ok(Self {
             master: pair.master,
-            child,
+            child: Some(child),
             output_rx,
             input_tx,
         })
@@ -143,7 +146,39 @@ impl Drop for PtyManager {
         // Reap the child when the manager is dropped. Keeping this in
         // Drop (and only in Drop) means callers can't "shutdown then
         // keep using" a half-dead manager.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        //
+        // Drop is synchronous, but we must not block the caller
+        // (typically a Tokio worker thread during session teardown)
+        // on `child.wait()` — that's a blocking syscall that on some
+        // platforms (Windows, macOS under load) can stall for many
+        // milliseconds per session, and under a burst of teardowns
+        // would starve the async pool.
+        //
+        // `kill()` is treated as non-blocking (SIGKILL on Unix, raw
+        // TerminateProcess on Windows) so we run it inline. The
+        // `wait()` call is handed off to a blocking-pool thread via
+        // `spawn_blocking` when a Tokio runtime is available. The
+        // `JoinHandle` is deliberately dropped — we do not need the
+        // exit status and the reaper thread survives until the child
+        // is reaped regardless.
+        //
+        // Fallback: if no Tokio runtime is available (CLI, tests
+        // running without `#[tokio::test]`), we wait inline —
+        // synchronous blocking is acceptable when we're not sitting
+        // on a Tokio worker in the first place.
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = child.kill();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(_) => {
+                let _ = child.wait();
+            }
+        }
     }
 }

@@ -129,6 +129,48 @@ async fn env_vars_are_passed_to_child() {
     assert!(output.contains("TELEPAIR_TEST_MARKER=present"));
 }
 
+/// Regression for P0-3: `impl Drop for PtyManager` used to call
+/// `child.wait()` inline, blocking whatever thread the drop ran on.
+/// Under Tokio that was a worker thread, and a burst of session
+/// teardowns could starve the async pool. The fix offloads `wait()`
+/// to the blocking pool when a Tokio runtime is available, falling
+/// back to synchronous wait only when there is no runtime in scope.
+///
+/// This test verifies two invariants the fix guarantees:
+///
+/// 1. Dropping a `PtyManager` inside a Tokio runtime does not panic
+///    — a regression that replaced `try_current()` with an
+///    unconditional `spawn_blocking` would still work here, but a
+///    broken offload that touched a dropped runtime handle would
+///    surface as a panic on the test thread.
+/// 2. Drop returns within a generous budget even when the child is
+///    long-running. Pre-fix this was bounded by `waitpid()` latency
+///    (typically sub-100 ms on Unix but platform-dependent); the
+///    fix makes it unconditionally sub-millisecond in the hot path.
+///
+/// The time budget is intentionally loose (500 ms) so the test is
+/// not flaky on slow CI; its purpose is to catch "drop hangs" not
+/// to microbenchmark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_does_not_stall_tokio_worker() {
+    // `sleep 30` would outlive the test without an explicit kill,
+    // so the drop path is the only thing that reaps it.
+    let pty =
+        PtyManager::spawn_command("sleep", &["30"], 80, 24, &HashMap::new()).unwrap();
+
+    let start = std::time::Instant::now();
+    drop(pty);
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "Drop(PtyManager) took {elapsed:?}; expected it to return \
+         promptly by offloading child.wait() to spawn_blocking. \
+         A large delay suggests the Drop impl regressed to inline \
+         blocking wait, which would stall Tokio workers under load."
+    );
+}
+
 #[tokio::test]
 async fn server_secrets_not_leaked_to_child() {
     unsafe { std::env::set_var("TELEPAIR_SECRET_PROBE", "leaked") };
