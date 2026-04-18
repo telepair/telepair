@@ -80,18 +80,6 @@ Send a chat message. All roles can chat.
 }
 ```
 
-#### CursorMove
-
-Report cursor position (for collaborative cursors).
-
-```json
-{
-  "type": "CursorMove",
-  "x": 42,
-  "y": 10
-}
-```
-
 ### Server to Client
 
 #### SessionState
@@ -174,19 +162,6 @@ Broadcast chat message with server-assigned timestamp.
 }
 ```
 
-#### PeerCursor
-
-Forwarded cursor position from another participant.
-
-```json
-{
-  "type": "PeerCursor",
-  "user_id": "...",
-  "x": 42,
-  "y": 10
-}
-```
-
 #### PeerRoleChanged
 
 Broadcast when the session owner changes a participant's role via
@@ -264,6 +239,5 @@ The server enforces permissions on every action:
 | Terminal input (binary) | Yes | Yes | Rejected |
 | TermResize | Yes | Yes | Rejected |
 | ChatMessage | Yes | Yes | Yes |
-| CursorMove | Yes | Yes | Yes |
 
 Rejected actions are **silently dropped** — the server does not send an `Error` message or close the connection. The client receives no feedback when a permission check fails. In serialized input mode, only the session owner can send terminal input; other operators' input is also silently dropped.

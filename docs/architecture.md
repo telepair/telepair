@@ -144,7 +144,7 @@ Each live session has two independent broadcast channels:
 | Channel | Capacity | Content |
 |---------|----------|---------|
 | `output_tx` | 256 messages | PTY bytes (forwarded as raw binary WS frames) |
-| `collab_tx` | 64 messages | `PeerJoined`, `PeerLeft`, `PeerChat`, `PeerCursor`, `PeerRoleChanged` |
+| `collab_tx` | 64 messages | `PeerJoined`, `PeerLeft`, `PeerChat`, `PeerRoleChanged` |
 
 Separation ensures high-frequency terminal output does not starve collaboration messages. Both use `tokio::broadcast` — slow receivers lose oldest messages.
 

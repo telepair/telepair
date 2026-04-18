@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
 
 use axum::{
     extract::{
@@ -33,11 +32,6 @@ const MAX_WS_FRAME_BYTES: usize = 256 * 1024;
 /// dropped server-side with a warn log. Prevents a client from broadcasting
 /// multi-MB strings and fanning out to every participant.
 const MAX_CHAT_BYTES: usize = 4 * 1024;
-
-/// Minimum interval between `CursorMove` broadcasts from a single connection.
-/// ~30 Hz is smooth enough for collaborative cursors and throttles flood
-/// attempts against the collab broadcast channel.
-const CURSOR_MIN_INTERVAL: Duration = Duration::from_millis(33);
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -708,10 +702,6 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
     // one fresh notice).
     let mut denial_notice_sent = false;
 
-    // Track the last accepted CursorMove timestamp per connection so we can
-    // drop floods without spinning up a timer task.
-    let mut last_cursor_at: Option<Instant> = None;
-
     loop {
         tokio::select! {
             msg = ws_rx.next() => {
@@ -749,17 +739,6 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                                             ts: Utc::now().to_rfc3339(),
                                         };
                                         hub.record_chat(&session_id, entry).await;
-                                    }
-                                }
-                                ClientMessage::CursorMove { x, y } => {
-                                    let now = Instant::now();
-                                    let ok = last_cursor_at
-                                        .map(|prev| now.duration_since(prev) >= CURSOR_MIN_INTERVAL)
-                                        .unwrap_or(true);
-                                    if ok {
-                                        last_cursor_at = Some(now);
-                                        let cursor_msg = ServerMessage::PeerCursor { user_id, x, y };
-                                        hub.broadcast_collab(&session_id, cursor_msg).await;
                                     }
                                 }
                                 ClientMessage::SessionJoin { .. } => {

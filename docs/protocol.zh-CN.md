@@ -78,18 +78,6 @@ Client                              Server
 }
 ```
 
-#### CursorMove
-
-上报光标位置(用于协作光标)。
-
-```json
-{
-  "type": "CursorMove",
-  "x": 42,
-  "y": 10
-}
-```
-
 ### 服务器到客户端
 
 #### SessionState
@@ -172,19 +160,6 @@ Client                              Server
 }
 ```
 
-#### PeerCursor
-
-转发其他参与者上报的光标位置。
-
-```json
-{
-  "type": "PeerCursor",
-  "user_id": "...",
-  "x": 42,
-  "y": 10
-}
-```
-
 #### PeerRoleChanged
 
 当会话 owner 通过 `PUT /api/sessions/:id/participants/:user_id/role` 改变
@@ -257,6 +232,5 @@ PTY 输出 `$ `(2 字节)示例:
 | 终端输入(二进制) | Yes | Yes | Rejected |
 | TermResize | Yes | Yes | Rejected |
 | ChatMessage | Yes | Yes | Yes |
-| CursorMove | Yes | Yes | Yes |
 
 被拒绝的动作**静默丢弃** —— 服务器不会回 `Error` 消息,也不会关连接。权限校验失败时客户端不会收到任何反馈。在 serialized 输入模式下,只有会话 owner 能发送终端输入;其他 operator 的输入也会被静默丢弃。
