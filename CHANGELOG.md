@@ -82,6 +82,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against a guest token for a microtask. Storage writes and
   `tokenChange` listener dispatch remain outside `batch()` because
   they're not reactive signals.
+- `SqliteStorage::ensure_column` now validates its `table`, `column`,
+  and `sql_type` arguments before splicing them into raw DDL. All
+  existing callers pass `&'static str` literals, but the function
+  signature does not enforce that, and a future plugin / config-
+  driven path that fed runtime-constructed strings through the same
+  helper would have silently opened an SQL-injection surface in an
+  `ALTER TABLE` context (identifiers and type clauses can't be bound
+  as parameters). Table and column names are now checked against a
+  strict `^[A-Za-z_][A-Za-z0-9_]*$` whitelist, and `sql_type` is
+  restricted to the char classes real call-sites use plus single-
+  quoted literals — `;`, `--`, `/*`, newlines inside literals, and
+  unbalanced quotes all panic before `format!` runs. Eleven unit
+  tests pin the accept / reject matrix so regressions are loud.
 - `InviteDialog` now exposes proper modal semantics to assistive
   tech and supports keyboard dismissal. The root container picks up
   `role="dialog"`, `aria-modal="true"`, and `aria-labelledby` tied
