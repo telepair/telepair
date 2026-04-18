@@ -542,8 +542,30 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(session = %session_id_for_output, "output receiver lagged, dropped {n} messages");
-                            continue;
+                            // VT state is a running decode of the ENTIRE
+                            // output stream — missing a chunk mid-escape
+                            // leaves the client's xterm permanently
+                            // out of sync (stray CSI sequences apply to
+                            // the wrong region, SGR colours bleed, etc).
+                            // Simply `continue`-ing here used to leak
+                            // that desync forever. Instead we close with
+                            // `CLOSE_CODE_TRANSIENT`: the client's
+                            // `ws.ts` treats this as a retryable signal
+                            // and reconnects, and `SessionHub::attach`
+                            // replays scrollback into the fresh session
+                            // state so the terminal re-synchronises.
+                            tracing::warn!(
+                                session = %session_id_for_output,
+                                dropped = n,
+                                "output receiver lagged; closing with CLOSE_CODE_TRANSIENT so the client reconnects and replays scrollback",
+                            );
+                            let _ = ws_tx
+                                .send(Message::Close(Some(CloseFrame {
+                                    code: telepair_core::protocol::CLOSE_CODE_TRANSIENT,
+                                    reason: "output lagged".into(),
+                                })))
+                                .await;
+                            break;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
@@ -620,8 +642,31 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(session = %session_id_for_output, "collab receiver lagged, dropped {n} messages");
-                            continue;
+                            // Missed collab messages include
+                            // `PeerJoined` / `PeerLeft` /
+                            // `PeerRoleChanged` / `RecordingStarted` /
+                            // `PeerEvicted`. Skipping them silently
+                            // leaves the UI out of sync with the hub
+                            // (stale presence list, missed eviction,
+                            // "recording" badge never appears…). The
+                            // main loop's `role_rx` arm resubscribed
+                            // from the same channel and will cover role
+                            // drift on its own, but presence / recording
+                            // state can only be rebuilt from a fresh
+                            // `SessionState` snapshot — which is exactly
+                            // what a transient reconnect gets us.
+                            tracing::warn!(
+                                session = %session_id_for_output,
+                                dropped = n,
+                                "collab receiver lagged; closing with CLOSE_CODE_TRANSIENT so the client reconnects and resubscribes from a fresh snapshot",
+                            );
+                            let _ = ws_tx
+                                .send(Message::Close(Some(CloseFrame {
+                                    code: telepair_core::protocol::CLOSE_CODE_TRANSIENT,
+                                    reason: "collab lagged".into(),
+                                })))
+                                .await;
+                            break;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }

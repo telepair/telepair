@@ -72,6 +72,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `initPlayer` flow now checks an abort latch after every `await`
   (metadata fetch, data download, microtask yield) and bails
   before initialising xterm if the component has been cleaned up.
+- WebSocket forwarder now closes with `CLOSE_CODE_TRANSIENT` (4503)
+  when the output or collab broadcast receivers drop messages (the
+  `tokio::sync::broadcast::error::RecvError::Lagged` arm).
+  Previously the forwarder just `warn!`ed and continued, which
+  permanently desynced the client's VT state machine (missing a
+  chunk of the output stream mid-escape makes every subsequent
+  SGR/CSI sequence apply to the wrong region) and left presence /
+  recording badges out of date. The new behaviour drives the
+  client's existing transient-reconnect path, and the hub's
+  scrollback + `SessionState` snapshot replay brings the terminal
+  and collab UI back in sync on the new connection.
 - `POST /api/sessions/{id}/recording/start` now logs `fail_recording`
   rollback failures at ERROR level instead of silently swallowing
   them. Previously a DB error on the rollback path left the
