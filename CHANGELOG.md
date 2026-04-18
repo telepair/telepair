@@ -72,6 +72,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `initPlayer` flow now checks an abort latch after every `await`
   (metadata fetch, data download, microtask yield) and bails
   before initialising xterm if the component has been cleaned up.
+- `auth.setToken` now wraps its reactive signal writes
+  (`setCurrentUser`, `setIdentityChecked`, `setTokenSignal`,
+  `setErrorKey`) in a single `batch()` so downstream observers see
+  one atomic transition instead of an intermediate frame where the
+  token signal has flipped but `currentUser` still points at the
+  previous identity. During an admin → guest invite swap in the
+  same tab that brief mismatch let `AdminGuard` render admin UI
+  against a guest token for a microtask. Storage writes and
+  `tokenChange` listener dispatch remain outside `batch()` because
+  they're not reactive signals.
 - `Terminal.tsx` font-load callback now bails out cleanly if the
   component has already been unmounted. The
   `document.fonts.load(...).then(...)` promise resolves on a later

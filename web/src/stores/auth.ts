@@ -1,5 +1,5 @@
 // web/src/stores/auth.ts
-import { createSignal } from 'solid-js';
+import { batch, createSignal } from 'solid-js';
 import { api, ApiError } from '../lib/api';
 
 export const STORAGE_KEY = 'telepair_token';
@@ -181,23 +181,23 @@ export interface SetTokenOptions {
 
 function setToken(value: string, options: SetTokenOptions = {}) {
   const previous = token();
+  // Storage writes sit OUTSIDE `batch()`: they're synchronous side
+  // effects on the underlying Storage object, not reactive signals,
+  // and wrapping them would add nothing. Every reactive `set*`
+  // below, however, MUST land in the same batch so dependent
+  // memos / effects see a single coherent transition instead of
+  // the intermediate state "token already swapped but identity
+  // still points at the previous user". That intermediate state
+  // is the one that used to let `AdminGuard` flash the previous
+  // user's gear icon during an invite-swap: the token signal
+  // fired first, a memo read it as the new (guest) token while
+  // `currentUser` was still the admin row, and the guard
+  // rendered admin UI for a tick before `setCurrentUser(null)`
+  // invalidated it.
   if (value) {
     safeSet(sessionStore(), STORAGE_KEY, value);
     if (options.persist) {
       safeSet(localStore(), STORAGE_KEY, value);
-    }
-    // Identity is bound to the credential — a token swap (admin
-    // logged in, then same tab walks a /join/:token invite link and
-    // picks up a guest token) must invalidate the cached whoami, or
-    // AdminGuard / dashboard owner gate / Session back-button all
-    // keep running against the previous user's id and flags. Only
-    // invalidate when the token actually changes so back-to-back
-    // writes of the same value (persist upgrade, retry) don't churn
-    // an in-flight whoami.
-    if (value !== previous) {
-      setCurrentUser(null);
-      setIdentityChecked(false);
-      identityInFlight = null;
     }
   } else {
     // Logout: clear both tiers. A shared-admin-then-logout flow should
@@ -205,20 +205,43 @@ function setToken(value: string, options: SetTokenOptions = {}) {
     // from localStorage.
     safeRemove(sessionStore(), STORAGE_KEY);
     safeRemove(localStore(), STORAGE_KEY);
-    // Identity is bound to the credential — when the credential goes
-    // away, the cached user must too. Otherwise the next login (e.g.
-    // admin → guest invite → admin) would observe a stale id from
-    // the previous session and mis-gate the dashboard's owner check,
-    // or leak the admin gear icon to a subsequent guest session.
-    setCurrentUser(null);
-    setIdentityChecked(false);
-    identityInFlight = null;
   }
-  setTokenSignal(value);
-  setErrorKey(null);
+
+  batch(() => {
+    if (value) {
+      // Identity is bound to the credential — a token swap (admin
+      // logged in, then same tab walks a /join/:token invite link
+      // and picks up a guest token) must invalidate the cached
+      // whoami, or AdminGuard / dashboard owner gate / Session
+      // back-button all keep running against the previous user's
+      // id and flags. Only invalidate when the token actually
+      // changes so back-to-back writes of the same value (persist
+      // upgrade, retry) don't churn an in-flight whoami.
+      if (value !== previous) {
+        setCurrentUser(null);
+        setIdentityChecked(false);
+        identityInFlight = null;
+      }
+    } else {
+      // Identity is bound to the credential — when the credential
+      // goes away, the cached user must too. Otherwise the next
+      // login (e.g. admin → guest invite → admin) would observe a
+      // stale id from the previous session and mis-gate the
+      // dashboard's owner check, or leak the admin gear icon to a
+      // subsequent guest session.
+      setCurrentUser(null);
+      setIdentityChecked(false);
+      identityInFlight = null;
+    }
+    setTokenSignal(value);
+    setErrorKey(null);
+  });
+
   // Fire change notifications last, so listeners that read `auth.token()`
   // or call back into this module see fully-settled state. One listener's
-  // throw must not starve the others.
+  // throw must not starve the others. Deliberately outside `batch()`:
+  // listeners may call back into this module (triggering their own
+  // batched writes) and shouldn't inherit the outer batch scope.
   if (value !== previous) {
     for (const cb of tokenChangeListeners) {
       try {
