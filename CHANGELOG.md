@@ -28,6 +28,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sessions — a UI double-click now returns 204 instead of a
   misleading 404. Concurrent close races (reaper beating the
   owner, two admin tabs) are also absorbed as success.
+- Two concurrent `POST /api/sessions/:id/recording/start` no longer
+  race past the active-recording check and leave an orphan `.cast`
+  file alongside a `failed` recording row. Migration 003 adds a
+  partial unique index on `(session_id) WHERE status = 'recording'`
+  (sweeping any pre-existing orphans to `failed` first, idempotent
+  on fresh DBs), and the storage layer maps the resulting
+  `SQLITE_CONSTRAINT_UNIQUE` back to `409 Conflict`. Drop-in
+  upgrade from 0.1.8.
+- Recording playback now honors the asciicast header's recorded
+  `width` / `height` instead of fitting to the container size. The
+  player previously built xterm at 80×24 and then called `fit()`,
+  so anonymous share-link viewers (who can't reach the metadata
+  endpoint) saw cursor-positioning escapes land in the wrong
+  column. `FitAddon` has been dropped from the playback page; live
+  sessions still fit normally.
+- Seeking in recording playback no longer empties the collab
+  sidebar. `PlaybackEngine.seek()` previously replayed only output
+  (`o`) and resize (`r`) events while walking from t=0, so the
+  participant + chat panel silently went blank after any seek. It
+  now dispatches every event type (`j` / `l` / `c` / `o` / `r` /
+  …) up to the target, and pins `currentTime` to the requested
+  target rather than the last replayed event's timestamp.
+- `POST /api/recordings/:id/shares` now rejects `max_uses < 0` and
+  non-RFC3339 or already-past `expires_at` at the API boundary
+  with `400 Bad Request` and an actionable message. Previously
+  both sailed through and produced unredeemable share links at
+  consume time — negative `max_uses` is always-exhausted in the
+  consume SQL, and a lexicographic `expires_at > now()` compare on
+  non-RFC3339 input is nonsensical.
+- `SessionHub::record_chat` now releases the `chat_history` mutex
+  before acquiring `recording_tx`, so the two collab locks are
+  never held nested. No existing path locks them in the reverse
+  order today, but removing the overlap forecloses a deadlock the
+  next refactor would otherwise walk into.
+- WebSocket reconnect no longer double-fires `onclose` against the
+  new socket. `WSClient.doConnect` now detaches the prior socket's
+  handlers before overwriting `this.ws`, so a user-initiated
+  "Reconnect" while the previous socket is still in `CLOSING`
+  cannot schedule a ghost retry that races the fresh attempt.
+- Unmounting the recording player mid-load no longer touches a
+  disposed xterm or writes into unmounted Solid signals. The
+  `initPlayer` flow now checks an abort latch after every `await`
+  (metadata fetch, data download, microtask yield) and bails
+  before initialising xterm if the component has been cleaned up.
+
+### Changed
+
+- Bumped `tokio-tungstenite` from 0.26 to 0.29 (dev-dependency,
+  test WebSocket client only — no runtime impact). Picks up
+  upstream `rustls` / `http` dep refreshes and lines the test
+  client up with recent advisory fixes without changing the API
+  surface our tests consume.
+- Route components are now code-split via `lazy()`. Login and
+  Register stay eager (first-paint path for unauthenticated
+  users); every authenticated page ships as its own chunk. The
+  Vite entry bundle drops from **754 kB / 195 kB gzip** to
+  **29 kB / 8 kB gzip**, and xterm.js (340 kB / 86 kB gzip) no
+  longer loads until a user opens a session or recording. This
+  also clears the 500 kB single-chunk warning the build emitted
+  on every CI run.
 
 ## [0.1.8] - 2026-04-17
 
