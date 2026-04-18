@@ -100,6 +100,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against a guest token for a microtask. Storage writes and
   `tokenChange` listener dispatch remain outside `batch()` because
   they're not reactive signals.
+- `PlaybackEngine` no longer pre-registers a `setTimeout` for every
+  remaining event when `play()` is called. The previous design
+  walked the full `events` array at play time and pushed one timer
+  per event into an internal array, which pinned O(N) memory in the
+  JS timer queue (a 1-hour cast can easily hit 60k+ events) and
+  made `pause()` / `seek()` / `setSpeed()` each walk the full array
+  to `clearTimeout`. The refactor replaces the array with a single
+  pumping timer: on each fire the callback dispatches the current
+  event, advances `nextIndex`, and re-schedules itself for the
+  next. Cancel paths now clear exactly one handle. Two vitest
+  regressions (`vi.getTimerCount()` + a seek-from-playing path)
+  pin the invariant so a future edit that reverts to pre-
+  registering every event will fail loudly.
 - `SqliteStorage::ensure_column` now validates its `table`, `column`,
   and `sql_type` arguments before splicing them into raw DDL. All
   existing callers pass `&'static str` literals, but the function

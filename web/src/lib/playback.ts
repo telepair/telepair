@@ -11,11 +11,20 @@
  *               "l" — participant leave (JSON string)
  *               "c" — chat message      (JSON string)
  *
- * Playback is timer-driven: each event is scheduled with a
- * `setTimeout` whose delay is `(event.time - currentTime) / speed * 1000`.
- * Seeking replays all output events from the beginning (a terminal is a
- * stateful display device — you cannot jump into the middle without
- * replaying prior state).
+ * Playback is timer-driven by a single pumping `setTimeout` chain:
+ * at any moment at most one timer is pending, and when it fires it
+ * dispatches the current event and re-schedules itself for the next
+ * one. This keeps memory and pause/seek costs O(1) regardless of
+ * cast length — a 1-hour recording with ~60k events used to pre-
+ * register 60k `setTimeout` handles inside `play()` and walk the
+ * full array on every `pause()` / `seek()` / `setSpeed()`, which
+ * both pinned a lot of timer-queue memory and made future
+ * scrubbing features impractical. The per-event delay formula
+ * `(event.time - elapsedTime()) / speed * 1000` is unchanged.
+ *
+ * Seeking still replays all events from the beginning (a terminal
+ * is a stateful display device — you cannot jump into the middle
+ * without replaying prior state) and is fully synchronous.
  */
 
 export interface CastHeader {
@@ -74,8 +83,15 @@ export class PlaybackEngine {
   private playStartWall = 0;
   /** Engine time (seconds) at which the current play segment started. */
   private playStartTime = 0;
-  /** Currently pending timer handles. */
-  private timers: ReturnType<typeof setTimeout>[] = [];
+  /**
+   * Single pending timer driving the event pump. `null` whenever the
+   * engine is not actively waiting for the next event (paused,
+   * seeking, ended, disposed). Keeping exactly one live handle —
+   * instead of the pre-registered array the old implementation used
+   * — keeps both the timer queue and every cancel path O(1) even
+   * for hour-long casts.
+   */
+  private pumpTimer: ReturnType<typeof setTimeout> | null = null;
   /** Timer for the `onTimeUpdate` ticker (100 ms interval). */
   private tickTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -123,17 +139,17 @@ export class PlaybackEngine {
     this.playStartWall = Date.now();
     this.playStartTime = this.currentTime;
 
-    this.scheduleRemaining();
+    this.scheduleNext();
     this.startTicker();
   }
 
   /** Pause playback. Current position is preserved for resuming. */
   pause(): void {
     if (this.state !== 'playing') return;
-    // Capture how far we have advanced before clearing timers.
+    // Capture how far we have advanced before clearing the pump.
     this.currentTime = this.elapsedTime();
     this.state = 'paused';
-    this.clearTimers();
+    this.clearPump();
     this.stopTicker();
   }
 
@@ -157,7 +173,7 @@ export class PlaybackEngine {
    */
   seek(timeSeconds: number): void {
     const wasPlaying = this.state === 'playing';
-    this.clearTimers();
+    this.clearPump();
     this.stopTicker();
 
     const target = Math.max(0, Math.min(timeSeconds, this.duration));
@@ -189,21 +205,21 @@ export class PlaybackEngine {
     if (this.state === 'playing') {
       // Snapshot current position before changing speed.
       this.currentTime = this.elapsedTime();
-      this.clearTimers();
+      this.clearPump();
       this.stopTicker();
     }
     this.speed = multiplier;
     if (this.state === 'playing') {
       this.playStartWall = Date.now();
       this.playStartTime = this.currentTime;
-      this.scheduleRemaining();
+      this.scheduleNext();
       this.startTicker();
     }
   }
 
   /** Release all timers. Safe to call multiple times. */
   dispose(): void {
-    this.clearTimers();
+    this.clearPump();
     this.stopTicker();
     this.state = 'idle';
   }
@@ -217,38 +233,55 @@ export class PlaybackEngine {
   }
 
   /**
-   * Schedule all events from `nextIndex` onward relative to the play
-   * segment start. Already-elapsed events (delay ≤ 0) are fired
-   * immediately via a zero-delay timeout so the call stack stays clean.
+   * Schedule the single next event in the pump. Called on every
+   * transition that resumes playback (`play`, `setSpeed` while
+   * playing) and re-called from the timer callback itself after
+   * each dispatch, so only one `setTimeout` is pending at any time.
+   *
+   * Delay is derived from the engine-time distance to the next
+   * event, translated through the current speed multiplier. An
+   * already-elapsed event (non-positive delta, e.g. clock drift or
+   * a long synchronous task eating into the schedule) is still
+   * queued with `delayMs = 0` rather than dispatched inline so we
+   * never starve the event loop with a tight dispatch burst.
    */
-  private scheduleRemaining(): void {
-    for (let i = this.nextIndex; i < this.events.length; i++) {
-      const event = this.events[i];
-      const delayMs = Math.max(
-        0,
-        ((event.time - this.playStartTime) / this.speed) * 1000
-          - (Date.now() - this.playStartWall),
-      );
-      const handle = setTimeout(() => {
-        if (this.state !== 'playing') return;
-        this.currentTime = event.time;
-        this.dispatch(event);
-
-        // Check if this was the last event.
-        if (i === this.events.length - 1) {
-          this.state = 'ended';
-          this.stopTicker();
-          this.onComplete?.();
-        }
-      }, delayMs);
-      this.timers.push(handle);
+  private scheduleNext(): void {
+    if (this.nextIndex >= this.events.length) {
+      // No more events — mark ended immediately so play() callers
+      // that load an already-drained engine still observe onComplete.
+      this.state = 'ended';
+      this.stopTicker();
+      this.onComplete?.();
+      return;
     }
-    this.nextIndex = this.events.length;
+    const event = this.events[this.nextIndex];
+    const delayMs = Math.max(0, ((event.time - this.elapsedTime()) / this.speed) * 1000);
+    this.pumpTimer = setTimeout(() => {
+      this.pumpTimer = null;
+      // State may have flipped between scheduling and firing (e.g.
+      // pause() or dispose()). Bail out cleanly.
+      if (this.state !== 'playing') return;
+      this.currentTime = event.time;
+      this.nextIndex++;
+      this.dispatch(event);
+
+      if (this.nextIndex >= this.events.length) {
+        this.state = 'ended';
+        this.stopTicker();
+        this.onComplete?.();
+        return;
+      }
+      // Recurse: queue the next event. Cheap because the queue
+      // depth is exactly 1 — no O(N) registration storm here.
+      this.scheduleNext();
+    }, delayMs);
   }
 
-  private clearTimers(): void {
-    for (const h of this.timers) clearTimeout(h);
-    this.timers = [];
+  private clearPump(): void {
+    if (this.pumpTimer !== null) {
+      clearTimeout(this.pumpTimer);
+      this.pumpTimer = null;
+    }
     this.nextIndex = this.findNextIndex();
   }
 
