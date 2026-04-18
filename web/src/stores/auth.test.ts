@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { createEffect, createRoot } from 'solid-js';
 
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
@@ -298,6 +299,58 @@ describe('auth.loadIdentity', () => {
     await auth.loadIdentity();
     expect(auth.currentUserId()).toBe('guest-1');
     expect(auth.currentUserIsGuest()).toBe(true);
+  });
+
+  // Batched-write regression: setToken mutates `token`, `currentUser`,
+  // `identityChecked`, and `errorKey`. Before these writes were
+  // wrapped in `batch()`, a subscriber reading `token()` and
+  // `currentUserIsAdmin()` together observed an intermediate frame
+  // where the token had already flipped to the guest value but
+  // `currentUser` still pointed at the previous admin — during an
+  // admin → guest invite swap that briefly let `AdminGuard` render
+  // admin UI against a guest token before the next microtask
+  // invalidated it. The contract after the fix: every reactive
+  // observer of these signals must see exactly ONE transition per
+  // `setToken` call, with token and identity settled to their post-
+  // swap values as an atomic unit.
+  it('updates token and identity atomically (single batched transition)', async () => {
+    // Prime admin identity so the cache has something to invalidate.
+    auth.setToken('admin-token', { persist: true });
+    mockFetch.mockResolvedValueOnce(
+      jsonResponse({ user_id: 'root', name: 'admin', is_admin: true, is_guest: false }),
+    );
+    await auth.loadIdentity();
+    expect(auth.currentUserIsAdmin()).toBe(true);
+
+    // Run observers inside a root so we can dispose them cleanly
+    // after the assertion — stray effects across tests would pollute
+    // the next run's reactive graph.
+    const observations: Array<{ token: string; isAdmin: boolean | null }> = [];
+    const dispose = createRoot((disposeFn) => {
+      createEffect(() => {
+        observations.push({
+          token: auth.token(),
+          isAdmin: auth.currentUserIsAdmin(),
+        });
+      });
+      return disposeFn;
+    });
+
+    // Initial synchronous run of the effect captures the primed
+    // state. Everything AFTER this point is the transition under
+    // test.
+    expect(observations).toEqual([{ token: 'admin-token', isAdmin: true }]);
+    observations.length = 0;
+
+    // The invite-swap: new token, identity must flip to null in the
+    // same frame. With `batch()`, Solid coalesces the writes and the
+    // effect re-runs exactly once. Without it, there would be two
+    // runs — the first observing the stale `{ token: guest, isAdmin: true }`
+    // intermediate state that `AdminGuard` used to race.
+    auth.setToken('guest-token');
+    expect(observations).toEqual([{ token: 'guest-token', isAdmin: null }]);
+
+    dispose();
   });
 
   // Idempotence: writing the SAME token twice (e.g. a persist-tier
