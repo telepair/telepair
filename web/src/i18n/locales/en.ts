@@ -80,6 +80,12 @@ export const en = {
     back: 'Back',
     already_have_account: 'Already have an account?',
     login_link: 'Sign in',
+    smtp_fallback_title: 'No email service configured',
+    smtp_fallback_body:
+      'The server was started without SMTP, so the email verification flow is unavailable. If you administer this instance, you can provision the account from the CLI without email:',
+    smtp_fallback_cli: 'telepair admin users create --email {{ email }} --display-name "{{ name }}"',
+    smtp_fallback_cli_tip:
+      'Run the command on the server host. The new user starts in the pending-approval state; approve them from the admin users page.',
   },
   change_password: {
     title: 'Change Password',

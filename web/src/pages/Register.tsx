@@ -135,6 +135,32 @@ export default function Register() {
             </button>
           </form>
 
+          {/*
+            SMTP-fallback help panel. When the server answers 503 on
+            `/api/auth/register` the UI previously showed only the
+            terse `error_smtp_unavailable` line, which stranded
+            self-hosted operators whose single-node install has no
+            mail config. Surfacing the CLI bypass inline (with the
+            operator's email/name pre-filled) gives them an
+            actionable next step without forcing them to dig through
+            `--help`. Fix for QA v0.1.9 C1/Q3.
+          */}
+          <Show when={auth.errorKey() === 'auth.error_smtp_unavailable'}>
+            <div class="smtp-fallback" data-testid="smtp-fallback-help">
+              <p class="smtp-fallback-title">{t('register.smtp_fallback_title')}</p>
+              <p class="smtp-fallback-body">{t('register.smtp_fallback_body')}</p>
+              <pre class="smtp-fallback-cli">
+                <code>
+                  {t('register.smtp_fallback_cli', {
+                    email: email() || 'you@example.com',
+                    name: name() || 'Your Name',
+                  })}
+                </code>
+              </pre>
+              <p class="smtp-fallback-tip">{t('register.smtp_fallback_cli_tip')}</p>
+            </div>
+          </Show>
+
           <p class="alt-link">
             {t('register.already_have_account')}{' '}
             <a href="/login">{t('register.login_link')}</a>
@@ -348,6 +374,45 @@ export default function Register() {
           width: 100%;
           padding: 10px;
           font-size: 15px;
+        }
+        .smtp-fallback {
+          margin-top: 16px;
+          padding: 14px 16px;
+          border: 1px solid var(--border);
+          border-radius: 8px;
+          background: var(--bg-tertiary, var(--bg-secondary));
+          text-align: left;
+        }
+        .smtp-fallback-title {
+          font-size: 13px;
+          font-weight: 600;
+          color: var(--text-primary);
+          margin-bottom: 6px;
+        }
+        .smtp-fallback-body {
+          font-size: 12px;
+          color: var(--text-secondary);
+          line-height: 1.5;
+          margin-bottom: 10px;
+        }
+        .smtp-fallback-cli {
+          display: block;
+          font-family: var(--font-mono);
+          font-size: 12px;
+          padding: 8px 10px;
+          background: var(--bg-primary);
+          border: 1px solid var(--border);
+          border-radius: 6px;
+          overflow-x: auto;
+          white-space: pre;
+          margin: 0 0 8px;
+          color: var(--text-primary);
+        }
+        .smtp-fallback-tip {
+          font-size: 11px;
+          color: var(--text-secondary);
+          line-height: 1.5;
+          margin: 0;
         }
       `}</style>
     </div>

@@ -71,6 +71,12 @@ export const zh: Dict = {
     back: '返回',
     already_have_account: '已有账号?',
     login_link: '登录',
+    smtp_fallback_title: '服务器未配置邮件服务',
+    smtp_fallback_body:
+      '当前实例启动时未配置 SMTP，因此无法通过邮箱验证码注册。如果你是此实例的管理员，可以直接在服务器上用下面的命令创建账号（无需邮件）：',
+    smtp_fallback_cli: 'telepair admin users create --email {{ email }} --display-name "{{ name }}"',
+    smtp_fallback_cli_tip:
+      '在服务器主机上执行。新用户默认处于待审批状态，请到管理员用户页面批准。',
   },
   change_password: {
     title: '修改密码',
