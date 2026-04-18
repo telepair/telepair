@@ -2244,7 +2244,39 @@ pub async fn start_recording(
             reason,
             "failed to attach recording to hub, rolling back"
         );
-        let _ = state.storage.fail_recording(&recording.id).await;
+        // `start_recording` consumed `recording_slot` by value, so by
+        // the time we hit this rollback block the `Sender` has been
+        // dropped and the writer task's `recv()` is about to return
+        // `None` — the writer will finalise the DB row on its own
+        // (either `complete_recording` with zero events or
+        // `mark_failed` if the header write itself failed). We still
+        // eagerly set the row to `failed` here so:
+        //
+        //   * the idx_recordings_one_active_per_session partial unique
+        //     index is released immediately rather than after the
+        //     writer's finalise await completes — letting the owner
+        //     retry without spuriously hitting a CONFLICT;
+        //   * the recording surface (list + details) never flashes a
+        //     bogus `completed` status for a row that never captured
+        //     a single event.
+        //
+        // If that DB write itself fails (disk full, pool exhausted,
+        // …) we MUST surface it loudly: the row stays in status
+        // `recording`, the partial unique index blocks every future
+        // start for this session, and the only recovery is operator
+        // intervention. Silently swallowing this with `let _ =` used
+        // to leave the session permanently unable to record, with
+        // zero log evidence of why.
+        if let Err(e) = state.storage.fail_recording(&recording.id).await {
+            tracing::error!(
+                session_id,
+                recording_id = %recording.id,
+                error = %e,
+                "start_recording rollback: fail_recording DB call failed; \
+                 recording row may be stuck in status=recording and block \
+                 future recordings for this session until operator cleanup",
+            );
+        }
         return Err(ApiError::with_message(
             StatusCode::CONFLICT,
             reason.to_string(),
