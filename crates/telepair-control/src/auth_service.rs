@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use argon2::password_hash::{SaltString, rand_core::OsRng};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
@@ -35,6 +35,25 @@ fn validate_password(password: &str) -> Result<()> {
 /// — the audit log carries the precise reason for the operator, the
 /// API does not.
 const GENERIC_AUTH_ERROR: &str = "invalid email or code";
+
+/// Throw-away Argon2 hash generated once per process from a constant
+/// placeholder password. Used by [`AuthService::burn_dummy_verify`] to
+/// equalise the wall-clock cost of the early-return branches in
+/// `login` (unknown email, user row without a password hash) with the
+/// wrong-password branch — closing the email-enumeration timing side
+/// channel the `GENERIC_AUTH_ERROR` shape would otherwise leak.
+///
+/// Regenerated on every process start so it can never collide with a
+/// real user's stored hash. The actual password hashed is irrelevant;
+/// we only care that `verify_password` against this hash costs the
+/// same as a real verify (both go through `Argon2::default()`).
+///
+/// `LazyLock` defers the ~50 ms hashing cost until the first login
+/// attempt rather than paying it on every process boot.
+static DUMMY_LOGIN_HASH: LazyLock<String> = LazyLock::new(|| {
+    hash_password("timing-shield-placeholder-do-not-use")
+        .expect("argon2 hash of a constant string cannot fail")
+});
 
 #[derive(Debug, Clone)]
 pub struct SmtpConfig {
@@ -273,6 +292,15 @@ impl AuthService {
         let user = match self.storage.get_user_by_email(email).await? {
             Some(u) => u,
             None => {
+                // Timing shield (Fix #P0-1 — email enumeration):
+                // Burn one Argon2 verify against a throw-away hash so
+                // the unknown-email branch takes the same wall-clock
+                // time as the wrong-password branch below. Without
+                // this, an unauthenticated attacker can enumerate
+                // registered addresses by measuring the ~50 ms delta
+                // an Argon2 verify introduces even though both paths
+                // return the same `GENERIC_AUTH_ERROR` string.
+                Self::burn_dummy_verify(password).await;
                 self.audit_login_failed(None, email, "unknown_email", None, None)
                     .await;
                 return Err(Error::Auth(GENERIC_AUTH_ERROR.into()));
@@ -280,6 +308,13 @@ impl AuthService {
         };
 
         if let Some(until) = self.storage.check_login_lockout(user.id).await? {
+            // Locked branch intentionally skips the Argon2 burn: a
+            // locked row has already produced five prior unlocked
+            // attempts that *did* hash, so the row's existence is not
+            // newly leaked here, and paying the Argon2 cost on every
+            // retry inside a lockout window would be a CPU-DoS gift
+            // to a credential-stuffing run. The audit trail below
+            // still captures the lockout hit.
             self.audit_login_failed(
                 Some((user.id, &user.name)),
                 email,
@@ -299,6 +334,15 @@ impl AuthService {
                 // integrity bug. Treat it as a bad-password attempt
                 // for throttle accounting so a hammering attacker
                 // still hits the lockout.
+                //
+                // Timing shield (Fix #P0-1 — email enumeration):
+                // Burn one Argon2 verify so the shape of this branch
+                // is wall-clock indistinguishable from the
+                // wrong-password branch below. Without it, an
+                // attacker observing the latency delta could single
+                // out admin/CLI accounts (which have no password hash)
+                // from regular users.
+                Self::burn_dummy_verify(password).await;
                 self.record_bad_password(&user.id, &user.name, email).await;
                 return Err(Error::Auth(GENERIC_AUTH_ERROR.into()));
             }
@@ -343,6 +387,23 @@ impl AuthService {
             remaining,
             until,
         )
+        .await;
+    }
+
+    /// Run one Argon2 verify against a throw-away hash so an early-
+    /// return branch in `login` takes the same wall-clock time as the
+    /// wrong-password branch. The return value is ignored — the verify
+    /// against `DUMMY_LOGIN_HASH` is expected to fail — we only care
+    /// about the CPU cost.
+    ///
+    /// See [`DUMMY_LOGIN_HASH`] for the rationale. Kept as a private
+    /// associated function so the call sites read as
+    /// `Self::burn_dummy_verify(password)` and the intent is obvious.
+    async fn burn_dummy_verify(password: &str) {
+        let password_owned = password.to_owned();
+        let _ = tokio::task::spawn_blocking(move || {
+            verify_password(&password_owned, &DUMMY_LOGIN_HASH)
+        })
         .await;
     }
 
@@ -845,6 +906,88 @@ mod tests {
         assert_eq!(row.detail["reason"], "unknown_email");
         assert_eq!(row.detail["email"], "ghost@x.com");
     }
+
+    /// Regression for the email-enumeration timing side channel
+    /// (P0-1). Pre-fix, `login("unknown@x", ...)` short-circuited
+    /// before touching Argon2 while `login("known@x", "wrong")`
+    /// spent ~50 ms hashing, so an unauthenticated attacker could
+    /// tell the two apart by latency alone. The fix burns one
+    /// Argon2 verify on the unknown-email branch; this test asserts
+    /// that the branch now spends real CPU and that its latency is
+    /// within a generous tolerance of the wrong-password branch.
+    ///
+    /// Tolerances are intentionally wide so this test stays
+    /// non-flaky on loaded CI runners — the point is to detect
+    /// "shield missing" (where `unknown_median` collapses back to
+    /// sub-millisecond), not to measure Argon2 down to the
+    /// microsecond.
+    #[tokio::test]
+    async fn login_unknown_email_burns_argon2_for_timing_parity() {
+        use std::time::{Duration as StdDuration, Instant};
+
+        let (svc, _) = seed_real_account("real@x.com", "real", "correct-horse").await;
+
+        // Warm up the DUMMY_LOGIN_HASH LazyLock and the SQLite
+        // statement cache so the first sample does not carry one-off
+        // initialisation cost.
+        let _ = svc.login("warmup-ghost@x.com", "anything").await;
+        let _ = svc.login("real@x.com", "warmup-wrong").await;
+
+        async fn median_ms(
+            svc: &AuthService,
+            email_prefix: Option<&str>,
+            fixed_email: Option<&str>,
+            password: &str,
+        ) -> StdDuration {
+            let mut samples = Vec::with_capacity(5);
+            for i in 0..5 {
+                let email = match (email_prefix, fixed_email) {
+                    (Some(p), _) => format!("{p}-{i}@x.com"),
+                    (_, Some(e)) => e.to_owned(),
+                    _ => unreachable!(),
+                };
+                let start = Instant::now();
+                let _ = svc.login(&email, password).await;
+                samples.push(start.elapsed());
+            }
+            samples.sort();
+            samples[2]
+        }
+
+        let unknown = median_ms(&svc, Some("ghost"), None, "anything").await;
+        let known = median_ms(&svc, None, Some("real@x.com"), "wrong-horse").await;
+
+        // Lower bound: Argon2::default() is never cheaper than 10 ms
+        // on any CI machine we've seen (debug or release). If this
+        // trips, the unknown-email branch is skipping the verify.
+        assert!(
+            unknown >= StdDuration::from_millis(10),
+            "unknown-email branch median was {unknown:?} — expected \
+             an Argon2 verify (≥ 10 ms). The timing shield regressed."
+        );
+
+        // Parity: the two branches should be within ~3x. We've seen
+        // ratios as skewed as 0.6 on a quiet M-series box and 1.8 on
+        // a loaded GitHub runner; 0.3–3.0 absorbs the full range
+        // while still catching the pre-fix ratio (~0.05).
+        let ratio = unknown.as_secs_f64() / known.as_secs_f64();
+        assert!(
+            (0.3..=3.0).contains(&ratio),
+            "unknown-email latency ({unknown:?}) and bad-password \
+             latency ({known:?}) should be within 3x — ratio was \
+             {ratio:.2}. A tiny ratio means the unknown-email branch \
+             regressed to returning without burning Argon2."
+        );
+    }
+
+    // The second early-return branch (user row exists but carries no
+    // password_hash — admin/CLI accounts) routes through the exact
+    // same `Self::burn_dummy_verify(password)` call as the unknown-
+    // email branch above, so the timing-parity test on that branch
+    // exercises the shared helper. A dedicated test here would
+    // require a storage primitive to seed a NULL password_hash row
+    // that the public API does not expose; we lean on code review +
+    // the unknown-email regression instead.
 
     #[tokio::test]
     async fn login_locked_path_does_not_verify_password() {
