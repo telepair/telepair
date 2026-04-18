@@ -305,19 +305,19 @@ List sessions visible to the caller. Regular users see sessions they own plus an
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `closed_reason` | string \| absent | One of `owner`, `reaper`, `startup`, `error`. Omitted for active rows and for legacy v0.1.0 closed rows created before the column existed. |
+| `closed_reason` | string \| absent | One of `owner`, `admin`, `reaper`, `startup`, `error`. Omitted for active rows and for legacy v0.1.0 closed rows created before the column existed. |
 
 ### DELETE /api/sessions/{session_id}
 
-Close a session. Only the session owner can close it. Stops the PTY process and marks the session as closed.
+Close a session. The session owner can close their own session; admins can force-close any session — useful after disabling the owner, so operators don't have to wait for the idle reaper. Stops the PTY process and marks the session as closed. Admin-initiated closes stamp `closed_reason = "admin"` so history rows don't misattribute the action to the owner (dashboard chip: "Closed by admin").
 
 **Response** `204 No Content`
 
-No response body.
+No response body. Idempotent on already-closed sessions — a UI double-click or concurrent close race (reaper beating the owner, two admin tabs) returns 204 rather than a misleading 404.
 
 **Errors**
 - `401 Unauthorized` — missing or invalid token
-- `403 Forbidden` — not the session owner
+- `403 Forbidden` — caller is neither the session owner nor an admin
 - `404 Not Found` — session does not exist
 
 ### PUT /api/sessions/{session_id}/participants/{user_id}/role
