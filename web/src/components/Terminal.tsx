@@ -33,9 +33,12 @@ export default function Terminal(props: TerminalProps) {
   let containerRef: HTMLDivElement | undefined;
   let term: XTerm | undefined;
   let fitAddon: FitAddon | undefined;
+  let webglAddon: WebglAddon | undefined;
   let resizeObserver: ResizeObserver | undefined;
   let resizeTimer: ReturnType<typeof setTimeout> | undefined;
   let onVisibilityChange: (() => void) | undefined;
+  let dprMediaQuery: MediaQueryList | undefined;
+  let dprHandler: (() => void) | undefined;
   // `readOnly` is set via the exposed handle and read inside xterm
   // callbacks; keeping it outside the xterm option bag means we avoid
   // touching internal xterm APIs that differ across minor versions.
@@ -83,7 +86,6 @@ export default function Terminal(props: TerminalProps) {
     // renders content ~row 11 (mid-pane) instead of row 0, and no public
     // API clears it. The canvas renderer has no equivalent cache and
     // repaints cleanly after reset.
-    let webglAddon: WebglAddon | undefined;
     if (!(window as unknown as { __DISABLE_WEBGL?: boolean }).__DISABLE_WEBGL) {
       try {
         webglAddon = new WebglAddon();
@@ -92,6 +94,27 @@ export default function Terminal(props: TerminalProps) {
         // WebGL not available, fall back to canvas
       }
     }
+
+    // Centralised "fit + clear atlas" so every resize path (container
+    // resize, visibility flip, DPR change, window resize) goes through
+    // the same recovery sequence. The `clearTextureAtlas` call is
+    // load-bearing for QA v0.1.9 C2: when the user narrowed then
+    // widened the window, the WebGL glyph atlas kept the cell-size it
+    // was measured at in the narrow layout, and subsequent paints
+    // against a wider viewport rendered glyphs ~half-size until the
+    // atlas was rebuilt. Clearing on every fit() is cheap — the atlas
+    // rebuilds lazily on the next frame — and eliminates the whole
+    // class of "wrong-DPR/wrong-cell-size persistence" bugs.
+    const fitAndRepaint = () => {
+      if (disposed) return;
+      try {
+        fitAddon?.fit();
+      } catch {
+        // fit() can throw if the container is detached mid-teardown.
+        return;
+      }
+      webglAddon?.clearTextureAtlas();
+    };
 
     // When the async webfont lands, purge cached glyph textures and
     // refit so character cells are re-measured against the real font.
@@ -110,8 +133,7 @@ export default function Terminal(props: TerminalProps) {
         .load(`${s.fontSize}px "JetBrainsMono Nerd Font Mono"`)
         .then(() => {
           if (disposed) return;
-          webglAddon?.clearTextureAtlas();
-          fitAddon?.fit();
+          fitAndRepaint();
         })
         .catch(() => {
           // Font failed to load — keep the fallback stack, nothing to do
@@ -135,12 +157,12 @@ export default function Terminal(props: TerminalProps) {
     // first snap and the server PTY stays at 80×24.
     term.onResize(({ cols, rows }) => props.onResize(cols, rows));
 
-    fitAddon.fit();
+    fitAndRepaint();
 
     // Auto-fit on container resize (debounced to avoid flooding server with resize messages)
     resizeObserver = new ResizeObserver(() => {
       clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(() => fitAddon?.fit(), 100);
+      resizeTimer = setTimeout(fitAndRepaint, 100);
     });
     resizeObserver.observe(containerRef);
 
@@ -155,10 +177,38 @@ export default function Terminal(props: TerminalProps) {
     // the hide leg of the toggle.
     onVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
-        fitAddon?.fit();
+        fitAndRepaint();
       }
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
+
+    // Device-pixel-ratio change handler. Browsers do NOT fire `resize`
+    // when only the DPR changes (the most common trigger is dragging
+    // the window between monitors with different scaling factors, or
+    // a user ⌘- / ⌘+ page-zoom step), so neither the ResizeObserver
+    // above nor a `window.resize` listener would catch it. Instead,
+    // `matchMedia('(resolution: <cur>dppx)')` fires its `change`
+    // event the moment DPR differs from the baseline — at which point
+    // we re-install the listener at the new DPR and refit so the
+    // xterm canvas's backing store is re-measured against the current
+    // pixel ratio (the root cause of QA v0.1.9 C2 where widen-after-
+    // narrow left glyphs at ~half size because the WebGL atlas was
+    // still sized for the old DPR/cell geometry).
+    const installDprListener = () => {
+      const dpr = window.devicePixelRatio || 1;
+      dprMediaQuery = window.matchMedia(`(resolution: ${dpr}dppx)`);
+      dprHandler = () => {
+        fitAndRepaint();
+        // The MediaQueryList that just fired is now "stale" — its
+        // baseline DPR no longer matches the page's current DPR. Tear
+        // it down and re-install a fresh listener pinned to the new
+        // ratio so we catch the *next* transition.
+        dprMediaQuery?.removeEventListener('change', dprHandler!);
+        installDprListener();
+      };
+      dprMediaQuery.addEventListener('change', dprHandler);
+    };
+    installDprListener();
 
     props.ref?.({
       write(data: string | Uint8Array) {
@@ -209,7 +259,16 @@ export default function Terminal(props: TerminalProps) {
     if (!readOnly) {
       term.options.cursorBlink = s.cursorBlink;
     }
-    fitAddon.fit();
+    // Font/theme changes shift cell metrics; clear the WebGL atlas
+    // so the new glyphs are re-rasterised against the new geometry.
+    // `fitAndRepaint` was defined in onMount and is only called here
+    // after term + fitAddon exist, so the guarded access is safe.
+    try {
+      fitAddon.fit();
+    } catch {
+      return;
+    }
+    webglAddon?.clearTextureAtlas();
   });
 
   onCleanup(() => {
@@ -222,6 +281,9 @@ export default function Terminal(props: TerminalProps) {
     resizeObserver?.disconnect();
     if (onVisibilityChange) {
       document.removeEventListener('visibilitychange', onVisibilityChange);
+    }
+    if (dprMediaQuery && dprHandler) {
+      dprMediaQuery.removeEventListener('change', dprHandler);
     }
     term?.dispose();
   });
