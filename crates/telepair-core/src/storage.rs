@@ -197,10 +197,15 @@ pub trait Storage: Send + Sync {
     /// rows still carry `token_sha256` (not the raw token) — the
     /// raw bearer is only ever visible at mint time.
     async fn list_invites_for_session(&self, session_id: &str) -> Result<Vec<InviteToken>>;
-    /// Hard-delete an invite row by its SHA-256 PK. Returns
-    /// `Error::InvalidInput` if the row does not exist so callers
-    /// can distinguish "already gone" (→ 404) from "real error".
-    async fn revoke_invite(&self, token_sha256: &str) -> Result<()>;
+    /// Hard-delete an invite row by its SHA-256 PK.
+    ///
+    /// Returns `Ok(true)` when a row was actually deleted and
+    /// `Ok(false)` when the row was already gone (or never existed).
+    /// Callers use the boolean to decide whether the observable state
+    /// of the system changed — the `InviteService::revoke` audit path
+    /// only emits on `true` so concurrent double-clicks or retries
+    /// don't write phantom audit events.
+    async fn revoke_invite(&self, token_sha256: &str) -> Result<bool>;
 
     // Auth — email registration
     //

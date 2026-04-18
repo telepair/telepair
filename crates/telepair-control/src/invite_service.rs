@@ -502,7 +502,17 @@ impl InviteService {
         };
         let role = target.role;
         let token_prefix = target.token_prefix().to_string();
-        self.storage.revoke_invite(&target.token_sha256).await?;
+        // Only emit an audit event when this request actually removed
+        // a row. Without the guard, two concurrent revokes of the same
+        // sha each pass the `find_invite_by_sha256` check, each issue
+        // the idempotent `DELETE`, and both write an audit line — so
+        // a double-clicked button produces two identical
+        // `invite.revoked` entries even though only one real state
+        // transition happened (observed in QA v0.1.9, finding C3).
+        let deleted = self.storage.revoke_invite(&target.token_sha256).await?;
+        if !deleted {
+            return Ok(());
+        }
 
         self.audit
             .record(

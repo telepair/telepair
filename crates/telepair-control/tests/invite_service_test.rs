@@ -14,7 +14,7 @@ use telepair_control::invite_service::{
     CreateInviteParams, InviteService, MAX_INVITE_TTL_MINUTES, MAX_INVITE_USES,
 };
 use telepair_control::session_service::SessionService;
-use telepair_core::audit::AuditSink;
+use telepair_core::audit::{AuditEventType, AuditFilter, AuditSink};
 use telepair_core::auth::TokenAuthProvider;
 use telepair_core::error::Error;
 use telepair_core::permission::Role;
@@ -603,6 +603,49 @@ async fn revoke_hard_deletes_and_blocks_future_redeem() {
     // And the raw token no longer redeems — the whole point.
     let err = fx.invites.redeem(None, &created.token).await.unwrap_err();
     assert!(matches!(err, Error::InvalidInput(_)));
+}
+
+#[tokio::test]
+async fn revoke_twice_writes_only_one_audit_row() {
+    // Regression for QA finding C3 (v0.1.9): a double-clicked revoke
+    // used to write two identical `invite.revoked` audit rows because
+    // both requests passed the `find_invite_by_sha256` check before
+    // the first one deleted the row, and each fired the audit on the
+    // optimistic path. The service now only audits when the storage
+    // DELETE actually removed a row.
+    let fx = setup().await;
+    let owner = seed_user(&fx, "owner").await;
+    let session = seed_session(&fx, &owner).await;
+    fx.invites
+        .create(&owner, &session.id, default_params(Role::Operator))
+        .await
+        .unwrap();
+
+    let rows = fx
+        .invites
+        .list_for_session(&owner, &session.id)
+        .await
+        .unwrap();
+    let sha = rows[0].token_sha256.clone();
+
+    fx.invites.revoke(&owner, &session.id, &sha).await.unwrap();
+    // Second call succeeds (idempotent) but must NOT write an audit row.
+    fx.invites.revoke(&owner, &session.id, &sha).await.unwrap();
+
+    let audits = fx
+        .storage
+        .list_audit_events(&AuditFilter {
+            session_id: Some(session.id.clone()),
+            event_types: vec![AuditEventType::InviteRevoked],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        audits.len(),
+        1,
+        "idempotent revoke must not produce a second audit row, got {audits:?}",
+    );
 }
 
 #[tokio::test]

@@ -1221,20 +1221,21 @@ impl Storage for SqliteStorage {
         rows.iter().map(row_to_invite).collect()
     }
 
-    async fn revoke_invite(&self, token_sha256: &str) -> Result<()> {
+    async fn revoke_invite(&self, token_sha256: &str) -> Result<bool> {
         // Hard delete, idempotent: a revoked invite has no use to the
         // caller and nothing downstream references it by its PK
         // (participants are keyed by session+user, not by invite).
-        // Missing rows resolve to `Ok(())` so the HTTP DELETE can be
-        // retried or raced between concurrent admins without spurious
-        // 400s. The caller-facing "did it really exist?" distinction is
-        // deliberately erased at this layer — cross-session probe
-        // blocking lives one level up in `InviteService::revoke`.
-        sqlx::query("DELETE FROM invite_tokens WHERE token_sha256 = ?")
+        // Missing rows resolve to `Ok(false)` so the HTTP DELETE can
+        // be retried or raced between concurrent admins without
+        // spurious 400s, while the service layer still learns whether
+        // a real state change happened (needed for audit dedupe —
+        // otherwise two concurrent revokes of the same sha produce
+        // two audit rows, one per request).
+        let rows = sqlx::query("DELETE FROM invite_tokens WHERE token_sha256 = ?")
             .bind(token_sha256)
             .execute(&self.pool)
             .await?;
-        Ok(())
+        Ok(rows.rows_affected() > 0)
     }
 
     async fn find_invite(&self, token: &str) -> Result<InviteToken> {

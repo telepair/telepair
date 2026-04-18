@@ -169,7 +169,8 @@ async fn revoke_invite_hard_deletes_row() {
         .await
         .unwrap();
 
-    store.revoke_invite(&invite.token_sha256).await.unwrap();
+    let deleted = store.revoke_invite(&invite.token_sha256).await.unwrap();
+    assert!(deleted, "first revoke must report actual deletion");
 
     let rows = store.list_invites_for_session(&session_id).await.unwrap();
     assert!(rows.is_empty());
@@ -180,7 +181,9 @@ async fn revoke_invite_twice_is_idempotent() {
     // Two admins racing a revoke, or a user retrying after a network
     // timeout, must not get a spurious error on the second call. The
     // storage layer erases the "did the row really exist?" distinction
-    // so the HTTP DELETE can answer 204 either way.
+    // on the wire (HTTP DELETE still answers 204) but still reports
+    // whether *this* call changed state, so the service-level audit
+    // can dedupe (see `InviteService::revoke`).
     let (store, session_id) = setup().await;
 
     let (invite, _) = store
@@ -188,13 +191,16 @@ async fn revoke_invite_twice_is_idempotent() {
         .await
         .unwrap();
 
-    store.revoke_invite(&invite.token_sha256).await.unwrap();
+    let first = store.revoke_invite(&invite.token_sha256).await.unwrap();
+    assert!(first, "first revoke must report deletion");
 
     // Second call is a no-op — already gone, so nothing to delete.
-    store.revoke_invite(&invite.token_sha256).await.unwrap();
+    let second = store.revoke_invite(&invite.token_sha256).await.unwrap();
+    assert!(!second, "second revoke must report false (no row changed)");
 
     // And an arbitrary unknown sha is also a no-op (not an error).
-    store.revoke_invite(&"0".repeat(64)).await.unwrap();
+    let unknown = store.revoke_invite(&"0".repeat(64)).await.unwrap();
+    assert!(!unknown, "unknown sha must report false");
 }
 
 #[tokio::test]
