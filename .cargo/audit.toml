@@ -1,0 +1,32 @@
+# cargo-audit configuration.
+#
+# Documented ignores. Every entry MUST include a rationale that
+# explains why the advisory does not apply to telepair as shipped,
+# plus a reassessment trigger. Re-audit the full list at every
+# release.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — rsa 0.9.10 "Marvin Attack" (timing
+    # sidechannel in decryption / signing).
+    #
+    # Reach: rsa 0.9.10 ← sqlx-mysql 0.8.6 ← sqlx-macros-core ←
+    # sqlx-macros (proc-macro). telepair enables only the
+    # `runtime-tokio` + `sqlite` features on sqlx; sqlx-mysql is
+    # pulled in solely by the compile-time macro expander so
+    # `query!` can surface MySQL-flavour errors. No RSA primitive
+    # is linked into or invoked by the shipping telepair binary,
+    # and the gateway does not expose any surface that would drive
+    # attacker-controllable ciphertexts through rsa even if it
+    # were present. Upstream reports "No fixed upgrade is
+    # available!" so there is nothing to bump here.
+    #
+    # Reassess when:
+    #   - sqlx ships a rsa-less sqlx-macros-core (likely tied to
+    #     the rsa crate landing a constant-time rework), OR
+    #   - telepair ever enables a non-sqlite sqlx runtime driver,
+    #     OR
+    #   - the advisory's severity is raised beyond medium / the
+    #     scored vector starts to cover our deployment profile.
+    "RUSTSEC-2023-0071",
+]
