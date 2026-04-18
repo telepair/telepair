@@ -97,7 +97,16 @@ export class TelepairSocket {
     this.ws.binaryType = 'arraybuffer';
 
     this.ws.onopen = () => {
-      this.reconnectAttempts = 0;
+      // Don't reset `reconnectAttempts` here — a TCP open does NOT
+      // mean the gateway accepted us. If the server closes the
+      // socket immediately after the upgrade (bad token, missing
+      // session, transient storage error before the handshake
+      // completes), resetting the counter at `onopen` time would
+      // zero the exponential backoff and turn a legitimate server
+      // refusal into a tight client-side retry storm. The counter
+      // is only cleared on the first successful `SessionState`
+      // message (see `onmessage` below), which is the actual
+      // "fully joined" handshake checkpoint.
       this.send({
         type: 'SessionJoin',
         session_id: this.sessionId,
@@ -115,6 +124,11 @@ export class TelepairSocket {
       try {
         const msg: ServerMessage = JSON.parse(event.data);
         if (msg.type === 'SessionState') {
+          // First `SessionState` after `doConnect()` proves the
+          // gateway accepted the handshake. Only now is it safe to
+          // reset the exponential-backoff counter — see the rationale
+          // on `onopen` above.
+          this.reconnectAttempts = 0;
           this.onStatus('connected');
           this.onReconnectInfo?.(null);
         }

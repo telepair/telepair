@@ -344,8 +344,9 @@ describe('TelepairSocket', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     // Pin reconnectAttempts at the max so the next scheduleReconnect call
-    // falls into the giveup branch. Walking the full loop via mock close is
-    // fragile because MockWebSocket auto-fires onopen, which resets attempts.
+    // falls into the giveup branch. Walking the full loop via mock close
+    // would require stepping through each scheduled retry and is noisy
+    // to write — this shortcut is equivalent.
     (sock as any).reconnectAttempts = 5;
 
     const ws = (sock as any).ws as MockWebSocket;
@@ -355,6 +356,77 @@ describe('TelepairSocket', () => {
     expect(statusCalls).toContain('giveup');
     expect(onInfo).toHaveBeenLastCalledWith(null);
     expect((sock as any).reconnectTimer).toBeNull();
+    vi.useRealTimers();
+  });
+
+  // Regression for the reconnect-storm bug (P0-2): pre-fix, `onopen`
+  // reset `reconnectAttempts` as soon as TCP accepted the upgrade —
+  // which fires *before* the server validates the token, the session
+  // id, or runs the storage lookups behind the handshake. If the
+  // server rejected the join immediately afterwards, the counter had
+  // already been zeroed, collapsing the exponential backoff into a
+  // tight client-side retry loop. The fix defers the reset to the
+  // first `SessionState` message (the real "fully joined" signal).
+  it('does not reset retry counter until SessionState arrives', async () => {
+    vi.useFakeTimers();
+    const sock = new TelepairSocket(vi.fn(), vi.fn(), vi.fn());
+    sock.connect('s', 't');
+
+    // Burn past the mock's auto-onopen; no SessionState is dispatched.
+    await vi.advanceTimersByTimeAsync(10);
+    expect((sock as any).reconnectAttempts).toBe(0);
+
+    // First rejection: server closed the upgrade without handshaking.
+    const ws1 = (sock as any).ws as MockWebSocket;
+    ws1.onclose?.({ code: 1006, reason: '' });
+    expect((sock as any).reconnectAttempts).toBe(1);
+
+    // Let the first scheduled retry fire. The reconnected socket
+    // auto-opens again (MockWebSocket behaviour), but since no
+    // SessionState is dispatched the counter must not reset.
+    await vi.advanceTimersByTimeAsync(2000);
+    expect((sock as any).reconnectAttempts).toBe(1);
+
+    // Second rejection climbs the counter instead of staying at 1.
+    const ws2 = (sock as any).ws as MockWebSocket;
+    ws2.onclose?.({ code: 1006, reason: '' });
+    expect((sock as any).reconnectAttempts).toBe(2);
+
+    vi.useRealTimers();
+  });
+
+  // Sibling to the test above: once the handshake actually succeeds
+  // (a `SessionState` lands), a *subsequent* disconnect must start
+  // over from attempt 1, not carry the climb from the prior rejected
+  // attempts. This is what makes the reset safe to defer.
+  it('resets retry counter on SessionState after prior rejections', async () => {
+    vi.useFakeTimers();
+    const sock = new TelepairSocket(vi.fn(), vi.fn(), vi.fn());
+    sock.connect('s', 't');
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Two rejected handshakes so the counter climbs to 2.
+    (sock as any).ws.onclose?.({ code: 1006, reason: '' });
+    await vi.advanceTimersByTimeAsync(2000);
+    (sock as any).ws.onclose?.({ code: 1006, reason: '' });
+    expect((sock as any).reconnectAttempts).toBe(2);
+
+    // Third attempt succeeds: SessionState delivered.
+    await vi.advanceTimersByTimeAsync(5000);
+    const ws = (sock as any).ws as MockWebSocket;
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: 'SessionState',
+        session: { id: 's', owner_id: 'u', target_name: 't', input_mode: 'serialized', status: 'active', created_at: '', closed_at: null },
+        participants: [],
+        your_role: 'owner',
+        your_user_id: 'u',
+        chat_history: [],
+        recording: null,
+      }),
+    });
+    expect((sock as any).reconnectAttempts).toBe(0);
+
     vi.useRealTimers();
   });
 
