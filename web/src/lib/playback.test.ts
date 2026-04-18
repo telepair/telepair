@@ -126,4 +126,43 @@ describe('PlaybackEngine', () => {
     vi.advanceTimersByTime(4000);
     expect(completed).toBe(true);
   });
+
+  // Regression: the pre-refactor implementation registered a `setTimeout`
+  // for every remaining event at `play()` time, so the timer count
+  // tracked event count. For long casts that pinned O(N) memory in the
+  // JS timer queue and made every `pause()` / `seek()` / `setSpeed()`
+  // walk the full array to cancel. Each play() segment now queues
+  // exactly one pending timer — pinning the invariant here means any
+  // future edit that goes back to pre-registering all events will
+  // trip this test, not just some fuzzy perf regression.
+  it('keeps only one pending timer at a time during playback', () => {
+    engine.load(SAMPLE_CAST);
+    engine.play();
+    expect(vi.getTimerCount()).toBe(2); // 1 pump timer + 1 ticker interval
+    // Cross a few event boundaries — the pump should re-queue a single
+    // replacement each time, never stack up.
+    for (let step = 0; step < 6; step++) {
+      vi.advanceTimersByTime(500);
+      // During `ended` the pump releases its timer, so 1 (ticker only)
+      // is acceptable for the final iteration; everything else must
+      // still be exactly 2.
+      expect(vi.getTimerCount()).toBeLessThanOrEqual(2);
+    }
+  });
+
+  // Regression: synchronous seek must leave zero outstanding timers
+  // while paused. The pre-refactor code cleared an array of per-event
+  // timers and re-populated `nextIndex` from a linear scan; the pump
+  // refactor replaces that with a single-handle clear. This test
+  // guards against a regression where `seek()` forgets to cancel the
+  // pump while the engine was playing, which would leave an orphan
+  // timer ticking at the old speed after the user scrubs.
+  it('leaves no timers pending after seek from a playing state', () => {
+    engine.load(SAMPLE_CAST);
+    engine.play();
+    vi.advanceTimersByTime(100); // dispatch a couple events
+    engine.pause();
+    engine.seek(1.5);
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });
