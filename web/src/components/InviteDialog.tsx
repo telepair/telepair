@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, Show } from 'solid-js';
+import { createEffect, createSignal, For, onCleanup, Show } from 'solid-js';
 import { api, errorMessage } from '../lib/api';
 import type { InviteSummary, Role, InputMode } from '../lib/protocol';
 import { toast } from '../stores/toast';
@@ -85,6 +85,12 @@ export default function InviteDialog(props: InviteDialogProps) {
   // select it — picking text from an unfocused input is a no-op on
   // most browsers.
   let urlInputRef: HTMLInputElement | undefined;
+  // Ref to the dialog root. Focused on open so the Escape-to-close
+  // keyboard shortcut routes through the same node whether the
+  // owner opens the dialog via mouse or keyboard, and screen
+  // readers land inside the dialog on its announcement instead of
+  // wherever focus happened to be on the underlying page.
+  let dialogRef: HTMLDivElement | undefined;
 
   const loadInvites = async () => {
     setInvitesLoading(true);
@@ -106,7 +112,34 @@ export default function InviteDialog(props: InviteDialogProps) {
   createEffect(() => {
     if (props.open) {
       void loadInvites();
+      // Defer the focus() call a tick so the `<Show>` block has
+      // actually rendered the dialog node before we try to focus
+      // it. Without the queueMicrotask hop we'd be calling
+      // `.focus()` on an element that SolidJS has not yet attached
+      // to the DOM and the call would be a silent no-op, leaving
+      // keyboard-only users stuck on whatever triggered the open.
+      queueMicrotask(() => dialogRef?.focus());
     }
+  });
+
+  // Window-level Escape handler — scoped to whenever this dialog is
+  // open. Keeping it at the window layer (not on the dialog div)
+  // means the shortcut works even if focus has wandered into a
+  // nested element (input, button inside the revoke confirm), which
+  // an onKeyDown on the dialog would miss when the inner node calls
+  // stopPropagation. `onCleanup` removes the listener on unmount
+  // so navigation away from the session page doesn't leak a dangling
+  // Escape handler that fires on every other dialog.
+  createEffect(() => {
+    if (!props.open) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        handleClose();
+      }
+    };
+    window.addEventListener('keydown', handler);
+    onCleanup(() => window.removeEventListener('keydown', handler));
   });
 
   const handleCreate = async () => {
@@ -241,8 +274,16 @@ export default function InviteDialog(props: InviteDialogProps) {
   return (
     <Show when={props.open}>
       <div class="dialog-backdrop" onClick={handleClose}>
-        <div class="dialog" onClick={(e) => e.stopPropagation()}>
-          <h3>{t('invite.title')}</h3>
+        <div
+          ref={dialogRef}
+          class="dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="invite-dialog-title"
+          tabindex="-1"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <h3 id="invite-dialog-title">{t('invite.title')}</h3>
           <Show when={!createdInvite()} fallback={
             <div class="invite-result">
               <label>{t('invite.link_label')}</label>
@@ -406,6 +447,8 @@ export default function InviteDialog(props: InviteDialogProps) {
           <style>{`
             .dialog-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 100; }
             .dialog { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 12px; padding: 24px; width: 440px; max-width: 90vw; }
+            .dialog:focus { outline: none; }
+            .dialog:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
             .dialog h3 { font-size: 16px; font-weight: 600; margin-bottom: 16px; }
             .dialog label { display: block; font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 8px; margin-top: 12px; }
             .dialog label:first-of-type { margin-top: 0; }
