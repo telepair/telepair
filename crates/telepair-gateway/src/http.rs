@@ -2431,6 +2431,15 @@ const SHARE_TOKEN_HEADER: &str = "x-share-token";
 ///    (expiry + usage) without requiring auth. This powers share
 ///    links.
 ///
+/// Failure semantics:
+/// - Missing both credentials → 401 `Unauthorized`.
+/// - Bearer auth failure → 401 (propagated from `extract_user`).
+/// - Share token rejected (unknown digest, revoked, expired, or
+///   exhausted) → 401 `authentication failed: invalid, expired, or
+///   exhausted share token`. A spent share is a failed credential,
+///   not a malformed request; this is the semantic fix for QA v0.1.9
+///   C4 (it used to return 400).
+///
 /// The share token used to travel in a `?token=...` query parameter,
 /// but reverse-proxy access logs almost always capture full request
 /// URIs (query string included) while `X-Share-Token` is a custom

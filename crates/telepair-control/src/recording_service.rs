@@ -307,7 +307,13 @@ impl RecordingService {
         self.storage
             .consume_recording_share(&sha256_hex, expected_recording_id)
             .await?
-            .ok_or_else(|| Error::InvalidInput("invalid, expired, or exhausted share token".into()))
+            // `Error::Auth` so the HTTP layer answers 401 (not 400):
+            // a revoked / expired / exhausted share token is
+            // semantically a failed credential, and clients that
+            // branch on 401 to redirect to an "access revoked" screen
+            // used to miss this case with the old 400 mapping
+            // (observed in QA v0.1.9, finding C4).
+            .ok_or_else(|| Error::Auth("invalid, expired, or exhausted share token".into()))
     }
 
     /// List all share tokens for a recording.
@@ -589,19 +595,22 @@ mod tests {
         // Second validation also succeeds.
         svc.validate_share_token(&raw, &rec.id).await.unwrap();
 
-        // Third validation should fail (max_uses exhausted).
+        // Third validation should fail (max_uses exhausted). The
+        // service reports this as `Error::Auth` so the HTTP layer
+        // answers 401 — a spent share token is a failed credential,
+        // not a malformed request.
         let err = svc
             .validate_share_token(&raw, &rec.id)
             .await
             .expect_err("exhausted share must fail");
-        assert!(matches!(err, Error::InvalidInput(_)));
+        assert!(matches!(err, Error::Auth(_)), "got {err:?}");
 
         // Wrong recording id must fail without consuming a use.
         let err = svc
             .validate_share_token(&raw, "some-other-recording")
             .await
             .expect_err("mismatched recording id must fail");
-        assert!(matches!(err, Error::InvalidInput(_)));
+        assert!(matches!(err, Error::Auth(_)), "got {err:?}");
     }
 
     #[tokio::test]
@@ -632,12 +641,14 @@ mod tests {
             .unwrap();
         assert!(deleted, "well-scoped revoke must report deletion");
 
-        // Token should no longer validate.
+        // Token should no longer validate. Revoked shares surface as
+        // `Error::Auth` → HTTP 401 so clients can distinguish a dead
+        // credential from a malformed request (see QA v0.1.9 C4).
         let err = svc
             .validate_share_token(&raw, &rec.id)
             .await
             .expect_err("deleted share must fail");
-        assert!(matches!(err, Error::InvalidInput(_)));
+        assert!(matches!(err, Error::Auth(_)), "got {err:?}");
     }
 
     /// Service-level guard that the scoped revoke refuses a
