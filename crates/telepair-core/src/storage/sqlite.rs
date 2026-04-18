@@ -346,9 +346,7 @@ fn assert_safe_sql_ident(ident: &str, field: &str) {
             .next()
             .map(|c| c.is_ascii_alphabetic() || c == '_')
             .unwrap_or(false)
-        && ident
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        && ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     assert!(
         ok,
         "{field}: {ident:?} is not a safe SQL identifier \
