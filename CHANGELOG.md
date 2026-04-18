@@ -72,6 +72,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `initPlayer` flow now checks an abort latch after every `await`
   (metadata fetch, data download, microtask yield) and bails
   before initialising xterm if the component has been cleaned up.
+- Recording share tokens no longer travel in URL query strings.
+  `GET /api/recordings/:id/data` now reads the raw token from the
+  `X-Share-Token` request header (`?token=…` is no longer
+  recognised), and share links emit `…/play#token=<raw>` URL
+  fragments that the player captures on mount, scrubs from history
+  via `replaceState`, and ships in the header on its one data
+  fetch. Closes a quiet log-exfiltration path: default NGINX /
+  ALB / CloudFront access-log formats capture the full request URI
+  (query string included) but never arbitrary request headers, so
+  a leaked log file can no longer replay a still-valid share link.
+  Breaking for any out-of-tree caller that hand-crafted a
+  `?token=…` URL — the owner-authored UI has been migrated.
 
 ### Changed
 

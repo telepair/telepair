@@ -220,7 +220,7 @@ telepair 所有持久化数据放在 `~/.telepair/`(可用 `--data-dir` / `TELEP
 
 - 会话所有者可以从会话内的 Recording 面板 **开始 / 停止** 录制(`POST /api/sessions/{id}/recording/{start,stop}`)。同一会话同一时刻只能有一个活跃录制。
 - Owner 和 admin 可以 **列表 / 回放 / 删除** 自己的录制;admin 还能通过 `GET /api/admin/recordings` 看到所有人的。
-- Owner 可以通过 `POST /api/recordings/{id}/shares` 生成 **带签名的分享链接**(TTL + 最多使用次数)。匿名观看者访问 `/recordings/{id}/play?token=...` 会绕过 `AuthGuard` 直接命中 `/api/recordings/{id}/data?token=...` —— token 会通过单条 `UPDATE … RETURNING` 同时校验 recording id、剩余使用次数和过期时间,无 TOCTOU 窗口。
+- Owner 可以通过 `POST /api/recordings/{id}/shares` 生成 **带签名的分享链接**(TTL + 最多使用次数)。匿名观看者访问 `/recordings/{id}/play#token=...` 会绕过 `AuthGuard`；播放器读取 URL fragment 后立即用 `replaceState` 清除,再以 `X-Share-Token: <raw>` 请求头拉取 `/api/recordings/{id}/data`。token 会通过单条 `UPDATE … RETURNING` 同时校验 recording id、剩余使用次数和过期时间,无 TOCTOU 窗口。使用 fragment + header 的组合是为了日志卫生 —— NGINX `$request`、ALB `request_url`、CloudFront standard log 默认都会记录 query string,但不会记录自定义请求头,所以原始 token 永远不会出现在访问日志中。
 - 后台 **cleaner** 每隔数分钟扫描 `expires_at`,删除过期行。候选集中**始终**排除活跃录制(`status = 'recording'`)作为防御性兜底。`expires_at IS NULL` 表示"永久保留"。
 
 存储细节:

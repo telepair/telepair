@@ -86,10 +86,12 @@ export default function App() {
         <Route path="/recordings/:id" component={() => <AuthGuard><RecordingPlayer /></AuthGuard>} />
         {/*
           Anonymous share-token playback. Lives outside AuthGuard so a
-          recipient with a `?token=...` query parameter can open the
-          link without an account; the player component itself reads
-          the token and uses the public `/recordings/:id/data?token=`
-          endpoint instead of the authed metadata endpoint.
+          recipient with a `#token=...` URL fragment can open the link
+          without an account; the player component reads the fragment,
+          scrubs it via `history.replaceState`, and sends the token in
+          the `X-Share-Token` header on its one `/data` fetch. A URL
+          fragment + custom header keeps the raw secret out of every
+          reverse-proxy access log on the path.
         */}
         <Route path="/recordings/:id/play" component={RecordingPlayer} />
         <Route

@@ -49,8 +49,15 @@ export default function ShareRecordingDialog(props: ShareRecordingDialogProps): 
     setNewToken('');
     try {
       const share = await api.createRecordingShare(props.recordingId);
-      // Construct the shareable URL using the plaintext token
-      const url = `${window.location.origin}/recordings/${props.recordingId}/play?token=${encodeURIComponent(share.token)}`;
+      // Construct the shareable URL using a URL fragment (#token=…)
+      // instead of a query string. Fragments never hit the server, so
+      // reverse-proxy and gateway access logs can't capture the raw
+      // share secret — a token leaked through `nginx_access.log` used
+      // to grant replay for the full TTL until the owner revoked it.
+      // The player reads `location.hash`, strips it via
+      // `history.replaceState`, and sends the token over the
+      // `X-Share-Token` header on its one `/data` fetch.
+      const url = `${window.location.origin}/recordings/${props.recordingId}/play#token=${encodeURIComponent(share.token)}`;
       setNewToken(url);
       // Reload the list so the new entry appears
       await loadShares();

@@ -1130,12 +1130,12 @@ Get a single recording's metadata. Owner or admin.
 Download the asciicast v2 `.cast` file. Two access modes:
 
 1. **Bearer token** (owner or admin): standard `Authorization: Bearer <token>`.
-2. **Share token** (anonymous): append `?token=<raw_share_token>`. The server validates the token atomically (recording-id match + expiry + remaining uses + used_count++) in a single `UPDATE … RETURNING` — TOCTOU-safe.
+2. **Share token** (anonymous): pass the raw token in the `X-Share-Token: <raw_share_token>` request header. The server validates the token atomically (recording-id match + expiry + remaining uses + used_count++) in a single `UPDATE … RETURNING` — TOCTOU-safe.
 
-**Query**
-| Param | Description |
-|-------|-------------|
-| `token` | Raw share token from `POST /api/recordings/{id}/shares`. When present, the auth header is ignored. |
+**Headers**
+| Header | Description |
+|--------|-------------|
+| `X-Share-Token` | Raw share token from `POST /api/recordings/{id}/shares`. When present, the `Authorization` header is ignored. Deliberately a custom header (and **not** a query parameter) so the raw secret never reaches reverse-proxy / gateway access logs, which capture request URIs but not arbitrary request headers by default. |
 
 **Response** `200 OK`
 - `Content-Type: application/x-asciicast`

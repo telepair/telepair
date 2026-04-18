@@ -199,7 +199,7 @@ recording_shares      (token_sha256, recording_id, max_uses, used_count,
 2. **Service(`recording_service.rs`)。** 强制"每会话只能有一个活跃录制"不变量;铸造 recording id 并让 DB 主键 / `.cast` 文件名 / asciicast header id 共用这一个值(pre-v0.1.8 把三者拆开后出现过文件与数据库行漂移);用单条原子化的 `UPDATE recording_shares SET used_count = used_count + 1 … RETURNING` 校验 share token —— 同一条语句里检查过期、剩余次数和 recording-id;share 删除限定到 `(recording_id, token_sha256)`,这样一个所有者无法通过对一个泄露的 URL 做哈希来撤销别的所有者的 share。
 3. **Cleaner(`recording_cleaner.rs`)。** 循环扫描 `expires_at` 的后台任务。从候选集里排除 `status = 'recording'` 行,作为对坏 `expires_at` 写入或 wall-clock 跳变的防御性兜底;永远先删 `.cast` 文件,再删 DB 行,这样两步之间崩溃也不会残留孤儿文件。
 
-播放时 `.cast` 文件直接通过 `/api/recordings/{id}/data` 读取,既可用 bearer token(所有者 / 管理员),也可用 `?token=<share_token>`(匿名)。`/recordings/{id}/play` 路由处在 `AuthGuard` 外,所以持有分享链接的匿名观看者不会被弹回 `/login`。
+播放时 `.cast` 文件直接通过 `/api/recordings/{id}/data` 读取,既可用 bearer token(所有者 / 管理员),也可用 `X-Share-Token: <raw>` 请求头(匿名)。`/recordings/{id}/play` 路由处在 `AuthGuard` 外,所以持有分享链接(形如 `…/play#token=<raw>`)的匿名观看者不会被弹回 `/login`;播放器读取 URL fragment 后用 `replaceState` 立即清除,再用请求头发起唯一的一次数据拉取。特意避开 query string 是为了日志卫生 —— 反向代理的访问日志(`nginx $request`、ALB `request_url`、CloudFront standard log)默认都会记录完整 query,但不会记录自定义请求头,这样日志泄漏也无法复用仍在有效期内的分享链接。
 
 ## 安全模型
 
