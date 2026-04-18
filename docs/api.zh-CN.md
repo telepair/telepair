@@ -300,19 +300,19 @@ SQLite 事务中完成,所以两次写入之间不会出现旧 token 在密码�
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `closed_reason` | string \| 缺省 | 取值为 `owner`、`reaper`、`startup`、`error` 之一。活跃会话以及 v0.1.0 时代没有该列的旧记录会省略此字段。 |
+| `closed_reason` | string \| 缺省 | 取值为 `owner`、`admin`、`reaper`、`startup`、`error` 之一。活跃会话以及 v0.1.0 时代没有该列的旧记录会省略此字段。 |
 
 ### DELETE /api/sessions/{session_id}
 
-关闭一个会话。只有会话 owner 能关闭。会停掉 PTY 进程并把会话标记为关闭。
+关闭一个会话。会话 owner 可以关闭自己的会话;管理员可以强制关闭任意会话 —— 用于禁用 owner 之后,operator 不用再等 idle reaper。会停掉 PTY 进程并把会话标记为关闭。管理员发起的关闭会打上 `closed_reason = "admin"`,避免历史记录错误归因到 owner(面板会显示 "Closed by admin")。
 
 **响应** `204 No Content`
 
-无响应体。
+无响应体。对已关闭的会话幂等 —— UI 双击或并发关闭竞态(reaper 抢先、两个 admin 标签页同时操作)返回 204,而不是误导性的 404。
 
 **错误**
 - `401 Unauthorized` —— token 缺失或无效
-- `403 Forbidden` —— 调用方不是会话 owner
+- `403 Forbidden` —— 调用方既不是会话 owner 也不是管理员
 - `404 Not Found` —— 会话不存在
 
 ### PUT /api/sessions/{session_id}/participants/{user_id}/role
