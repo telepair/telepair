@@ -295,7 +295,29 @@ impl SqliteStorage {
     /// Returns `true` when the column was just added, so callers can
     /// run a one-shot backfill inside the same migration step without
     /// re-running it on every boot.
+    ///
+    /// # DDL injection hardening
+    ///
+    /// Every argument is substituted into a raw DDL string because
+    /// `ALTER TABLE` identifiers and type declarations can't be bound
+    /// as SQL parameters. Today every caller in this crate passes
+    /// literal `&'static str`s, but the signature does not enforce
+    /// that and we don't want a future plugin / config-driven path
+    /// (e.g. an admin UI that adds custom columns) to silently open a
+    /// SQLi surface. Each argument is validated against a strict
+    /// whitelist up-front: `table` and `column` must be plain SQL
+    /// identifiers (`[A-Za-z_][A-Za-z0-9_]*`), and `sql_type` is
+    /// restricted to the characters the existing call-sites actually
+    /// use (alphanumerics, space, underscore, parens, `=`, and a
+    /// single pair of single-quote delimiters around a literal
+    /// default value). Anything outside the whitelist is a programmer
+    /// bug — we panic with a clear message rather than splicing
+    /// hostile text into DDL.
     async fn ensure_column(&self, table: &str, column: &str, sql_type: &str) -> Result<bool> {
+        assert_safe_sql_ident(table, "ensure_column.table");
+        assert_safe_sql_ident(column, "ensure_column.column");
+        assert_safe_sql_type(sql_type, "ensure_column.sql_type");
+
         let probe = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?");
         let exists: Option<i64> = sqlx::query_scalar(&probe)
             .bind(column)
@@ -308,6 +330,78 @@ impl SqliteStorage {
         sqlx::raw_sql(&alter).execute(&self.pool).await?;
         Ok(true)
     }
+}
+
+/// Panics if `ident` is not a conservative SQL identifier. Used to
+/// gate table / column names before they are spliced into raw DDL by
+/// [`SqliteStorage::ensure_column`]. SQLite's real identifier grammar
+/// is broader (quoted names, Unicode), but every real caller today
+/// uses the ASCII subset, so we keep the check tight — anything else
+/// is suspicious enough to warrant attention.
+fn assert_safe_sql_ident(ident: &str, field: &str) {
+    let ok = !ident.is_empty()
+        && ident.len() <= 64
+        && ident
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_')
+            .unwrap_or(false)
+        && ident
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+    assert!(
+        ok,
+        "{field}: {ident:?} is not a safe SQL identifier \
+         (expected /^[A-Za-z_][A-Za-z0-9_]*$/, max 64 chars)"
+    );
+}
+
+/// Panics if `sql_type` contains characters outside the whitelist
+/// actually used by current [`SqliteStorage::ensure_column`] call
+/// sites: alphanumerics, ASCII space, underscore, parentheses, `=`,
+/// comma, and single-quote-delimited string literals. We deliberately
+/// refuse `;`, `--`, `/*`, `*/`, and any unbalanced single quote so a
+/// malformed input can't terminate the enclosing DDL statement or
+/// open an SQL comment that swallows the rest of it.
+fn assert_safe_sql_type(sql_type: &str, field: &str) {
+    let mut in_quote = false;
+    let mut prev = ' ';
+    for c in sql_type.chars() {
+        if in_quote {
+            if c == '\'' {
+                in_quote = false;
+            } else {
+                assert!(
+                    c != '\n' && c != '\r',
+                    "{field}: {sql_type:?} contains newline inside literal"
+                );
+            }
+            prev = c;
+            continue;
+        }
+        match c {
+            '\'' => in_quote = true,
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | ' ' | '(' | ')' | '=' | ',' => {}
+            _ => panic!(
+                "{field}: disallowed char {c:?} in {sql_type:?} \
+                 (type clauses are restricted to alphanumerics, \
+                  space, `_`, parens, `=`, `,`, and single-quoted literals)"
+            ),
+        }
+        assert!(
+            !(prev == '-' && c == '-'),
+            "{field}: {sql_type:?} contains `--` comment sequence"
+        );
+        assert!(
+            !(prev == '/' && c == '*'),
+            "{field}: {sql_type:?} contains `/*` comment sequence"
+        );
+        prev = c;
+    }
+    assert!(
+        !in_quote,
+        "{field}: {sql_type:?} has an unterminated single-quoted literal"
+    );
 }
 
 fn parse_uuid(s: String) -> Result<Uuid> {
@@ -3357,5 +3451,101 @@ mod tests {
             LoginFailureOutcome::Recorded { remaining: 4 },
             "post-clear failure must start a fresh window",
         );
+    }
+
+    // ---- ensure_column DDL injection guards ----
+    //
+    // These tests pin the whitelist behaviour of `assert_safe_sql_ident`
+    // and `assert_safe_sql_type`. They run as `#[should_panic]` to
+    // confirm hostile input trips the guard BEFORE it reaches
+    // `format!` — even if a future refactor accidentally loosens
+    // `ensure_column`'s signature (e.g. to accept runtime-constructed
+    // column names for a plugin), the guards have to explicitly be
+    // removed to regress, which is a reviewable change.
+
+    #[test]
+    fn ident_guard_accepts_real_callers() {
+        for id in [
+            "sessions",
+            "users",
+            "invite_tokens",
+            "closed_reason",
+            "password_hash",
+            "login_failed_count",
+            "approval_state",
+            "_leading_underscore",
+            "x",
+        ] {
+            assert_safe_sql_ident(id, "test");
+        }
+    }
+
+    #[test]
+    fn ddl_type_guard_accepts_real_callers() {
+        for ty in [
+            "TEXT",
+            "BOOLEAN NOT NULL DEFAULT FALSE",
+            "INTEGER NOT NULL DEFAULT 0",
+            "TEXT NOT NULL DEFAULT 'approved'",
+            "BOOLEAN NOT NULL DEFAULT TRUE",
+        ] {
+            assert_safe_sql_type(ty, "test");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "not a safe SQL identifier")]
+    fn ident_guard_rejects_semicolon() {
+        assert_safe_sql_ident("users; DROP TABLE users", "test");
+    }
+
+    #[test]
+    #[should_panic(expected = "not a safe SQL identifier")]
+    fn ident_guard_rejects_space() {
+        assert_safe_sql_ident("users foo", "test");
+    }
+
+    #[test]
+    #[should_panic(expected = "not a safe SQL identifier")]
+    fn ident_guard_rejects_empty() {
+        assert_safe_sql_ident("", "test");
+    }
+
+    #[test]
+    #[should_panic(expected = "not a safe SQL identifier")]
+    fn ident_guard_rejects_leading_digit() {
+        assert_safe_sql_ident("1col", "test");
+    }
+
+    #[test]
+    #[should_panic(expected = "not a safe SQL identifier")]
+    fn ident_guard_rejects_quote() {
+        assert_safe_sql_ident("col\"", "test");
+    }
+
+    #[test]
+    #[should_panic(expected = "disallowed char")]
+    fn ddl_type_guard_rejects_semicolon() {
+        assert_safe_sql_type("TEXT; DROP TABLE users", "test");
+    }
+
+    #[test]
+    #[should_panic(expected = "disallowed char")]
+    fn ddl_type_guard_rejects_dash() {
+        // A raw `-` isn't in the whitelist, so `--` comments trip the
+        // char check before the `--` heuristic even runs.
+        assert_safe_sql_type("TEXT -- comment", "test");
+    }
+
+    #[test]
+    #[should_panic(expected = "unterminated single-quoted literal")]
+    fn ddl_type_guard_rejects_open_quote() {
+        assert_safe_sql_type("TEXT DEFAULT 'oops", "test");
+    }
+
+    #[test]
+    #[should_panic(expected = "newline inside literal")]
+    fn ddl_type_guard_rejects_newline_in_literal() {
+        assert_safe_sql_type("TEXT DEFAULT 'a\nb'", "test");
     }
 }
