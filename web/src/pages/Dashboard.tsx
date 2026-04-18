@@ -1,5 +1,13 @@
 // web/src/pages/Dashboard.tsx
-import { createSignal, onMount, Show, For, createMemo, createEffect } from 'solid-js';
+import {
+  createSignal,
+  onMount,
+  onCleanup,
+  Show,
+  For,
+  createMemo,
+  createEffect,
+} from 'solid-js';
 import { useNavigate, useSearchParams } from '@solidjs/router';
 import { auth } from '../stores/auth';
 import { AuthChangedError, sessionStore, type SessionsFilter } from '../stores/session';
@@ -102,6 +110,45 @@ export default function Dashboard() {
     }
     sessionStore.fetchSessions(nextStatus, nextTarget);
   });
+
+  // Pending-approval auto-refresh. Without this, a freshly-registered
+  // user on the dashboard has to click "Check status" every time they
+  // want to see whether the admin enabled their account, which in QA
+  // v0.1.9 made the happy path feel broken (finding Q1). We poll
+  // whoami at a slow cadence — ONLY while the caller is genuinely
+  // pending (non-admin, `session_enabled=false`) — and stop as soon
+  // as the flag flips. The effect is self-cancelling: once whoami
+  // reports `session_enabled=true`, the guard short-circuits and the
+  // interval is cleared. `onCleanup` also tears it down on route
+  // unmount so a fast logout → login doesn't leak timers.
+  //
+  // Cadence: 15s. Short enough that a just-approved user sees the
+  // dashboard unlock within a coffee sip, long enough that a screen
+  // left open for hours doesn't DoS the whoami route.
+  const PENDING_POLL_MS = 15_000;
+  let pendingTimer: ReturnType<typeof setInterval> | undefined;
+  createEffect(() => {
+    const pending =
+      auth.currentUserSessionEnabled() === false && auth.currentUserIsAdmin() === false;
+    // Effect re-runs whenever the signals flip; always clear the
+    // existing timer first so we don't double-schedule.
+    clearInterval(pendingTimer);
+    pendingTimer = undefined;
+    if (!pending) return;
+    pendingTimer = setInterval(async () => {
+      // Fire-and-forget; `refreshIdentity` handles its own errors by
+      // leaving the signals untouched. If the poll races with a
+      // manual "Check status" click or a logout, the result is still
+      // a no-op because the effect body re-runs on any signal change
+      // and will cancel this timer on the next tick.
+      await auth.refreshIdentity();
+      if (auth.currentUserSessionEnabled() !== false) {
+        setJustApproved(true);
+        sessionStore.refresh();
+      }
+    }, PENDING_POLL_MS);
+  });
+  onCleanup(() => clearInterval(pendingTimer));
 
   // Whether the current user owns `session`. The dashboard's session
   // list mixes "owned" and "merely joined" rows (the SQL is
