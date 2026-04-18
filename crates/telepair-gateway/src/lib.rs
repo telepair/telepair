@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use axum::{
     Router,
     body::Body,
-    http::{HeaderValue, Request, Response, StatusCode, header},
+    http::{HeaderName, HeaderValue, Request, Response, StatusCode, header},
     routing::{delete, get, post, put},
 };
 use bytes::Bytes;
@@ -22,6 +22,7 @@ use state::AppState;
 use tower::service_fn;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 
 /// Default loopback origins allowed when the operator does not pass
 /// `--allowed-origins` or `--allow-any-origin`. These match the Vite
@@ -305,5 +306,37 @@ pub fn build_router_with_options(
         }
         None => api,
     };
+
+    // Baseline security response headers applied to every route (API,
+    // static assets, SPA shell, WebSocket upgrade responses).
+    //
+    // `if_not_present` so any individual handler that needs a
+    // different value can still set one — the defaults are a
+    // safety net, not an override. Headers are deliberately
+    // conservative: CSP is intentionally omitted here because the
+    // policy that covers xterm.js + SolidJS hydration needs
+    // per-page verification and belongs in a dedicated change.
+    //
+    // - `X-Frame-Options: DENY` — the terminal surface is a
+    //   clickjacking target; block all framing.
+    // - `X-Content-Type-Options: nosniff` — stops MIME sniffing,
+    //   relevant for served `.cast` recording downloads.
+    // - `Referrer-Policy: strict-origin-when-cross-origin` — leaks
+    //   no path info cross-origin (share-link URLs carry digests in
+    //   the path since v0.1.8 but the policy still adds margin).
+    let router = router
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("x-frame-options"),
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("referrer-policy"),
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ));
+
     Ok(router)
 }
