@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-04-18
+
+Security and stability hardening release. No new user-facing
+features; every change exists to make 0.1.8 safer to run and
+harder to break. The auth layer closes an email-enumeration
+timing side channel — unknown-email and no-password-hash branches
+now burn an Argon2 verify against a process-local dummy hash to
+flatten the latency tell. The WS reconnect path grows proper
+semantics: counter reset deferred until `SessionState` arrives
+(not at TCP-upgrade time), prior socket handlers detached before
+reconnect, and broadcast `Lagged` now forces a transient close so
+the client replays scrollback via `SessionState` instead of
+desyncing its VT state. The recording subsystem tightens six
+edges — a partial unique index on `(session_id) WHERE
+status='recording'` closing the double-start race, UTC-normalised
+`expires_at` so lex comparisons agree with wall-clock expiry,
+share tokens moved off URL query strings into an `X-Share-Token`
+header to foreclose access-log exfiltration, create-share input
+validation at the API boundary, observable storage-error logging
+on the join-time recording lookup, and a tokio-async writer that
+no longer parks a worker thread on fsync. The gateway gains
+baseline security response headers (`X-Frame-Options: DENY`,
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-
+origin-when-cross-origin`). The Docker runtime image now runs as
+unprivileged `telepair:10001` with a baked-in `/api/health`
+HEALTHCHECK. CI adds `cargo audit` + `npm audit` as a merge
+gate, and a new `SECURITY.md` publishes the coordinated-
+disclosure channel. Drop-in upgrade from 0.1.8: migration 003 is
+idempotent, and the only breaking change is for out-of-tree
+callers that hand-crafted `?token=` URLs against the recording
+data endpoint (see the share-token fix below).
+
 ### Removed
 
 - `ClientMessage::CursorMove` and `ServerMessage::PeerCursor` are
@@ -32,9 +64,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operators don't have to wait for the idle reaper. History rows
   stamp a new `CloseReason::Admin` (surfaced as "Closed by admin"
   on the dashboard) so the action isn't misattributed to the owner.
+- Baseline security response headers on every route (API, static
+  assets, SPA shell, WebSocket upgrade responses), applied via
+  `tower_http::set_header::SetResponseHeaderLayer::if_not_present`
+  so individual handlers can still override: `X-Frame-Options:
+  DENY` (the terminal surface is a prime clickjacking target),
+  `X-Content-Type-Options: nosniff` (relevant for served `.cast`
+  recording downloads), and `Referrer-Policy: strict-origin-when-
+  cross-origin`. A full CSP is intentionally deferred — the
+  policy that covers xterm.js + SolidJS hydration needs per-page
+  verification and belongs in a dedicated change.
+- `SECURITY.md` now publishes the coordinated-disclosure channel
+  (private email, 3-business-day acknowledgement, 7-business-day
+  triage, fix in next patch release) and the deployment-hardening
+  expectations running operators should honour: terminate TLS in
+  front of the gateway, keep `~/.telepair/` restricted, run as an
+  unprivileged user, and rate-limit the unauthenticated auth
+  endpoints at the reverse proxy on top of the built-in per-IP
+  throttle.
+- Dockerfile now runs the runtime image as an unprivileged system
+  user `telepair` with fixed uid/gid 10001 so bind-mounted host
+  volumes have predictable ownership across image versions. Data
+  directory moves from `/root/.telepair` to
+  `/home/telepair/.telepair` to match the unprivileged home. The
+  image also bakes in a `HEALTHCHECK` against `/api/health` (30 s
+  interval, 15 s start-period, 3-retry threshold), and pulls in
+  `curl` alongside `ca-certificates` for that sole purpose.
+- CI now runs `cargo audit` and `npm audit` as a merge-gating
+  `security-audit` job. Any RUSTSEC advisory fails the job; any
+  production-tree npm advisory at `high` or `critical` fails the
+  job. Dev-only advisories (vite / playwright chain) are
+  surfaced with `continue-on-error` so they stay visible in the
+  log without blocking merges. A CVE landing in a transitive dep
+  now blocks merges until the affected crate is bumped.
 
 ### Fixed
 
+- Bumped `rustls-webpki` from 0.103.10 to 0.103.12 to pick up
+  the fixes for **RUSTSEC-2026-0098** (name constraints for URI
+  names were incorrectly accepted) and **RUSTSEC-2026-0099**
+  (name constraints accepted for certificates asserting a
+  wildcard name). Both advisories were filed 2026-04-14 and
+  caught on the v0.1.9 prepare PR by the new `cargo audit` merge
+  gate. Reach is via `rustls-webpki ← rustls 0.23.37 ←
+  tokio-rustls ← lettre 0.11.21 ← telepair-control`, i.e. every
+  outbound SMTP TLS handshake that validates the mail server's
+  certificate. `cargo update -p rustls-webpki` is a single-line
+  `Cargo.lock` change, so the fix is covered even though the
+  concrete exposure requires a hostile SMTP provider presenting
+  a crafted intermediate.
+- `cargo audit` now passes in CI against the full advisory
+  database. After the `rustls-webpki` bump, the only remaining
+  hard failure was **RUSTSEC-2023-0071** (`rsa 0.9.10` Marvin
+  Attack — timing sidechannel in RSA decryption / signing).
+  `rsa` reaches our tree only via `sqlx-mysql` →
+  `sqlx-macros-core` → `sqlx-macros` (proc-macro). Telepair
+  enables only `runtime-tokio` + `sqlite` on `sqlx`, so
+  `sqlx-mysql` is pulled in solely by the compile-time macro
+  expander for `query!` error messages; no RSA primitive is
+  linked into or invoked by the shipping binary, and the gateway
+  does not expose any surface that would feed attacker-
+  controllable ciphertexts through `rsa`. Upstream reports "No
+  fixed upgrade is available!" so there is nothing to bump. A
+  new `.cargo/audit.toml` ignores the advisory with the full
+  rationale and a reassessment trigger list (revisit if sqlx
+  ships a rsa-less `sqlx-macros-core`, if telepair enables a
+  non-sqlite sqlx runtime driver, or if the advisory severity is
+  raised). The two remaining warnings (`serial` unmaintained via
+  `portable-pty`, `rand 0.8.5` unsound) stay non-blocking — they
+  are warnings, not denies.
+- Login no longer leaks registration state via response latency.
+  Pre-fix, `login("unknown@x", anything)` short-circuited without
+  touching Argon2 while `login("known@x", "wrong")` spent ~50 ms
+  hashing, so an unauthenticated attacker could enumerate
+  registered addresses by response time alone — the shared
+  `GENERIC_AUTH_ERROR` string defeats response-body enumeration
+  but not response-time enumeration. A process-local
+  `DUMMY_LOGIN_HASH` (lazy Argon2 hash of a placeholder,
+  regenerated on every process start) now backs a
+  `burn_dummy_verify` helper that runs one `verify_password` on a
+  blocking thread on the unknown-email and no-password-hash
+  branches, flattening the latency tell. The locked-row branch
+  intentionally stays non-hashing (it has already produced five
+  prior Argon2-paying attempts, and hashing during lockout would
+  be a CPU-DoS gift to credential stuffers). Adds
+  `login_unknown_email_burns_argon2_for_timing_parity`, which
+  measures median latency of the two branches and asserts
+  ≥ 10 ms with ≤ 3x spread — wide enough to survive loaded CI
+  runners while catching the pre-fix ~50x spread.
+- `PtyManager::drop` no longer stalls the tokio worker on child
+  reap. Previously `impl Drop` called `child.wait()` inline,
+  which is a synchronous blocking syscall; because drops happen
+  on a worker thread during session teardown, each reap parked a
+  whole async worker until cleanup finished. Under a burst of
+  session closures (or on heavier Windows/macOS reap paths) this
+  was visible worker-pool starvation. `child` is now
+  `Option<Box<dyn Child>>` so `Drop` can take ownership, issue
+  the non-blocking `kill()` inline, and hand the blocking
+  `wait()` off to `spawn_blocking` on the current tokio runtime.
+  With no runtime in scope (CLI paths, raw sync tests) the inline
+  wait is kept — it's only a problem to block when sitting on a
+  tokio worker. `drop_does_not_stall_tokio_worker` spawns a
+  long-running `sleep 30`, drops the manager, and asserts the
+  drop returns within 500 ms as a smoke regression.
+- `ws.onopen` no longer resets the reconnect counter before the
+  server has accepted the session join. Pre-fix, the TCP upgrade
+  completing was treated as success, so a gateway that rejected
+  the join immediately afterwards (bad token, missing session,
+  transient storage error) collapsed the exponential backoff
+  into a tight client-side retry storm that kept hammering the
+  refusal. The reset is now deferred to the first `SessionState`
+  message — the real "fully joined" checkpoint — so a rejected
+  upgrade keeps climbing the backoff as intended and a later
+  success still cleanly zeroes attempts for the next disconnect.
+  Two vitest regressions (`does not reset retry counter until
+  SessionState arrives`, `resets retry counter on SessionState
+  after prior rejections`) pin the invariant.
+- `find_active_recording` in the WS join handler no longer
+  silently swallows storage errors. The previous `_ => None`
+  match arm collapsed `Ok(None)` and `Err(_)` into the same
+  answer, so a transient SQLite read error was indistinguishable
+  from "no active recording" and left no log trail — operators
+  could not correlate a missing `RecordingStatusInfo` on the
+  client with a flaky DB read. Errors now emit a
+  `tracing::warn!` with session id and error before the `None`
+  fallback, preserving the client contract while making failures
+  observable.
 - Disabled-then-re-enabled user's session tab no longer lingers
   in zombie state. `PeerEvicted` now self-detects: `account_disabled`
   refreshes the identity and routes home (dashboard shows the
@@ -236,6 +391,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer loads until a user opens a session or recording. This
   also clears the 500 kB single-chunk warning the build emitted
   on every CI run.
+
+### Testing
+
+- Cargo test count: **416 → 442** (all green). New coverage
+  includes `login_unknown_email_burns_argon2_for_timing_parity`
+  (auth timing parity), `drop_does_not_stall_tokio_worker` (PTY
+  reap offload smoke), eleven `assert_safe_sql_ident` /
+  `assert_safe_sql_type` unit tests pinning the accept / reject
+  matrix for `SqliteStorage::ensure_column`, and storage / gateway
+  coverage for migration 003's partial unique index, UTC-
+  normalised `expires_at` round-trip, and the `X-Share-Token`
+  header path on `GET /api/recordings/:id/data`.
+- Vitest count: **194 → 219** (all green). New coverage:
+  `Session.test.ts` (7 tests — three-gate notification AND,
+  visibility-state edge cases, anonymous viewer),
+  `RecordingPlayer.test.ts` (6 tests — hash token capture, scrub,
+  hostile fragments, `replaceState` failure fallback),
+  `terminal-themes.test.ts` (5 tests — theme / font lookup on
+  first paint), plus WS reconnect counter regressions (`does not
+  reset retry counter until SessionState arrives`, `resets retry
+  counter on SessionState after prior rejections`) and a
+  `PlaybackEngine` single-timer invariant (`vi.getTimerCount()`
+  + seek-from-playing path).
+- Playwright count: **51 → 52** (all green). New spec assertion
+  `share token in query string is NOT honoured (log-hygiene
+  regression)` pins the header-only share-token path against any
+  future `?token=` reintroduction.
 
 ## [0.1.8] - 2026-04-17
 
