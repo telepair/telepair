@@ -11,7 +11,6 @@
 /// dropped, the recording is marked `failed` rather than
 /// `completed`, so the API/UI never silently serve a capture with
 /// gaps in it.
-use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +18,8 @@ use std::time::Instant;
 
 use telepair_core::recording::{AsciicastHeader, RecordingEvent};
 use telepair_core::storage::{SqliteStorage, Storage};
+use tokio::fs::File;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 
@@ -148,7 +149,17 @@ async fn run_writer(
     }
 
     // ── Open file ────────────────────────────────────────────────────
-    let file = match std::fs::File::create(&file_path) {
+    //
+    // All file I/O from here on uses `tokio::fs` + `tokio::io::BufWriter`
+    // — the previous `std::fs` + `std::io::BufWriter` stack blocked the
+    // tokio worker that happened to drive this task on every slow
+    // disk op. On busy hosts that meant a single hung fsync could
+    // stall every other task scheduled on the same worker (PTY
+    // output fan-out, WS forwarders, HTTP handlers), not just this
+    // recording. Async IO yields control back to the scheduler
+    // while the disk is working, so the blast radius now stops at
+    // this task.
+    let file = match File::create(&file_path).await {
         Ok(f) => f,
         Err(e) => {
             error!(
@@ -163,14 +174,11 @@ async fn run_writer(
     let mut writer = BufWriter::new(file);
 
     // ── Write header ─────────────────────────────────────────────────
-    let header_bytes = header_written_bytes(&header_json_str(&header));
-    {
-        // Scope ensures format temporaries are gone before the first await.
-        let write_result = write_header(&mut writer, &header);
-        if let Err(e) = write_result {
-            error!(recording_id = %recording_id, error = %e, "recording writer: failed to write header");
-            abort_writer!();
-        }
+    let header_json = header_json_str(&header);
+    let header_bytes = header_written_bytes(&header_json);
+    if let Err(e) = write_line(&mut writer, &header_json).await {
+        error!(recording_id = %recording_id, error = %e, "recording writer: failed to write header");
+        abort_writer!();
     }
 
     // ── Event loop ───────────────────────────────────────────────────
@@ -187,8 +195,7 @@ async fn run_writer(
             // 1-second timeout — flush if anything is pending.
             Err(_timeout) => {
                 if unflushed_bytes > 0 {
-                    let flush_result = writer.flush();
-                    if let Err(e) = flush_result {
+                    if let Err(e) = writer.flush().await {
                         error!(recording_id = %recording_id, error = %e, "recording writer: periodic flush failed");
                         abort_writer!();
                     }
@@ -206,9 +213,7 @@ async fn run_writer(
                 let line = event.to_asciicast_line(elapsed);
                 let line_len = line.len() + 1; // +1 for the newline
 
-                // Perform the write and capture the result before any await.
-                let write_result = writeln!(writer, "{line}");
-                if let Err(e) = write_result {
+                if let Err(e) = write_line(&mut writer, &line).await {
                     error!(recording_id = %recording_id, error = %e, "recording writer: write failed");
                     abort_writer!();
                 }
@@ -218,8 +223,7 @@ async fn run_writer(
                 unflushed_bytes += line_len;
 
                 if unflushed_bytes >= FLUSH_THRESHOLD_BYTES {
-                    let flush_result = writer.flush();
-                    if let Err(e) = flush_result {
+                    if let Err(e) = writer.flush().await {
                         error!(recording_id = %recording_id, error = %e, "recording writer: threshold flush failed");
                         abort_writer!();
                     }
@@ -229,13 +233,17 @@ async fn run_writer(
         }
     }
 
-    // ── Final flush ──────────────────────────────────────────────────
-    {
-        let flush_result = writer.flush();
-        if let Err(e) = flush_result {
-            error!(recording_id = %recording_id, error = %e, "recording writer: final flush failed");
-            abort_writer!();
-        }
+    // ── Final flush + shutdown ───────────────────────────────────────
+    //
+    // `shutdown().await` flushes the BufWriter AND closes the
+    // underlying `tokio::fs::File`, which on most platforms calls
+    // `close(2)` (not `fsync`) but also releases any kernel buffers
+    // held by the tokio runtime. Skipping this used to leak the FD
+    // until the task fully unwound; under high recording churn that
+    // added up.
+    if let Err(e) = writer.shutdown().await {
+        error!(recording_id = %recording_id, error = %e, "recording writer: shutdown failed");
+        abort_writer!();
     }
     drop(writer);
     // Graceful path: drop the cleanup explicitly. The hub already
@@ -245,7 +253,8 @@ async fn run_writer(
     drop(on_failure_slot);
 
     // ── Complete DB row ──────────────────────────────────────────────
-    let file_size = std::fs::metadata(&file_path)
+    let file_size = tokio::fs::metadata(&file_path)
+        .await
         .map(|m| m.len() as i64)
         .unwrap_or(bytes_written as i64);
     let duration_ms = start.elapsed().as_millis() as i64;
@@ -283,7 +292,7 @@ async fn run_writer(
     }
 }
 
-// ── Helpers (sync, no await) ──────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────
 
 fn header_json_str(header: &AsciicastHeader) -> String {
     serde_json::to_string(header).unwrap_or_default()
@@ -293,12 +302,15 @@ fn header_written_bytes(json: &str) -> usize {
     json.len() + 1 // +1 for the trailing newline
 }
 
-fn write_header(
-    writer: &mut BufWriter<std::fs::File>,
-    header: &AsciicastHeader,
-) -> std::io::Result<()> {
-    let json = header_json_str(header);
-    writeln!(writer, "{json}")
+/// Write one NDJSON line (content + trailing `\n`) to the async
+/// buffered writer. Issuing a single `write_all` per payload and a
+/// second for the newline keeps the framing byte-for-byte identical
+/// to the previous `writeln!(...)`-based emit; callers that parse
+/// the file line-by-line (asciicast v2 consumers) see no change.
+async fn write_line(writer: &mut BufWriter<File>, line: &str) -> std::io::Result<()> {
+    writer.write_all(line.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    Ok(())
 }
 
 async fn mark_failed(storage: &Arc<SqliteStorage>, recording_id: &str) {

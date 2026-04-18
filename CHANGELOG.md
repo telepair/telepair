@@ -72,6 +72,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `initPlayer` flow now checks an abort latch after every `await`
   (metadata fetch, data download, microtask yield) and bails
   before initialising xterm if the component has been cleaned up.
+- Recording writer task (`spawn_recording_writer`) now uses
+  `tokio::fs` + `tokio::io::BufWriter` for file creation, per-event
+  writes, periodic and threshold flushes, and final shutdown. The
+  previous `std::fs` + `std::io::BufWriter` stack blocked the
+  tokio worker thread on every slow disk op — a single hung fsync
+  could stall every other task scheduled on the same worker (PTY
+  output fan-out, WS forwarders, HTTP handlers), not just the
+  recording that triggered it. With async IO the scheduler yields
+  while the disk is working and the blast radius is confined to
+  the writer task.
 - WebSocket forwarder now closes with `CLOSE_CODE_TRANSIENT` (4503)
   when the output or collab broadcast receivers drop messages (the
   `tokio::sync::broadcast::error::RecvError::Lagged` arm).
