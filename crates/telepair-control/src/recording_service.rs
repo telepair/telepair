@@ -210,9 +210,19 @@ impl RecordingService {
     /// pick it up on the next cleaner pass", which is a meaningful
     /// caller intent (e.g. the `expire_recording` endpoint when the
     /// global TTL is 0).
+    ///
+    /// The stored string is **always** normalised to UTC with a
+    /// `+00:00` offset, never the caller's original timezone. Without
+    /// this the lexicographic compare against `now_rfc3339()` (which
+    /// always ends in `+00:00`) produces impossible orderings on
+    /// timezone-offset input: a caller submitting
+    /// `2099-01-01T00:00:00+14:00` (actually `2098-12-31T10:00:00Z`)
+    /// makes the row lexically greater than every realistic `now()`,
+    /// indefinitely surviving the cleaner even after its wall-clock
+    /// expiry — and the mirror DoS with `-14:00` purges it early.
     pub async fn set_expiry(&self, id: &str, expires_at: &str) -> Result<()> {
-        validate_rfc3339(expires_at)?;
-        self.storage.set_recording_expiry(id, expires_at).await
+        let normalised = validate_rfc3339_utc(expires_at)?;
+        self.storage.set_recording_expiry(id, &normalised).await
     }
 
     /// Create a share token for a recording. Returns `(raw_token,
@@ -242,9 +252,17 @@ impl RecordingService {
                 "max_uses must be >= 0 (0 = unlimited), got {max_uses}"
             )));
         }
-        if let Some(raw) = expires_at {
-            validate_future_rfc3339(raw)?;
-        }
+        // Normalise the caller's timezone offset to UTC before storage.
+        // See `set_expiry` for the full rationale — TL;DR the consume
+        // SQL does a lexicographic compare against `now_rfc3339()`
+        // (which always ends in `+00:00`), so leaving a `+14:00` /
+        // `-14:00` offset in the stored string lets an attacker mint
+        // shares that linger past their declared wall-clock expiry or
+        // die hours before it.
+        let normalised_expires_at = match expires_at {
+            Some(raw) => Some(validate_future_rfc3339_utc(raw)?),
+            None => None,
+        };
 
         // Verify the recording exists.
         self.storage
@@ -257,7 +275,12 @@ impl RecordingService {
 
         let row = self
             .storage
-            .create_recording_share(recording_id, &sha256_hex, max_uses, expires_at)
+            .create_recording_share(
+                recording_id,
+                &sha256_hex,
+                max_uses,
+                normalised_expires_at.as_deref(),
+            )
             .await?;
 
         Ok((raw_token, row))
@@ -314,17 +337,25 @@ impl RecordingService {
     }
 }
 
-/// Parse-only check for RFC3339. Both `expires_at` columns are
-/// queried with lexicographic string compares against `now_rfc3339()`,
-/// so a non-RFC3339 value silently produces unpredictable orderings.
-/// Reject at the API boundary so bad input never reaches storage.
-fn validate_rfc3339(raw: &str) -> Result<DateTime<Utc>> {
+/// Parse an RFC3339 timestamp and return its **UTC-normalised**
+/// string form. Both `expires_at` columns are queried with
+/// lexicographic string compares against `now_rfc3339()` (which
+/// always emits a `+00:00` offset). Storing the caller's original
+/// offset would therefore yield wrong orderings on any non-UTC
+/// input — a `2099-01-01T00:00:00+14:00` value is wall-clock equal
+/// to `2098-12-31T10:00:00+00:00`, but lexically greater than every
+/// realistic `now()` for the next seven decades.
+///
+/// Returning the normalised string (not just the parsed
+/// `DateTime<Utc>`) keeps the callers honest: whatever they pass to
+/// storage is guaranteed lex-comparable with `now_rfc3339()`.
+fn validate_rfc3339_utc(raw: &str) -> Result<String> {
     let parsed = DateTime::parse_from_rfc3339(raw).map_err(|e| {
         Error::InvalidInput(format!(
             "expires_at must be an RFC3339 timestamp (e.g. 2026-12-31T23:59:59Z): {e}"
         ))
     })?;
-    Ok(parsed.with_timezone(&Utc))
+    Ok(parsed.with_timezone(&Utc).to_rfc3339())
 }
 
 /// Stricter check used at share-mint time: RFC3339 *and* in the
@@ -335,14 +366,22 @@ fn validate_rfc3339(raw: &str) -> Result<DateTime<Utc>> {
 /// diagnose. `set_expiry` does NOT use this check because a past
 /// timestamp on a recording is a legitimate "expire ASAP" signal for
 /// the cleaner.
-fn validate_future_rfc3339(raw: &str) -> Result<()> {
-    let parsed = validate_rfc3339(raw)?;
-    if parsed <= Utc::now() {
+///
+/// Like `validate_rfc3339_utc`, returns the normalised UTC string so
+/// non-UTC offsets are stripped before the value reaches storage.
+fn validate_future_rfc3339_utc(raw: &str) -> Result<String> {
+    let parsed = DateTime::parse_from_rfc3339(raw).map_err(|e| {
+        Error::InvalidInput(format!(
+            "expires_at must be an RFC3339 timestamp (e.g. 2026-12-31T23:59:59Z): {e}"
+        ))
+    })?;
+    let utc = parsed.with_timezone(&Utc);
+    if utc <= Utc::now() {
         return Err(Error::InvalidInput(format!(
             "expires_at must be in the future, got {raw}"
         )));
     }
-    Ok(())
+    Ok(utc.to_rfc3339())
 }
 
 #[cfg(test)]
@@ -987,5 +1026,89 @@ mod tests {
         svc.set_expiry(&rec.id, &future)
             .await
             .expect("future expires_at must be accepted");
+    }
+
+    /// `expires_at` is lex-compared against `now_rfc3339()` (which
+    /// always ends in `+00:00`), so a caller timezone offset that
+    /// leaks into storage would let an attacker extend or shorten
+    /// the wall-clock lifetime:
+    ///
+    /// * `…+14:00` is wall-clock equal to `-14h` UTC, but lexically
+    ///   *greater* than every realistic `now()` for decades — the
+    ///   cleaner never picks it up.
+    /// * `…-12:00` does the mirror DoS: the same instant is lex
+    ///   less-than `now()` and the cleaner purges the share before
+    ///   its declared expiry.
+    ///
+    /// Both `set_expiry` and `create_share` must therefore rewrite
+    /// the stored string to UTC. This test pins the contract by
+    /// minting inputs with non-zero offsets and asserting the
+    /// stored row ends in `+00:00`.
+    #[tokio::test]
+    async fn expires_at_is_normalised_to_utc_regardless_of_caller_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+        let svc = RecordingService::new(storage.clone(), test_config(dir.path()));
+
+        let (user, _) = storage.create_user("tester", false).await.unwrap();
+        let session = storage
+            .create_session_with_owner(
+                user.id,
+                "local-shell",
+                telepair_core::session::InputMode::Serialized,
+                None,
+            )
+            .await
+            .unwrap();
+        let rec = svc
+            .create_recording(&session.id, user.id, 80, 24)
+            .await
+            .unwrap();
+
+        // Pick a point clearly in the future no matter where the
+        // test runs: now + 10 days, then re-expressed through a
+        // `+14:00` offset. The wall-clock instant is unchanged but
+        // the raw string looks lexically much larger.
+        let wall_clock = Utc::now() + chrono::Duration::days(10);
+        let plus_14 = wall_clock
+            .with_timezone(&chrono::FixedOffset::east_opt(14 * 3600).unwrap())
+            .to_rfc3339();
+        assert!(
+            plus_14.ends_with("+14:00"),
+            "test precondition: raw input must carry the non-UTC offset, got {plus_14}",
+        );
+
+        let (_raw, share) = svc
+            .create_share(&rec.id, 1, Some(&plus_14))
+            .await
+            .expect("future expires_at must be accepted");
+        let stored = share.expires_at.as_deref().expect("expires_at stored");
+        assert!(
+            stored.ends_with("+00:00"),
+            "create_share must normalise to UTC (+00:00), got {stored}",
+        );
+
+        // Same deal on `set_expiry` — the +14:00 input round-trips
+        // into a +00:00 row.
+        svc.set_expiry(&rec.id, &plus_14)
+            .await
+            .expect("future expires_at must be accepted");
+        let fetched = storage.get_recording(&rec.id).await.unwrap().unwrap();
+        let stored = fetched.expires_at.as_deref().expect("expires_at stored");
+        assert!(
+            stored.ends_with("+00:00"),
+            "set_expiry must normalise to UTC (+00:00), got {stored}",
+        );
+
+        // Negative-offset mirror: same wall-clock instant behind a
+        // `-12:00` offset must also land as `+00:00`.
+        let minus_12 = wall_clock
+            .with_timezone(&chrono::FixedOffset::west_opt(12 * 3600).unwrap())
+            .to_rfc3339();
+        assert!(minus_12.ends_with("-12:00"));
+        svc.set_expiry(&rec.id, &minus_12).await.unwrap();
+        let fetched = storage.get_recording(&rec.id).await.unwrap().unwrap();
+        let stored = fetched.expires_at.as_deref().unwrap();
+        assert!(stored.ends_with("+00:00"), "got {stored}");
     }
 }
