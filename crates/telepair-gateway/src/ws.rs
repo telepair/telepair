@@ -452,7 +452,15 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: AppState) {
             recording_id: rec.id,
             started_at: rec.started_at,
         }),
-        _ => None,
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(
+                session = %session_id,
+                error = %e,
+                "failed to load active recording status; reporting none to the joining client",
+            );
+            None
+        }
     };
 
     let state_msg = ServerMessage::SessionState {
