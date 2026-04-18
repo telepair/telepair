@@ -82,6 +82,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against a guest token for a microtask. Storage writes and
   `tokenChange` listener dispatch remain outside `batch()` because
   they're not reactive signals.
+- `InviteDialog` now exposes proper modal semantics to assistive
+  tech and supports keyboard dismissal. The root container picks up
+  `role="dialog"`, `aria-modal="true"`, and `aria-labelledby` tied
+  to the `<h3>` title so screen readers announce the dialog on
+  open, and the dialog node takes focus on every transition from
+  closed → open. A window-scoped `keydown` listener (attached only
+  while `open` is true, cleaned up via `onCleanup`) maps `Escape`
+  to the existing close path, bringing the dialog in line with
+  `CreateSessionDialog` / `ShareRecordingDialog` and restoring the
+  "hit Esc to back out" affordance keyboard-only owners expect.
 - `Terminal.tsx` font-load callback now bails out cleanly if the
   component has already been unmounted. The
   `document.fonts.load(...).then(...)` promise resolves on a later
