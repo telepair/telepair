@@ -30,12 +30,44 @@ import {
 
 const MAX_CHAT_HISTORY = 500;
 
-function shouldNotify(senderId: string): boolean {
+/**
+ * Decide whether a chat message should raise a browser
+ * notification. Three independent gates must all pass, and each one
+ * is there for a specific UX reason that's easy to regress:
+ *
+ * - `notificationsEnabled` — user preference kill-switch. Respected
+ *   even when the browser has granted permission, because the user
+ *   may have toggled it off in our settings panel after granting.
+ * - `document.visibilityState !== 'visible'` — we never notify while
+ *   the tab is foregrounded; the chat panel is already on screen and
+ *   a popup would be noise.
+ * - `senderId !== currentUserId` — owner / operator typing in their
+ *   own session must not be notified about their own messages.
+ *
+ * Exported so `shouldNotify.test.ts` can pin the AND-of-three
+ * contract without having to mount the whole session page.
+ */
+export function shouldNotify(
+  senderId: string,
+  opts: {
+    notificationsEnabled: boolean;
+    visibilityState: DocumentVisibilityState;
+    currentUserId: string | null;
+  },
+): boolean {
   return (
-    terminalSettings().notificationsEnabled &&
-    document.visibilityState !== 'visible' &&
-    senderId !== auth.currentUserId()
+    opts.notificationsEnabled &&
+    opts.visibilityState !== 'visible' &&
+    senderId !== opts.currentUserId
   );
+}
+
+function shouldNotifyFromStores(senderId: string): boolean {
+  return shouldNotify(senderId, {
+    notificationsEnabled: terminalSettings().notificationsEnabled,
+    visibilityState: document.visibilityState,
+    currentUserId: auth.currentUserId(),
+  });
 }
 
 export default function SessionPage() {
@@ -206,7 +238,7 @@ export default function SessionPage() {
           `peer-joined:${msg.user_id}`,
           t('chat.system_joined', { name: msg.name }),
         );
-        if (shouldNotify(msg.user_id)) {
+        if (shouldNotifyFromStores(msg.user_id)) {
           notify('telepair', t('notifications.joined', { name: msg.name }));
         }
         break;
@@ -270,7 +302,7 @@ export default function SessionPage() {
           ...prev.slice(-(MAX_CHAT_HISTORY - 1)),
           { user_id: msg.user_id, name: msg.name, text: msg.text, ts: msg.ts },
         ]);
-        if (shouldNotify(msg.user_id)) {
+        if (shouldNotifyFromStores(msg.user_id)) {
           notify('telepair', `${msg.name}: ${msg.text}`);
         }
         break;

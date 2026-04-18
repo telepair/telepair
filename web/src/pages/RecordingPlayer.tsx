@@ -27,8 +27,12 @@ import EventTimeline from '../components/EventTimeline';
  * Runs synchronously at render time so no byte of the token leaks to
  * `document.referrer` on any subsequent navigation — if we deferred
  * to `onMount` a user could right-click → Copy Link first.
+ *
+ * Exported so the unit test suite can pin the privacy contract
+ * (token captured + fragment scrubbed + no exception on hostile
+ * input) without having to boot the whole player component.
  */
-function captureShareTokenFromHash(): string | undefined {
+export function captureShareTokenFromHash(): string | undefined {
   if (typeof window === 'undefined') return undefined;
   const hash = window.location.hash;
   if (!hash || hash.length < 2) return undefined;

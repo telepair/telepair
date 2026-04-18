@@ -100,6 +100,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against a guest token for a microtask. Storage writes and
   `tokenChange` listener dispatch remain outside `batch()` because
   they're not reactive signals.
+- `shouldNotify` (chat / peer-joined notification gate in
+  `Session.tsx`) and `captureShareTokenFromHash` (the fragment-based
+  share-token reader in `RecordingPlayer.tsx`) are now both exported
+  and unit-tested. The three big terminal-shaped components
+  (`Session`, `RecordingPlayer`, `Terminal`) were previously
+  untested in vitest — full component-level tests require mocking
+  xterm / WebGL / FitAddon / WebSocket / router and aren't worth
+  the churn, so the cheaper win is to pull the privacy-critical
+  and UX-critical pure logic out and pin it directly. The store-
+  aware wrapper `shouldNotifyFromStores` retains the same behaviour
+  for the live component. Adds `Session.test.ts` (7 tests covering
+  the three-gate AND, visibility-state edge cases, and anonymous
+  viewer) and `RecordingPlayer.test.ts` (6 tests covering
+  extraction, scrub, hostile fragments, and replaceState failure
+  paths). `terminal-themes.test.ts` (5 tests) adds shallow
+  coverage for the theme / font lookup that Terminal.tsx binds at
+  first paint — a missing theme id or a silently-null `fontCss`
+  fallback would produce invisible text or a font collapse, which
+  are the worst kind of UX regression.
 - `PlaybackEngine` no longer pre-registers a `setTimeout` for every
   remaining event when `play()` is called. The previous design
   walked the full `events` array at play time and pushed one timer
