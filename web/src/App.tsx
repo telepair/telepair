@@ -1,20 +1,26 @@
 // web/src/App.tsx
 import { Router, Route, Navigate } from '@solidjs/router';
-import { Show, onMount, type JSX } from 'solid-js';
+import { Show, onMount, lazy, type JSX } from 'solid-js';
 import { auth } from './stores/auth';
 import { I18nProvider } from './i18n';
+// Login and Register stay eager: they're the entry for unauthenticated
+// users and the SPA shell cannot paint anything useful without one of
+// them already parsed. Everything else is lazy so the first-paint bundle
+// no longer drags xterm.js, the admin tables, or the recording player
+// into every visit. SolidJS Router accepts `lazy()` components directly
+// as `component=` values — Vite/Rolldown splits each into its own chunk.
 import Login from './pages/Login';
 import Register from './pages/Register';
-import Dashboard from './pages/Dashboard';
-import Session from './pages/Session';
-import Join from './pages/Join';
-import AdminTargets from './pages/AdminTargets';
-import AdminUsers from './pages/AdminUsers';
-import AdminAudit from './pages/AdminAudit';
-import AdminSystem from './pages/AdminSystem';
-import ChangePassword from './pages/ChangePassword';
-import Recordings from './pages/Recordings';
-import RecordingPlayer from './pages/RecordingPlayer';
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+const Session = lazy(() => import('./pages/Session'));
+const Join = lazy(() => import('./pages/Join'));
+const AdminTargets = lazy(() => import('./pages/AdminTargets'));
+const AdminUsers = lazy(() => import('./pages/AdminUsers'));
+const AdminAudit = lazy(() => import('./pages/AdminAudit'));
+const AdminSystem = lazy(() => import('./pages/AdminSystem'));
+const ChangePassword = lazy(() => import('./pages/ChangePassword'));
+const Recordings = lazy(() => import('./pages/Recordings'));
+const RecordingPlayer = lazy(() => import('./pages/RecordingPlayer'));
 import ToastContainer from './components/Toast';
 
 function AuthGuard(props: { children: JSX.Element }) {
