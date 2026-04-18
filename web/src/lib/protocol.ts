@@ -140,7 +140,6 @@ export interface UserTargetInfo {
 export type ClientMessage =
   | { type: 'SessionJoin'; session_id: string; token: string; cols: number; rows: number }
   | { type: 'TermResize'; cols: number; rows: number }
-  | { type: 'CursorMove'; x: number; y: number }
   | { type: 'ChatMessage'; text: string };
 
 // --- Server → Client ---
@@ -190,7 +189,6 @@ export type ServerMessage =
       reason: 'account_disabled' | 'token_rotated';
     }
   | { type: 'PeerRoleChanged'; user_id: string; new_role: Role }
-  | { type: 'PeerCursor'; user_id: string; x: number; y: number }
   | { type: 'PeerChat'; user_id: string; name: string; text: string; ts: string }
   | { type: 'InputDenied'; reason: InputDeniedReason }
   | { type: 'Error'; code: string; message: string }

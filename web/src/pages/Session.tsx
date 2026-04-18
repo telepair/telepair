@@ -302,8 +302,6 @@ export default function SessionPage() {
           }
         }
         break;
-      case 'PeerCursor':
-        break;
       case 'InputDenied':
         handleInputDenied(msg.reason);
         break;

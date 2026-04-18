@@ -144,7 +144,7 @@ Browser                     telepair (single process)
 | 通道 | 容量 | 内容 |
 |------|------|------|
 | `output_tx` | 256 条 | PTY 字节(作为原始二进制 WS 帧转发) |
-| `collab_tx` | 64 条 | `PeerJoined`、`PeerLeft`、`PeerChat`、`PeerCursor`、`PeerRoleChanged` |
+| `collab_tx` | 64 条 | `PeerJoined`、`PeerLeft`、`PeerChat`、`PeerRoleChanged` |
 
 分离是为了确保高频的终端输出不会把协作消息饿死。两者都用 `tokio::broadcast` —— 接收端太慢时会丢掉最旧的消息。
 

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- `ClientMessage::CursorMove` and `ServerMessage::PeerCursor` are
+  removed from the WS protocol. The round-trip was half-wired: the
+  frontend never emitted `CursorMove` (no caller in `web/src/`), and
+  the `PeerCursor` handler in `Session.tsx` was a bare `break`, so
+  the entire path was dead code. The server was still spending
+  budget on it (per-connection rate-limit state `last_cursor_at`,
+  the `CURSOR_MIN_INTERVAL` constant, fan-out into the collab
+  broadcast channel, and a dedicated e2e throttle test). Removing
+  the variants cleans up the protocol surface (both `protocol.md`
+  and the Rust enum), drops `e2e_cursor_move_rate_limited` and its
+  `cursor_msg` helper, and drops the architecture-doc row claiming
+  `collab_tx` carries `PeerCursor` frames. A future collaborative-
+  cursor feature should land as a freshly-designed variant (overlay
+  rendering, per-peer color, viewport coord translation) rather
+  than reanimating this stub.
+
 ### Added
 
 - Admins can force-close sessions they don't own (`DELETE

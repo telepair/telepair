@@ -73,18 +73,6 @@ fn chat_msg(text: &str) -> Message {
     )
 }
 
-fn cursor_msg(x: u16, y: u16) -> Message {
-    Message::Text(
-        serde_json::json!({
-            "type": "CursorMove",
-            "x": x,
-            "y": y
-        })
-        .to_string()
-        .into(),
-    )
-}
-
 fn parse_server_msg(msg: &Message) -> Option<ServerMessage> {
     match msg {
         Message::Text(text) => serde_json::from_str::<ServerMessage>(text).ok(),
@@ -618,60 +606,6 @@ async fn e2e_oversized_chat_dropped() {
             "oversized chat should be dropped before the short one"
         );
     }
-
-    let _ = ws_a.close(None).await;
-    let _ = ws_b.close(None).await;
-}
-
-// ─── Scenario 7: Cursor move rate limited ───────────────
-
-#[tokio::test]
-async fn e2e_cursor_move_rate_limited() {
-    let (addr, state) = start_server().await;
-
-    let (session_id, token_a, _) = create_owned_session(&state, "alice").await;
-    let (token_b, _) = add_participant(&state, &session_id, "bob", Role::Operator).await;
-
-    let mut ws_a = join_session(&addr, &session_id, &token_a).await;
-    let mut ws_b = join_session(&addr, &session_id, &token_b).await;
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Blast 20 cursor moves with no delay. With a 33 ms throttle, at most 1
-    // should be broadcast.
-    for i in 0..20_u16 {
-        ws_a.send(cursor_msg(i, i)).await.unwrap();
-    }
-
-    // Anchor: send a chat message AFTER the cursor flood so we have a
-    // guaranteed-delivered signal to stop reading.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    ws_a.send(chat_msg("done")).await.unwrap();
-
-    let mut cursor_count = 0_usize;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match ws_b.next().await {
-                Some(Ok(ref msg)) => {
-                    if let Some(sm) = parse_server_msg(msg) {
-                        match sm {
-                            ServerMessage::PeerCursor { .. } => cursor_count += 1,
-                            ServerMessage::PeerChat { text, .. } if text == "done" => return,
-                            _ => {}
-                        }
-                    }
-                }
-                _ => return,
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for anchor chat");
-
-    assert!(
-        cursor_count <= 2,
-        "expected at most 2 cursor broadcasts from a 20-move flood, got {cursor_count}"
-    );
 
     let _ = ws_a.close(None).await;
     let _ = ws_b.close(None).await;

@@ -229,7 +229,7 @@ struct LiveSession {
     /// Subscribe to PTY output. Uses `Bytes` so broadcast cloning is a cheap
     /// refcount bump per subscriber instead of a per-chunk `Vec<u8>` copy.
     output_tx: broadcast::Sender<Bytes>,
-    /// Broadcast collaboration messages (PeerJoined, PeerLeft, PeerChat, PeerCursor).
+    /// Broadcast collaboration messages (PeerJoined, PeerLeft, PeerChat).
     collab_tx: broadcast::Sender<ServerMessage>,
     /// Signal to all connected WS handlers that this session is being force-stopped
     shutdown_tx: broadcast::Sender<()>,

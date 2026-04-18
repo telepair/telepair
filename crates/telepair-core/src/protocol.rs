@@ -101,10 +101,6 @@ pub enum ClientMessage {
         cols: u16,
         rows: u16,
     },
-    CursorMove {
-        x: u16,
-        y: u16,
-    },
     ChatMessage {
         text: String,
     },
@@ -197,11 +193,6 @@ pub enum ServerMessage {
     PeerRoleChanged {
         user_id: Uuid,
         new_role: Role,
-    },
-    PeerCursor {
-        user_id: Uuid,
-        x: u16,
-        y: u16,
     },
     PeerChat {
         user_id: Uuid,
