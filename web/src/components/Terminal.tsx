@@ -40,6 +40,17 @@ export default function Terminal(props: TerminalProps) {
   // callbacks; keeping it outside the xterm option bag means we avoid
   // touching internal xterm APIs that differ across minor versions.
   let readOnly = false;
+  // `disposed` guards async callbacks that outlive the component.
+  // Specifically: `document.fonts.load(...)` resolves on a later tick
+  // and used to call into `fitAddon`/`webglAddon` unconditionally —
+  // if the component unmounted while the font was still loading
+  // (navigation away from a session, lazy route swap), those addons
+  // had already been disposed by `onCleanup` and the webgl addon in
+  // particular throws on `clearTextureAtlas` against a torn-down
+  // GL context. Setting the latch in `onCleanup` and checking it at
+  // the top of every late callback keeps the component's lifetime
+  // well-defined even under fast mount/unmount cycles.
+  let disposed = false;
 
   onMount(() => {
     if (!containerRef) return;
@@ -84,10 +95,21 @@ export default function Terminal(props: TerminalProps) {
 
     // When the async webfont lands, purge cached glyph textures and
     // refit so character cells are re-measured against the real font.
+    //
+    // The `disposed` guard is load-bearing: this promise can resolve
+    // tens of ms after mount, and if the component unmounts in
+    // between (lazy route swap, session close), `onCleanup` has
+    // already torn down the webgl addon. Calling
+    // `clearTextureAtlas` on a disposed addon throws (the underlying
+    // GL context is gone), which used to bubble up as an unhandled
+    // rejection visible in the console on every navigation-during-
+    // font-load. The latch also protects `fitAddon`, which would
+    // otherwise refit a terminal that has already been `dispose()`d.
     if (typeof document !== 'undefined' && document.fonts?.load) {
       document.fonts
         .load(`${s.fontSize}px "JetBrainsMono Nerd Font Mono"`)
         .then(() => {
+          if (disposed) return;
           webglAddon?.clearTextureAtlas();
           fitAddon?.fit();
         })
@@ -191,6 +213,11 @@ export default function Terminal(props: TerminalProps) {
   });
 
   onCleanup(() => {
+    // Flip the latch BEFORE tearing down addons so any in-flight
+    // `document.fonts.load(...).then(...)` callback observes the
+    // unmount and bails out before touching the now-disposed webgl
+    // context.
+    disposed = true;
     clearTimeout(resizeTimer);
     resizeObserver?.disconnect();
     if (onVisibilityChange) {

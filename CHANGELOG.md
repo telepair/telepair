@@ -72,6 +72,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `initPlayer` flow now checks an abort latch after every `await`
   (metadata fetch, data download, microtask yield) and bails
   before initialising xterm if the component has been cleaned up.
+- `Terminal.tsx` font-load callback now bails out cleanly if the
+  component has already been unmounted. The
+  `document.fonts.load(...).then(...)` promise resolves on a later
+  tick, and on a fast mount/unmount cycle (lazy route swap, closing
+  a session while the webfont is still loading) it used to call
+  `clearTextureAtlas()` against a disposed WebGL addon, which
+  throws because the underlying GL context is already gone. A
+  `disposed` latch is flipped in `onCleanup` and checked at the
+  top of the callback so the post-unmount path is a pure no-op.
 - Recording writer task (`spawn_recording_writer`) now uses
   `tokio::fs` + `tokio::io::BufWriter` for file creation, per-event
   writes, periodic and threshold flushes, and final shutdown. The
