@@ -80,6 +80,17 @@ export class TelepairSocket {
 
   private doConnect() {
     this.onStatus('connecting');
+    // Detach handlers from any prior socket before overwriting the
+    // field. Without this, a `reconnectNow()` issued while the old
+    // socket is still mid-close fires the old `onclose` against the
+    // new `this`, triggering a ghost `scheduleReconnect()` that
+    // races the fresh attempt.
+    if (this.ws) {
+      this.ws.onopen = null;
+      this.ws.onmessage = null;
+      this.ws.onclose = null;
+      this.ws.onerror = null;
+    }
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${protocol}//${location.host}/ws/session/${this.sessionId}`;
     this.ws = new WebSocket(url);
