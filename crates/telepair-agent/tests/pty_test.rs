@@ -155,8 +155,7 @@ async fn env_vars_are_passed_to_child() {
 async fn drop_does_not_stall_tokio_worker() {
     // `sleep 30` would outlive the test without an explicit kill,
     // so the drop path is the only thing that reaps it.
-    let pty =
-        PtyManager::spawn_command("sleep", &["30"], 80, 24, &HashMap::new()).unwrap();
+    let pty = PtyManager::spawn_command("sleep", &["30"], 80, 24, &HashMap::new()).unwrap();
 
     let start = std::time::Instant::now();
     drop(pty);
