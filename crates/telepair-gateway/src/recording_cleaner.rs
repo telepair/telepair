@@ -55,9 +55,9 @@ async fn run_once(storage: &Arc<SqliteStorage>, dir: &std::path::Path) {
     for rec in expired {
         // Best-effort file removal. A missing file is not an error — it
         // may have been cleaned up by another process or a previous
-        // partial run. Any other I/O failure is logged as a warning and
-        // we still proceed with the DB deletion so the row doesn't
-        // accumulate indefinitely.
+        // partial run. Any other I/O failure leaves the DB row in place
+        // so a future cleaner pass (or an operator) still has the
+        // authoritative pointer needed to retry the delete.
         if let Some(ref path_str) = rec.file_path {
             let path = PathBuf::from(path_str);
             // If the stored path is relative, resolve it against `dir`.
@@ -88,6 +88,7 @@ async fn run_once(storage: &Arc<SqliteStorage>, dir: &std::path::Path) {
                         error = %e,
                         "TTL cleaner: failed to remove recording file"
                     );
+                    continue;
                 }
             }
         }
@@ -224,5 +225,52 @@ mod tests {
         run_once(&storage, dir.path()).await;
 
         assert!(storage.get_recording(id).await.unwrap().is_none());
+    }
+
+    /// A real file-removal failure must preserve the DB row so the next
+    /// cleaner pass still knows which path to retry. Using a directory
+    /// in place of the `.cast` file makes `remove_file` fail on every
+    /// platform without relying on permissions.
+    #[tokio::test]
+    async fn cleaner_preserves_row_when_file_remove_fails() {
+        let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+        let dir = tempfile::tempdir().unwrap();
+
+        let (user, _) = storage.create_user("iofailuser", false).await.unwrap();
+        let session = storage
+            .create_session_with_owner(user.id, "default", InputMode::Serialized, None)
+            .await
+            .unwrap();
+
+        let id = "rec_file_remove_fails";
+        let file_name = format!("{id}.cast");
+        let path = dir.path().join(&file_name);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("sentinel"), b"").unwrap();
+
+        storage
+            .create_recording(
+                id,
+                &session.id,
+                user.id,
+                80,
+                24,
+                &file_name,
+                Some("2020-01-01T00:00:00+00:00"),
+            )
+            .await
+            .unwrap();
+        storage.complete_recording(id, 1000, 5, 512).await.unwrap();
+
+        run_once(&storage, dir.path()).await;
+
+        assert!(
+            path.exists(),
+            "directory standing in for the file must survive the failed remove"
+        );
+        assert!(
+            storage.get_recording(id).await.unwrap().is_some(),
+            "DB row must survive a non-NotFound file removal error"
+        );
     }
 }

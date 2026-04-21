@@ -35,8 +35,14 @@
 //! bearer message (the header-extractor no longer wiring into the
 //! share branch).
 
+use std::sync::Arc;
+
 use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode};
+use axum::http::{Request, StatusCode, header};
+use telepair_agent::virtual_target::TargetEngine;
+use telepair_core::recording::RecordingConfig;
+use telepair_core::session::InputMode;
+use telepair_core::storage::{SqliteStorage, Storage};
 use telepair_gateway::build_router;
 use telepair_gateway::state::AppState;
 use tower::ServiceExt;
@@ -50,14 +56,27 @@ async fn body_error_message(body: Body) -> String {
         .to_string()
 }
 
-async fn setup() -> axum::Router {
-    let state = AppState::new_test().await;
-    build_router(state)
+async fn setup() -> (axum::Router, AppState, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(SqliteStorage::new_memory().await.unwrap());
+    let state = AppState::new(
+        storage,
+        TargetEngine::empty(),
+        None,
+        None,
+        dir.path().join("data"),
+        RecordingConfig {
+            dir: dir.path().join("recordings"),
+            ..RecordingConfig::default()
+        },
+    )
+    .await;
+    (build_router(state.clone()), state, dir)
 }
 
 #[tokio::test]
 async fn recording_data_without_credentials_returns_401_unauthorized() {
-    let app = setup().await;
+    let (app, _, _dir) = setup().await;
     let resp = app
         .oneshot(
             Request::get("/api/recordings/any-id/data")
@@ -85,7 +104,7 @@ async fn recording_data_query_token_is_not_honoured() {
     // "share token". Asserting the bare `Unauthorized` body locks in
     // the log-exfil fix: the query param is ignored and the
     // unauthenticated caller trips the standard auth gate instead.
-    let app = setup().await;
+    let (app, _, _dir) = setup().await;
     let resp = app
         .oneshot(
             Request::get("/api/recordings/any-id/data?token=whatever-raw-token")
@@ -114,7 +133,7 @@ async fn recording_data_x_share_token_header_routes_into_share_validation() {
     // the `Error::Auth` message, bearer missing returns the bare
     // canonical reason. Asserting on the message proves the header
     // extractor wired into the share branch.
-    let app = setup().await;
+    let (app, _, _dir) = setup().await;
     let resp = app
         .oneshot(
             Request::get("/api/recordings/any-id/data")
@@ -135,4 +154,116 @@ async fn recording_data_x_share_token_header_routes_into_share_validation() {
         "X-Share-Token header must route into share-validation, not \
          bearer auth. Expected body to mention 'share token'; got {msg:?}"
     );
+}
+
+#[tokio::test]
+async fn recording_data_missing_file_does_not_consume_share_use() {
+    let (app, state, _dir) = setup().await;
+    let (user, _) = state.storage.create_user("owner", false).await.unwrap();
+    let session = state
+        .storage
+        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized, None)
+        .await
+        .unwrap();
+    let rec = state
+        .storage
+        .create_recording(
+            "rec_share_missing_file",
+            &session.id,
+            user.id,
+            80,
+            24,
+            "rec_share_missing_file.cast",
+            None,
+        )
+        .await
+        .unwrap();
+    state
+        .storage
+        .complete_recording(&rec.id, 1000, 1, 64)
+        .await
+        .unwrap();
+    let (raw_share, share) = state
+        .recording
+        .create_share(&rec.id, 1, None)
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/recordings/{}/data", rec.id))
+                .header("X-Share-Token", raw_share)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let shares = state.storage.list_recording_shares(&rec.id).await.unwrap();
+    assert_eq!(shares.len(), 1);
+    assert_eq!(shares[0].token_sha256, share.token_sha256);
+    assert_eq!(
+        shares[0].used_count, 0,
+        "failed file read must not burn a share use"
+    );
+}
+
+#[tokio::test]
+async fn recording_data_success_sets_private_no_store_cache_headers() {
+    let (app, state, _dir) = setup().await;
+    let (user, token) = state.storage.create_user("owner", false).await.unwrap();
+    let session = state
+        .storage
+        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized, None)
+        .await
+        .unwrap();
+    let rec = state
+        .storage
+        .create_recording(
+            "rec_download_headers",
+            &session.id,
+            user.id,
+            80,
+            24,
+            "rec_download_headers.cast",
+            None,
+        )
+        .await
+        .unwrap();
+    state
+        .storage
+        .complete_recording(&rec.id, 1000, 1, 64)
+        .await
+        .unwrap();
+
+    let path = state.recording.recording_file_path(&rec.id);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"cast-data").unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/recordings/{}/data", rec.id))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "private, no-store"
+    );
+    assert_eq!(
+        resp.headers().get(header::VARY).unwrap(),
+        "Authorization, X-Share-Token"
+    );
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/x-asciicast"
+    );
+
+    let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+    assert_eq!(bytes.as_ref(), b"cast-data");
 }

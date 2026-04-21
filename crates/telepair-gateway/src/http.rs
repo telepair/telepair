@@ -2176,6 +2176,13 @@ pub async fn start_recording(
     Path(session_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = extract_user(&state, &headers).await?;
+    require_session_enabled(
+        &state,
+        &user,
+        "POST /api/sessions/{id}/recording/start",
+        Some(session_id.as_str()),
+    )
+    .await?;
     // Owner + active gate — mirrors `require_active_owned`.
     state
         .sessions
@@ -2323,6 +2330,13 @@ pub async fn stop_recording(
     Path(session_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = extract_user(&state, &headers).await?;
+    require_session_enabled(
+        &state,
+        &user,
+        "POST /api/sessions/{id}/recording/stop",
+        Some(session_id.as_str()),
+    )
+    .await?;
     state
         .sessions
         .require_active_owned(&user, &session_id)
@@ -2467,10 +2481,10 @@ pub async fn get_recording_data(
     // UPDATE that consumes a use — without this, an attacker holding
     // a valid token for recording A could burn its quota by hitting
     // recording B's URL.
-    if let Some(ref raw_token) = share_token {
+    if let Some(raw_token) = share_token.as_deref() {
         state
             .recording
-            .validate_share_token(raw_token, &recording_id)
+            .check_share_token(raw_token, &recording_id)
             .await?;
     } else {
         // Auth-header path: owner or admin.
@@ -2489,6 +2503,15 @@ pub async fn get_recording_data(
         ApiError::bare(StatusCode::NOT_FOUND)
     })?;
 
+    // Delay the usage burn until after the file read succeeds so a
+    // transient/missing `.cast` cannot consume a limited-use share.
+    if let Some(raw_token) = share_token.as_deref() {
+        state
+            .recording
+            .validate_share_token(raw_token, &recording_id)
+            .await?;
+    }
+
     axum::http::Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/x-asciicast")
@@ -2496,6 +2519,8 @@ pub async fn get_recording_data(
             header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{recording_id}.cast\""),
         )
+        .header(header::CACHE_CONTROL, "private, no-store")
+        .header(header::VARY, "Authorization, X-Share-Token")
         .body(axum::body::Body::from(data))
         .map_err(|_| ApiError::bare(StatusCode::INTERNAL_SERVER_ERROR))
 }

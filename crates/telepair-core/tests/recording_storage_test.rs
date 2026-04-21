@@ -91,6 +91,68 @@ async fn recording_storage_fail_recording() {
 }
 
 #[tokio::test]
+async fn recording_storage_complete_does_not_overwrite_failed_status() {
+    let store = setup().await;
+    let (user_id, session_id) = seed(&store).await;
+
+    let rec = store
+        .create_recording(
+            "rec_failed_terminal",
+            &session_id,
+            user_id,
+            80,
+            24,
+            "/tmp/failed_terminal.cast",
+            None,
+        )
+        .await
+        .unwrap();
+
+    store.fail_recording(&rec.id).await.unwrap();
+    store
+        .complete_recording(&rec.id, 5000, 42, 8192)
+        .await
+        .unwrap();
+
+    let fetched = store.get_recording(&rec.id).await.unwrap().unwrap();
+    assert_eq!(fetched.status, RecordingStatus::Failed.as_str());
+    assert_eq!(fetched.duration_ms, None);
+    assert_eq!(fetched.event_count, 0);
+    assert_eq!(fetched.file_size, 0);
+}
+
+#[tokio::test]
+async fn recording_storage_fail_does_not_overwrite_completed_status() {
+    let store = setup().await;
+    let (user_id, session_id) = seed(&store).await;
+
+    let rec = store
+        .create_recording(
+            "rec_completed_terminal",
+            &session_id,
+            user_id,
+            80,
+            24,
+            "/tmp/completed_terminal.cast",
+            None,
+        )
+        .await
+        .unwrap();
+
+    store
+        .complete_recording(&rec.id, 5000, 42, 8192)
+        .await
+        .unwrap();
+    store.fail_recording(&rec.id).await.unwrap();
+
+    let fetched = store.get_recording(&rec.id).await.unwrap().unwrap();
+    assert_eq!(fetched.status, RecordingStatus::Completed.as_str());
+    assert_eq!(fetched.duration_ms, Some(5000));
+    assert_eq!(fetched.event_count, 42);
+    assert_eq!(fetched.file_size, 8192);
+}
+
+#[tokio::test]
 async fn recording_storage_list_recordings_for_user() {
     let store = setup().await;
     let (user_id, session_id) = seed(&store).await;
@@ -236,6 +298,47 @@ async fn recording_storage_share_crud() {
         .await
         .unwrap();
     assert!(gone.is_none());
+}
+
+#[tokio::test]
+async fn recording_storage_peek_share_does_not_consume() {
+    let store = setup().await;
+    let (user_id, session_id) = seed(&store).await;
+
+    let rec = store
+        .create_recording(
+            "rec_share_peek",
+            &session_id,
+            user_id,
+            80,
+            24,
+            "/tmp/share_peek.cast",
+            None,
+        )
+        .await
+        .unwrap();
+
+    store
+        .create_recording_share(&rec.id, "hash_peek", 1, None)
+        .await
+        .unwrap();
+
+    let preview = store
+        .peek_recording_share("hash_peek", &rec.id)
+        .await
+        .unwrap()
+        .expect("preview should succeed");
+    assert_eq!(preview.used_count, 0);
+
+    let fetched = store.list_recording_shares(&rec.id).await.unwrap();
+    assert_eq!(fetched[0].used_count, 0, "peek must not increment usage");
+
+    let consumed = store
+        .consume_recording_share("hash_peek", &rec.id)
+        .await
+        .unwrap()
+        .expect("consume should still succeed after peek");
+    assert_eq!(consumed.used_count, 1);
 }
 
 /// Regression for the cross-recording revoke bug: before the fix,

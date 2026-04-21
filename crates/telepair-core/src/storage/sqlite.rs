@@ -2359,7 +2359,7 @@ impl Storage for SqliteStorage {
             "UPDATE recordings \
              SET status = ?, duration_ms = ?, event_count = ?, \
                  file_size = ?, completed_at = ? \
-             WHERE id = ?",
+             WHERE id = ? AND status = ?",
         )
         .bind(RecordingStatus::Completed.as_str())
         .bind(duration_ms)
@@ -2367,24 +2367,51 @@ impl Storage for SqliteStorage {
         .bind(file_size)
         .bind(&now_str)
         .bind(id)
+        .bind(RecordingStatus::Recording.as_str())
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
-            return Err(Error::InvalidInput(format!("recording {id} not found")));
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM recordings WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            return match status.as_deref() {
+                None => Err(Error::InvalidInput(format!("recording {id} not found"))),
+                Some("completed" | "failed") => Ok(()),
+                Some(other) => Err(Error::InvalidInput(format!(
+                    "recording {id} is in unexpected status {other}"
+                ))),
+            };
         }
         Ok(())
     }
 
     async fn fail_recording(&self, id: &str) -> Result<()> {
         let now_str = now_rfc3339();
-        let result = sqlx::query("UPDATE recordings SET status = ?, completed_at = ? WHERE id = ?")
-            .bind(RecordingStatus::Failed.as_str())
-            .bind(&now_str)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE recordings SET status = ?, completed_at = ? \
+             WHERE id = ? AND status = ?",
+        )
+        .bind(RecordingStatus::Failed.as_str())
+        .bind(&now_str)
+        .bind(id)
+        .bind(RecordingStatus::Recording.as_str())
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
-            return Err(Error::InvalidInput(format!("recording {id} not found")));
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM recordings WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            return match status.as_deref() {
+                None => Err(Error::InvalidInput(format!("recording {id} not found"))),
+                Some("completed" | "failed") => Ok(()),
+                Some(other) => Err(Error::InvalidInput(format!(
+                    "recording {id} is in unexpected status {other}"
+                ))),
+            };
         }
         Ok(())
     }
@@ -2501,6 +2528,26 @@ impl Storage for SqliteStorage {
             expires_at: expires_at.map(|s| s.to_string()),
             created_at: now_str,
         })
+    }
+
+    async fn peek_recording_share(
+        &self,
+        token_sha256: &str,
+        expected_recording_id: &str,
+    ) -> Result<Option<RecordingShareRow>> {
+        let row = sqlx::query(
+            "SELECT * FROM recording_shares \
+             WHERE token_sha256 = ? \
+               AND recording_id = ? \
+               AND (max_uses = 0 OR used_count < max_uses) \
+               AND (expires_at IS NULL OR expires_at > ?)",
+        )
+        .bind(token_sha256)
+        .bind(expected_recording_id)
+        .bind(now_rfc3339())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| row_to_recording_share(&r)))
     }
 
     async fn consume_recording_share(

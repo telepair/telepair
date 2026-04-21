@@ -316,6 +316,23 @@ impl RecordingService {
             .ok_or_else(|| Error::Auth("invalid, expired, or exhausted share token".into()))
     }
 
+    /// Read-only share validation. Same auth semantics as
+    /// [`Self::validate_share_token`] but leaves `used_count`
+    /// untouched so callers can defer the burn until after any
+    /// downstream side-effect (for example a `.cast` file read)
+    /// actually succeeds.
+    pub async fn check_share_token(
+        &self,
+        raw_token: &str,
+        expected_recording_id: &str,
+    ) -> Result<RecordingShareRow> {
+        let sha256_hex = token_sha256(raw_token);
+        self.storage
+            .peek_recording_share(&sha256_hex, expected_recording_id)
+            .await?
+            .ok_or_else(|| Error::Auth("invalid, expired, or exhausted share token".into()))
+    }
+
     /// List all share tokens for a recording.
     pub async fn list_shares(&self, recording_id: &str) -> Result<Vec<RecordingShareRow>> {
         self.storage.list_recording_shares(recording_id).await

@@ -466,6 +466,20 @@ pub trait Storage: Send + Sync {
         expires_at: Option<&str>,
     ) -> Result<RecordingShareRow>;
 
+    /// Read-only validation for a recording share token. Applies the
+    /// same ownership / expiry / remaining-uses predicates as
+    /// [`Self::consume_recording_share`] but does NOT increment
+    /// `used_count`.
+    ///
+    /// Used by the recording download path to fail invalid credentials
+    /// with 401 before touching the filesystem, while still delaying
+    /// the actual counter burn until after the `.cast` read succeeds.
+    async fn peek_recording_share(
+        &self,
+        token_sha256: &str,
+        expected_recording_id: &str,
+    ) -> Result<Option<RecordingShareRow>>;
+
     /// Atomically validate and consume a share token. Single SQL
     /// statement that increments `used_count` only when ALL of the
     /// following hold:

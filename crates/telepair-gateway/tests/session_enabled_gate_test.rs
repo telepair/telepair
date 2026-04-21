@@ -186,6 +186,88 @@ async fn create_session_enabled_user_succeeds() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 }
 
+#[tokio::test]
+async fn start_recording_disabled_owner_is_403_and_emits_audit() {
+    let (app, _, storage) = setup().await;
+    let (user_id, token) = seed_disabled(&storage, "disabled-rec-start").await;
+    let session = storage
+        .create_session_with_owner(user_id, "local-shell", InputMode::Serialized, None)
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::post(format!("/api/sessions/{}/recording/start", session.id))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(
+        storage
+            .find_active_recording(&session.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "disabled user must be rejected before any recording row is created"
+    );
+    assert_audit_denied(
+        &storage,
+        "POST /api/sessions/{id}/recording/start",
+        Some(user_id),
+        Some(&session.id),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn stop_recording_disabled_owner_is_403_and_emits_audit() {
+    let (app, _, storage) = setup().await;
+    let (user_id, token) = seed_disabled(&storage, "disabled-rec-stop").await;
+    let session = storage
+        .create_session_with_owner(user_id, "local-shell", InputMode::Serialized, None)
+        .await
+        .unwrap();
+    storage
+        .create_recording(
+            "rec_disabled_stop",
+            &session.id,
+            user_id,
+            80,
+            24,
+            "rec_disabled_stop.cast",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::post(format!("/api/sessions/{}/recording/stop", session.id))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let active = storage
+        .find_active_recording(&session.id)
+        .await
+        .unwrap()
+        .expect("seeded recording should still be active");
+    assert_eq!(active.id, "rec_disabled_stop");
+    assert_audit_denied(
+        &storage,
+        "POST /api/sessions/{id}/recording/stop",
+        Some(user_id),
+        Some(&session.id),
+    )
+    .await;
+}
+
 // ── WS gate: GET /ws/session/{id} ────────────────────────────────────
 
 /// Bind the router to an ephemeral port so tungstenite can upgrade.
