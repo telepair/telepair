@@ -13,6 +13,7 @@ use telepair_core::auth::TokenAuthProvider;
 use telepair_core::recording::RecordingConfig;
 use telepair_core::storage::{SqliteStorage, Storage};
 
+use crate::origin::OriginPolicy;
 use crate::rate_limit::{DEFAULT_REGISTER_MIN_INTERVAL, RegisterRateLimiter};
 use crate::session_hub::{ReaperConfig, SessionHub};
 
@@ -86,6 +87,11 @@ pub struct AppState {
     /// misconfigured operator fails closed to "per-socket IP", which
     /// is the safe default.
     pub trust_forwarded_headers: bool,
+    /// Browser-origin policy shared by HTTP CORS and WebSocket upgrades.
+    /// `Arc` so per-request `AppState::clone()` doesn't reallocate the
+    /// allowlist `Vec`. Set by `build_router_with_options` from the
+    /// operator's CORS flags.
+    pub origin_policy: Arc<OriginPolicy>,
 }
 
 impl AppState {
@@ -153,6 +159,7 @@ impl AppState {
             smtp_configured,
             auth_rl: Some(auth_rl),
             trust_forwarded_headers: false,
+            origin_policy: Arc::new(OriginPolicy::default()),
         }
     }
 
@@ -200,6 +207,7 @@ impl AppState {
             // swapping this to `Some(...)` on the returned AppState.
             auth_rl: None,
             trust_forwarded_headers: false,
+            origin_policy: Arc::new(OriginPolicy::default()),
         }
     }
 

@@ -6,7 +6,8 @@ use axum::{
         Path, State, WebSocketUpgrade,
         ws::{CloseFrame, Message, WebSocket},
     },
-    response::IntoResponse,
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
 };
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
@@ -35,12 +36,26 @@ const MAX_CHAT_BYTES: usize = 4 * 1024;
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     Path(session_id): Path<String>,
     State(state): State<AppState>,
-) -> impl IntoResponse {
+) -> Response {
+    if !state
+        .origin_policy
+        .allows_ws_origin(headers.get(header::ORIGIN), headers.get(header::HOST))
+    {
+        tracing::warn!(
+            origin = ?headers.get(header::ORIGIN),
+            host = ?headers.get(header::HOST),
+            "rejected WebSocket upgrade from disallowed origin"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
     ws.max_frame_size(MAX_WS_FRAME_BYTES)
         .max_message_size(MAX_WS_FRAME_BYTES)
         .on_upgrade(move |socket| handle_socket(socket, session_id, state))
+        .into_response()
 }
 
 /// Close a session row whose WS-phase launch failed so it doesn't

@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 pub mod http;
+pub mod origin;
 pub mod rate_limit;
 pub mod recording_cleaner;
 pub mod recording_writer;
@@ -10,6 +11,7 @@ pub mod ws;
 
 use std::convert::Infallible;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum::{
     Router,
@@ -20,17 +22,10 @@ use axum::{
 use bytes::Bytes;
 use state::AppState;
 use tower::service_fn;
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
-/// Default loopback origins allowed when the operator does not pass
-/// `--allowed-origins` or `--allow-any-origin`. These match the Vite
-/// dev server documented in CLAUDE.md (`npm run dev` on :5173 proxies
-/// /api and /ws to :7700). Prod deployments serve the frontend from
-/// the same origin as the API, so CORS is skipped entirely by the
-/// browser — no need to list :7700 here.
-const DEFAULT_LOOPBACK_ORIGINS: &[&str] = &["http://localhost:5173", "http://127.0.0.1:5173"];
+use origin::{DEFAULT_LOOPBACK_ORIGINS, OriginPolicy};
 
 /// CORS policy for `build_router_with_options`. A typed enum instead of
 /// a sentinel empty-list so we can't accidentally fall back to "allow
@@ -54,19 +49,16 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 pub fn build_router_with_options(
-    state: AppState,
+    mut state: AppState,
     web_dir: Option<&str>,
     cors: CorsMode,
 ) -> Result<Router, String> {
-    let cors = match cors {
+    let origin_policy = match cors {
         CorsMode::AllowAny => {
             tracing::warn!(
                 "CORS: allowing any origin — only safe in dev or behind a CORS-enforcing proxy"
             );
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any)
+            OriginPolicy::allow_any()
         }
         CorsMode::Origins(list) => {
             // Empty list → tighten to loopback dev defaults instead of
@@ -103,12 +95,11 @@ pub fn build_router_with_options(
                 }
             }
 
-            CorsLayer::new()
-                .allow_origin(AllowOrigin::list(parsed))
-                .allow_methods(Any)
-                .allow_headers(Any)
+            OriginPolicy::origins(parsed)
         }
     };
+    let cors = origin_policy.cors_layer();
+    state.origin_policy = Arc::new(origin_policy);
 
     let api = Router::new()
         .route("/api/health", get(http::health))
@@ -312,10 +303,7 @@ pub fn build_router_with_options(
     //
     // `if_not_present` so any individual handler that needs a
     // different value can still set one — the defaults are a
-    // safety net, not an override. Headers are deliberately
-    // conservative: CSP is intentionally omitted here because the
-    // policy that covers xterm.js + SolidJS hydration needs
-    // per-page verification and belongs in a dedicated change.
+    // safety net, not an override.
     //
     // - `X-Frame-Options: DENY` — the terminal surface is a
     //   clickjacking target; block all framing.
@@ -324,7 +312,29 @@ pub fn build_router_with_options(
     // - `Referrer-Policy: strict-origin-when-cross-origin` — leaks
     //   no path info cross-origin (share-link URLs carry digests in
     //   the path since v0.1.8 but the policy still adds margin).
+    // - `Content-Security-Policy` — limits token exfiltration blast
+    //   radius if a future XSS lands. `style-src 'unsafe-inline'` is
+    //   required by the current component-local style tags.
+    //   `connect-src 'self'` covers same-origin `wss://` upgrades on
+    //   modern browsers (CSP3); the gateway never opens cross-origin
+    //   sockets, so no `ws:`/`wss:` wildcard is needed.
     let router = router
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static(
+                "default-src 'self'; \
+                 script-src 'self'; \
+                 style-src 'self' 'unsafe-inline'; \
+                 img-src 'self' data: blob:; \
+                 font-src 'self' data:; \
+                 connect-src 'self'; \
+                 worker-src 'self' blob:; \
+                 object-src 'none'; \
+                 base-uri 'self'; \
+                 form-action 'self'; \
+                 frame-ancestors 'none'",
+            ),
+        ))
         .layer(SetResponseHeaderLayer::if_not_present(
             HeaderName::from_static("x-frame-options"),
             HeaderValue::from_static("DENY"),

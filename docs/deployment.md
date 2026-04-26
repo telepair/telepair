@@ -161,7 +161,7 @@ See the [README](../README.md#virtual-targets) for targets.yaml format.
 
 ### CORS
 
-telepair serves a same-origin frontend in production, so when the browser fetches `/api` and `/ws` from the same host that served `index.html`, CORS is bypassed entirely and no extra config is required. You only need to think about CORS when the frontend lives on a different origin than the API:
+telepair serves a same-origin frontend in production, so when the browser fetches `/api` and opens `/ws` from the same host that served `index.html`, the browser-origin checks pass without extra config. HTTP uses CORS response headers; WebSocket upgrades validate the `Origin` header before accepting the handshake. You only need to think about allowed origins when the frontend lives on a different origin than the API:
 
 - **Reverse-proxy deployment (recommended).** nginx terminates TLS, serves `/` and proxies `/api` + `/ws/` to `127.0.0.1:7700`. Same-origin from the browser's point of view — no CORS flags needed.
 - **Direct exposure without a proxy.** If you host the frontend on a different domain (e.g. serving `web/dist` from a CDN while the API runs elsewhere), you must pass the exact frontend origin:
@@ -172,7 +172,7 @@ telepair serves a same-origin frontend in production, so when the browser fetche
   ```
 
   Comma-separate to allow multiple. Malformed origins abort startup — a typo can never silently degrade to an empty list.
-- **Default (no flag).** Falls back to `http://localhost:5173, http://127.0.0.1:5173` for the Vite dev server only. This is intentionally **not** "allow any" — earlier versions defaulted to `*` and that was a footgun.
+- **Default (no flag).** Falls back to `http://localhost:5173, http://127.0.0.1:5173` for the Vite dev server and always allows same-host browser WebSocket upgrades. This is intentionally **not** "allow any" — earlier versions defaulted to `*` and that was a footgun.
 - **`--allow-any-origin`.** Only safe in dev or when a reverse proxy enforces CORS upstream. Overrides `--allowed-origins`.
 
 ### Environment Variables

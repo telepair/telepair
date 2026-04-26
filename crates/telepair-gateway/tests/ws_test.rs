@@ -1,8 +1,12 @@
 #![deny(unsafe_code)]
 
+use axum::http::{HeaderValue, StatusCode};
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Message, client::IntoClientRequest},
+};
 
 use uuid::Uuid;
 
@@ -11,6 +15,7 @@ use telepair_core::protocol::ServerMessage;
 use telepair_core::session::{CloseReason, InputMode, Session};
 use telepair_core::storage::Storage;
 use telepair_gateway::state::AppState;
+use telepair_gateway::{CorsMode, build_router_with_options};
 
 /// Create a user and a session they own (owner participant row inserted
 /// atomically). Returns `(token, user_id, session)` so tests can skip
@@ -27,8 +32,12 @@ async fn owned_session(state: &AppState, username: &str) -> (String, Uuid, Sessi
 }
 
 async fn start_server() -> (String, AppState) {
+    start_server_with_cors(CorsMode::AllowAny).await
+}
+
+async fn start_server_with_cors(cors: CorsMode) -> (String, AppState) {
     let state = AppState::new_test().await;
-    let router = telepair_gateway::build_router(state.clone());
+    let router = build_router_with_options(state.clone(), None, cors).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move {
@@ -52,6 +61,49 @@ fn session_join_msg(session_id: &str, token: &str) -> Message {
         .to_string()
         .into(),
     )
+}
+
+#[tokio::test]
+async fn ws_rejects_disallowed_browser_origin() {
+    let (addr, state) = start_server_with_cors(CorsMode::Origins(vec![
+        "http://allowed.example.com".to_string(),
+    ]))
+    .await;
+    let (_token, _user_id, session) = owned_session(&state, "origin-guard").await;
+
+    let mut req = ws_url(&addr, &session.id).into_client_request().unwrap();
+    req.headers_mut().insert(
+        "Origin",
+        HeaderValue::from_static("http://evil.example.com"),
+    );
+
+    let err = match connect_async(req).await {
+        Ok(_) => panic!("disallowed browser origin must not upgrade"),
+        Err(err) => err,
+    };
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(resp) => {
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+        other => panic!("expected HTTP 403 handshake rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn ws_allows_same_host_origin_without_explicit_allowlist() {
+    let (addr, state) = start_server_with_cors(CorsMode::Origins(vec![])).await;
+    let (_token, _user_id, session) = owned_session(&state, "same-host-origin").await;
+
+    let mut req = ws_url(&addr, &session.id).into_client_request().unwrap();
+    req.headers_mut().insert(
+        "Origin",
+        HeaderValue::from_str(&format!("http://{addr}")).unwrap(),
+    );
+
+    let (mut ws, _) = connect_async(req)
+        .await
+        .expect("same-host browser origin should upgrade");
+    let _ = ws.close(None).await;
 }
 
 /// Parse a text WebSocket frame into a ServerMessage.
