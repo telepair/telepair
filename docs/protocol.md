@@ -240,4 +240,4 @@ The server enforces permissions on every action:
 | TermResize | Yes | Yes | Rejected |
 | ChatMessage | Yes | Yes | Yes |
 
-Rejected actions are **silently dropped** — the server does not send an `Error` message or close the connection. The client receives no feedback when a permission check fails. In serialized input mode, only the session owner can send terminal input; other operators' input is also silently dropped.
+Rejected terminal input is dropped server-side and the connection stays open. For binary terminal input, the server sends a one-shot `InputDenied` message so the client can explain the permission failure without turning a repeated keypress into a toast storm. In serialized input mode, only the session owner can send terminal input; other operators receive the same one-shot denial notice.
