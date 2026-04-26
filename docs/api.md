@@ -1130,7 +1130,7 @@ Get a single recording's metadata. Owner or admin.
 Download the asciicast v2 `.cast` file. Two access modes:
 
 1. **Bearer token** (owner or admin): standard `Authorization: Bearer <token>`.
-2. **Share token** (anonymous): pass the raw token in the `X-Share-Token: <raw_share_token>` request header. The server validates the token atomically (recording-id match + expiry + remaining uses + used_count++) in a single `UPDATE … RETURNING` — TOCTOU-safe.
+2. **Share token** (anonymous): pass the raw token in the `X-Share-Token: <raw_share_token>` request header. The server first checks that the token belongs to this recording and has not expired or exhausted its uses, reads the `.cast` file, then atomically increments `used_count` with `UPDATE … RETURNING`. A missing or unreadable file therefore does not consume a limited-use share token, while successful reads still use the atomic consume path.
 
 **Headers**
 | Header | Description |
@@ -1190,7 +1190,7 @@ Mint a signed share link. **Owner only** — admins who are not the owner are re
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_uses` | integer \| null | `0` (unlimited) | Maximum redemptions. `0` means no cap. |
+| `max_uses` | integer \| null | `1` (one-shot) | Maximum redemptions. `0` means no cap and should be used only for deliberately long-lived links. |
 | `expires_at` | string \| null | `null` (no TTL) | ISO 8601 UTC expiry timestamp. |
 
 **Response** `201 Created`
@@ -1208,7 +1208,7 @@ Mint a signed share link. **Owner only** — admins who are not the owner are re
 }
 ```
 
-The raw `token` is returned **exactly once** — only its SHA-256 is persisted in `recording_shares.token_sha256`. Hand the raw value to the viewer as `?token=...`.
+The raw `token` is returned **exactly once** — only its SHA-256 is persisted in `recording_shares.token_sha256`. Hand the raw value to the viewer in the URL fragment as `/recordings/{id}/play#token=...`; the player sends it back in the `X-Share-Token` header so the secret stays out of access logs.
 
 **Errors**
 - `401` / `403` / `404` — as above

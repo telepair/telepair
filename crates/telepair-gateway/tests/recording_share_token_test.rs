@@ -157,6 +157,51 @@ async fn recording_data_x_share_token_header_routes_into_share_validation() {
 }
 
 #[tokio::test]
+async fn create_recording_share_defaults_to_one_use() {
+    let (app, state, _dir) = setup().await;
+    let (user, token) = state
+        .storage
+        .create_user("share-owner", false)
+        .await
+        .unwrap();
+    let session = state
+        .storage
+        .create_session_with_owner(user.id, "local-shell", InputMode::Serialized, None)
+        .await
+        .unwrap();
+    let rec = state
+        .storage
+        .create_recording(
+            "rec_default_share_uses",
+            &session.id,
+            user.id,
+            80,
+            24,
+            "rec_default_share_uses.cast",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::post(format!("/api/recordings/{}/shares", rec.id))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["share"]["max_uses"].as_i64(), Some(1));
+    assert_eq!(json["share"]["used_count"].as_i64(), Some(0));
+}
+
+#[tokio::test]
 async fn recording_data_missing_file_does_not_consume_share_use() {
     let (app, state, _dir) = setup().await;
     let (user, _) = state.storage.create_user("owner", false).await.unwrap();

@@ -12,6 +12,13 @@ const SHARE_DATE_OPTIONS: Intl.DateTimeFormatOptions = {
   minute: '2-digit',
 };
 
+function formatUses(share: RecordingShare): string {
+  if (share.max_uses === 0) {
+    return `Uses: ${share.used_count} / unlimited`;
+  }
+  return `Uses: ${share.used_count} / ${share.max_uses}`;
+}
+
 export interface ShareRecordingDialogProps {
   recordingId: string;
   onClose: () => void;
@@ -164,7 +171,7 @@ export default function ShareRecordingDialog(props: ShareRecordingDialogProps): 
                       <div class="srd-share-info">
                         <span class="srd-share-prefix mono">…{share.token_sha256.slice(-8)}</span>
                         <span class="srd-share-meta">
-                          Uses: {share.used_count} / {share.max_uses}
+                          {formatUses(share)}
                         </span>
                         <Show when={share.expires_at}>
                           <span class="srd-share-expiry">

@@ -2545,7 +2545,7 @@ pub async fn create_recording_share(
     require_recording_access(&state, &recording_id, &user, false).await?;
 
     let Json(body) = body?;
-    let max_uses = body.max_uses.unwrap_or(0); // 0 = unlimited
+    let max_uses = body.max_uses.unwrap_or(1); // default one-shot; 0 = unlimited
     let (raw_token, share) = state
         .recording
         .create_share(&recording_id, max_uses, body.expires_at.as_deref())

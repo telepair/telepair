@@ -678,7 +678,8 @@ export const api = {
 
   /**
    * Create a share link for a recording. `maxUses` defaults to 1 on the
-   * server; `expiresAt` is an ISO-8601 string or omitted for no TTL.
+   * server; pass 0 only when the caller intentionally wants unlimited
+   * playback. `expiresAt` is an ISO-8601 string or omitted for no TTL.
    * Returns the share row — the plaintext token is only present here,
    * not in subsequent list calls.
    */
